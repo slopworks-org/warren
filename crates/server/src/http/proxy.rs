@@ -303,7 +303,7 @@ pub async fn handle(
     let Some(device) = snap.devices.get(&res.device_id) else { return pages::not_found() };
     let owner_active = snap.users.get(&device.user_id).is_some_and(|u| !u.disabled);
     if !device.enabled || !owner_active || !state.backend.has_tunnel() || !state.is_online(device.id) {
-        return pages::device_offline(&device.name);
+        return pages::device_offline();
     }
 
     prepare_headers(&mut parts.headers, upgrade, client, &res.host, &res, user.as_ref());
@@ -327,8 +327,8 @@ pub async fn handle(
         }
     };
     result.unwrap_or_else(|e| {
-        tracing::debug!(host = %res.host, error = %e, "upstream request failed");
-        pages::service_unreachable(&device.name, res.target_port)
+        tracing::debug!(host = %res.host, device = %device.name, port = res.target_port, error = %e, "upstream request failed");
+        pages::service_unreachable()
     })
 }
 

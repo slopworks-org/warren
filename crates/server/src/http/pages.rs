@@ -48,24 +48,21 @@ pub fn not_found() -> Response<Body> {
     simple(StatusCode::NOT_FOUND, "Not found", "Nothing is published at this address.")
 }
 
-/// 503 when the target device is not connected.
+/// 503 when the target device is not connected. Visitors of public sites
+/// see this page, so it names neither the device nor its address.
 #[must_use]
-pub fn device_offline(device: &str) -> Response<Body> {
+pub fn device_offline() -> Response<Body> {
     simple(
         StatusCode::SERVICE_UNAVAILABLE,
-        "Device offline",
-        &format!("The device “{device}” that serves this site is not connected right now. Try again later."),
+        "Site offline",
+        "The device that serves this site is not connected right now. Try again later.",
     )
 }
 
 /// 502 when the device is connected but the service does not answer.
 #[must_use]
-pub fn service_unreachable(device: &str, port: u16) -> Response<Body> {
-    simple(
-        StatusCode::BAD_GATEWAY,
-        "Service unreachable",
-        &format!("The device “{device}” is connected, but nothing answered on port {port}."),
-    )
+pub fn service_unreachable() -> Response<Body> {
+    simple(StatusCode::BAD_GATEWAY, "Service unreachable", "The site is not answering right now. Try again later.")
 }
 
 /// 403 for signed-in users without access.
