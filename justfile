@@ -25,7 +25,7 @@ e2e *args:
 linux +cmd:
     scripts/linux.sh {{ cmd }}
 
-# Static agent: aarch64 (default), armv7, x86_64; output in dist/out/
+# Agent: aarch64 (default), armv7, x86_64 (static Linux), macos-aarch64, macos-x86_64; output in dist/out/
 agent *arches:
     scripts/build-agent.sh {{ arches }}
 

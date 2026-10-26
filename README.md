@@ -14,7 +14,8 @@ It is like Tailscale plus Cloudflare Tunnel, but you host it on one cheap VPS.
   Nothing listens on the device.
 - The server is one binary of about 9 MB. It has the WireGuard hub, the
   reverse proxy, Let's Encrypt certificates, the web admin, an API and SQLite.
-- The agent for OpenWrt routers and Linux boxes is about 470 KB.
+- The agent for OpenWrt routers and Linux boxes is about 470 KB. It also
+  runs on macOS.
 - You publish a service with one form, then open
   `https://app.warren.example.com`.
 - Each service is public, or it asks for a Warren login, Basic auth or a PIN.
@@ -52,8 +53,10 @@ You need:
    wget -qO- https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
      | sh -s -- agent --server https://warren.example.com --token wrt_…
    ```
+   On macOS, install wireguard-go first: `brew install wireguard-go`.
    The script installs `kmod-wireguard` on OpenWrt (opkg or apk), registers
-   the device and starts the agent service. Check it with `warren status`.
+   the device and starts the agent service (systemd, OpenWrt init or
+   launchd). Check it with `warren status`.
 4. Publish a service. Go to Resources → Publish service. Set the address, the
    device and the port.
 
@@ -71,7 +74,7 @@ Docker for the server build. The files go to `dist/out/`.
 
 ```sh
 just server amd64      # or arm64
-just agent aarch64     # or armv7, x86_64
+just agent aarch64     # or armv7, x86_64; macos-aarch64, macos-x86_64 on a Mac
 just ipk               # OpenWrt package
 ```
 </details>
@@ -86,7 +89,7 @@ HTTP API for all admin actions.
 - No DNS-01, so no automatic wildcard certificates. To use your own
   certificate, set `mode = "files"` in the `[tls]` section.
 - Only IPv4 inside the tunnel.
-- The agent needs kernel WireGuard.
+- The agent needs kernel WireGuard on Linux and wireguard-go on macOS.
 - No mesh between devices, no OIDC, no raw TCP/UDP forwarding, no multiple
   servers.
 
