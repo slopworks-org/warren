@@ -205,8 +205,32 @@ function shell(active, content) {
 
 function updateNotice() {
   if (!server || !server.update || !can('settings.manage')) return null;
+  const action = server.self_update
+    ? h('button', { class: 'small primary', text: 'Update now', onclick: (ev) => updateServer(ev.target) })
+    : h('span', { text: ' To upgrade, run install.sh on the server again.' });
   return h('div', { class: 'notice' }, 'Warren ' + server.update.version + ' is available; this server runs ' + server.version + '. ',
-    h('a', { href: server.update.url, target: '_blank', rel: 'noopener', text: 'Release notes' }));
+    h('a', { href: server.update.url, target: '_blank', rel: 'noopener', text: 'Release notes' }), ' ', action);
+}
+
+async function updateServer(button) {
+  button.disabled = true;
+  button.textContent = 'Downloading…';
+  const r = await attempt(() => api('POST', '/server/update'));
+  if (!r) {
+    button.disabled = false;
+    button.textContent = 'Update now';
+    return;
+  }
+  button.textContent = 'Restarting…';
+  for (let i = 0; i < 60; i++) {
+    await new Promise((done) => setTimeout(done, 2000));
+    const s = await api('GET', '/server').catch(() => null);
+    if (s && s.version === r.version) {
+      location.reload();
+      return;
+    }
+  }
+  button.textContent = 'The server did not come back; check journalctl -u warren-server';
 }
 
 async function loadMe() {

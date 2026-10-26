@@ -4,7 +4,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# "+" runs it outside the sandbox below: it replaces the binary with an
+# update that the server downloaded; "-" starts the server even if that fails.
+ExecStartPre=-+/usr/local/bin/warren-server --config /etc/warren/server.toml apply-update
 ExecStart=/usr/local/bin/warren-server --config /etc/warren/server.toml
+Environment=WARREN_SELF_UPDATE=1
 Restart=on-failure
 RestartSec=3
 # WireGuard, TUN and ports 80/443 need these; nothing else.

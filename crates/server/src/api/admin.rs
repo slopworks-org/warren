@@ -22,6 +22,7 @@ pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth)
     Json(json!({
         "version": warren_proto::VERSION,
         "update": update,
+        "self_update": crate::update::self_update_blocker().is_none(),
         "domain": c.domain,
         "admin_host": c.admin_host(),
         "admin_url": c.https_origin(c.admin_host()),
@@ -32,6 +33,22 @@ pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth)
         "backend": state.backend.name(),
         "tls_mode": format!("{:?}", c.tls.mode).to_lowercase(),
     }))
+}
+
+/// `POST /api/v1/server/update`: downloads the latest release and restarts into it.
+pub async fn update_server(State(state): State<Arc<AppState>>, ip: Ip, auth: Auth) -> ApiResult<Json<Value>> {
+    use crate::update::{Fetcher, UpdateError, install};
+    auth.require(Perm::ManageSettings)?;
+    let fetcher = Fetcher::new().map_err(ApiError::internal)?;
+    let release = install(&state, &fetcher).await.map_err(|e| match e {
+        UpdateError::Unsupported(_) | UpdateError::UpToDate | UpdateError::Busy => ApiError::Conflict(e.to_string()),
+        other => {
+            tracing::warn!(error = %other, "installing the new release");
+            ApiError::Conflict(format!("cannot install the update: {other}"))
+        }
+    })?;
+    state.audit(Some(&auth.user), &ip, "server.update", "server", &format!("to {}", release.version));
+    Ok(Json(json!({ "version": release.version })))
 }
 
 /// `GET /api/v1/users`.

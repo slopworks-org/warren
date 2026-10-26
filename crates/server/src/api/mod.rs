@@ -290,6 +290,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/me/tokens", get(profile::tokens).post(profile::create_token))
         .route("/me/tokens/{id}", delete(profile::delete_token))
         .route("/server", get(admin::server_info))
+        .route("/server/update", post(admin::update_server))
         .route("/devices", get(devices::list).post(devices::create_manual))
         .route("/devices/tokens", post(devices::create_token))
         .route("/devices/{id}", get(devices::get_one).patch(devices::update).delete(devices::remove))

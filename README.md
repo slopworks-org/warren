@@ -79,6 +79,18 @@ just ipk               # OpenWrt package
 ```
 </details>
 
+## Updates
+
+The server checks GitHub for a new release once a day. When one is out,
+administrators see a notice in the admin. Click **Update now** to install it:
+the server downloads the release, checks it against `SHA256SUMS` and
+restarts. To install new releases without the button, set `auto = true` in
+the `[update]` section of `server.toml`.
+
+Servers installed before this feature need one upgrade with `install.sh`,
+which installs the new systemd unit. The container image does not update
+itself; pull a new image instead.
+
 ## Also included
 
 Users and roles, two-factor login (TOTP), device ACLs, an audit log, and an

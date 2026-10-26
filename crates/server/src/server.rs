@@ -75,11 +75,20 @@ async fn shutdown_signal() {
     }
 }
 
-/// Runs the server until SIGTERM or Ctrl-C.
+/// Why [`run`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// SIGTERM or Ctrl-C.
+    Signal,
+    /// An update is staged; exit with [`crate::update::RESTART_EXIT`].
+    Restart,
+}
+
+/// Runs the server until SIGTERM, Ctrl-C or a staged update.
 ///
 /// # Errors
 /// When storage, keys, certificates, the tunnel or a listener cannot be set up.
-pub async fn run(config: Config) -> Result<(), ServerError> {
+pub async fn run(config: Config) -> Result<Stop, ServerError> {
     let db = open_db(&config)?;
     let dir = config.data_dir.clone();
     let server_key = load_or_create_key(&dir.join("wg.key")).map_err(io("loading wg.key"))?;
@@ -152,13 +161,16 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
         }));
     }
 
-    shutdown_signal().await;
+    let stop = tokio::select! {
+        () = shutdown_signal() => Stop::Signal,
+        () = state.restart.notified() => Stop::Restart,
+    };
     tracing::info!("shutting down");
     for t in &tasks {
         t.abort();
     }
     state.backend.shutdown().await;
-    Ok(())
+    Ok(stop)
 }
 
 /// Reads a password from stdin, or generates one when `from_stdin` is false.
