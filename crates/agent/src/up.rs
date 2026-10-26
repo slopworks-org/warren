@@ -45,10 +45,12 @@ pub fn register_target(server: &str) -> Result<(String, String)> {
 }
 
 pub fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into `buf`.
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..len]).trim().to_string())
+        .filter(|s| r == 0 && !s.is_empty())
         .unwrap_or_else(|| "device".to_string())
 }
 
@@ -117,6 +119,7 @@ pub fn run(args: &Args) -> Result<()> {
         "Keep the tunnel up by running the service:\n  \
          OpenWrt: /etc/init.d/warren enable && /etc/init.d/warren start\n  \
          systemd: systemctl enable --now warren\n  \
+         macOS:   launchctl bootstrap system /Library/LaunchDaemons/org.slopworks.warren.plist\n  \
          other:   warren run"
     );
     Ok(())

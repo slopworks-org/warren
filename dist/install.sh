@@ -3,6 +3,7 @@
 #   curl -fsSL https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
 #     | sudo sh -s -- server --domain warren.example.com --email you@example.com
 #   curl -fsSL …/install.sh | sudo sh -s -- agent --server https://warren.example.com --token wrt_…
+# On macOS the agent needs wireguard-go: brew install wireguard-go.
 # On OpenWrt, which has no curl by default: wget -qO- …/install.sh | sh -s -- agent …
 # Run it again to upgrade; the config and the registration are kept.
 # WARREN_VERSION=v0.2.0 (or --version) pins a release instead of the latest;
@@ -38,7 +39,12 @@ case "$mode" in
   server | agent) ;;
   *) die "$usage" ;;
 esac
-[ "$(uname -s)" = Linux ] || die "Warren runs on Linux only"
+os=$(uname -s)
+case "$os-$mode" in
+  Linux-* | Darwin-agent) ;;
+  Darwin-*) die "the server runs on Linux only" ;;
+  *) die "Warren runs on Linux and macOS only" ;;
+esac
 [ "$(id -u)" -eq 0 ] || die "run as root (pipe to 'sudo sh -s -- …')"
 
 if [ -n "${WARREN_BASE_URL:-}" ]; then
@@ -121,6 +127,11 @@ install_server() {
   fi
 }
 
+has_wireguard_go() {
+  command -v wireguard-go >/dev/null 2>&1 ||
+    [ -x /opt/homebrew/bin/wireguard-go ] || [ -x /usr/local/bin/wireguard-go ]
+}
+
 install_agent() {
   case "$(uname -m)" in
     x86_64 | amd64) arch=x86_64 ;;
@@ -128,7 +139,17 @@ install_agent() {
     armv7*) arch=armv7 ;;
     *) die "no agent build for $(uname -m)" ;;
   esac
-  if [ -f /etc/openwrt_release ]; then
+  asset=warren-linux-$arch
+  plist=/Library/LaunchDaemons/org.slopworks.warren.plist
+  if [ "$os" = Darwin ]; then
+    [ "$arch" = armv7 ] && die "no agent build for $(uname -m)"
+    # Homebrew refuses to run as root, so the installer cannot do this itself.
+    has_wireguard_go || die "the agent needs wireguard-go; install it first: brew install wireguard-go"
+    bin=/usr/local/bin/warren asset=warren-macos-$arch
+    say "Downloading the agent ($version, macOS $arch)"
+    download "$asset" org.slopworks.warren.plist
+    put 0644 "$work/org.slopworks.warren.plist" "$plist"
+  elif [ -f /etc/openwrt_release ]; then
     bin=/usr/bin/warren
     say "Installing kmod-wireguard"
     if command -v apk >/dev/null 2>&1; then
@@ -137,7 +158,7 @@ install_agent() {
       opkg update >/dev/null && opkg install kmod-wireguard
     fi
     say "Downloading the agent ($version, $arch)"
-    download "warren-linux-$arch" warren.init warren.uci-defaults
+    download "$asset" warren.init warren.uci-defaults
     put 0755 "$work/warren.init" /etc/init.d/warren
     # The firewall zone for the tunnel; the script does nothing if it exists.
     sh "$work/warren.uci-defaults"
@@ -146,13 +167,13 @@ install_agent() {
     modprobe wireguard 2>/dev/null ||
       echo "warning: cannot load the wireguard kernel module; the agent needs it" >&2
     say "Downloading the agent ($version, $arch)"
-    download "warren-linux-$arch" warren.service
+    download "$asset" warren.service
     if has_systemd; then
       put 0644 "$work/warren.service" /etc/systemd/system/warren.service
       systemctl daemon-reload
     fi
   fi
-  put 0755 "$work/warren-linux-$arch" "$bin"
+  put 0755 "$work/$asset" "$bin"
   say "Installed $("$bin" version) to $bin"
 
   if [ -n "$token" ]; then
@@ -167,7 +188,10 @@ install_agent() {
     echo "and run this installer again, or start the service yourself."
     return
   fi
-  if [ -f /etc/openwrt_release ]; then
+  if [ "$os" = Darwin ]; then
+    launchctl bootout system/org.slopworks.warren 2>/dev/null || true
+    launchctl bootstrap system "$plist"
+  elif [ -f /etc/openwrt_release ]; then
     /etc/init.d/warren enable
     /etc/init.d/warren restart
   elif has_systemd; then

@@ -1,5 +1,6 @@
-# A GitHub release for each v* tag: the static agents, the OpenWrt package,
-# the static servers, the service files and dist/install.sh, with SHA256SUMS.
+# A GitHub release for each v* tag: the static agents, the macOS agents, the
+# OpenWrt package, the static servers, the service files and dist/install.sh,
+# with SHA256SUMS.
 # Release: bump `version` in Cargo.toml, merge, then tag main as v<version>.
 name: Release
 
@@ -43,6 +44,28 @@ jobs:
           path: dist/out/
           if-no-files-found: error
 
+  agent-macos:
+    name: Agent (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+          rustup toolchain install "$version" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: scripts/build-agent.sh macos-aarch64 macos-x86_64
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent-macos
+          path: dist/out/
+          if-no-files-found: error
+
   server:
     name: Server (${{ matrix.arch }})
     strategy:
@@ -69,7 +92,7 @@ jobs:
 
   release:
     name: Publish
-    needs: [agent, server]
+    needs: [agent, agent-macos, server]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -86,6 +109,7 @@ jobs:
         run: |
           cp dist/install.sh dist/systemd/warren-server.service dist/systemd/warren.service out/
           cp dist/openwrt/warren.init dist/openwrt/warren.uci-defaults out/
+          cp dist/macos/org.slopworks.warren.plist out/
           cd out && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
 
       - name: Create the release
