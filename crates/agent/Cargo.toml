@@ -1,0 +1,19 @@
+[package]
+name = "warren-agent"
+description = "Warren agent: registers a device and keeps its WireGuard tunnel up"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "warren"
+path = "src/main.rs"
+
+[dependencies]
+warren-proto.workspace = true
+warren-wgctl.workspace = true
+libc.workspace = true
+x25519-dalek.workspace = true
+
+[lints]
+workspace = true

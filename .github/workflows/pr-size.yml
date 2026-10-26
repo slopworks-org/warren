@@ -1,0 +1,20 @@
+# size:XS…XXL labels by effective lines changed, via the org's reusable
+# workflow. It never checks out PR code, so pull_request_target is safe.
+name: PR size
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  pr-size:
+    uses: slopworks-org/.github/.github/workflows/pr-size.yml@main

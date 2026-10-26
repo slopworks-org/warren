@@ -1,0 +1,17 @@
+# The scripts/check.sh gate, run for you at commit time. `lefthook install`
+# sets the hook up; `LEFTHOOK=0 git commit` skips it once.
+pre-commit:
+  jobs:
+    # Checks rather than rewrites: a hook that edits staged files silently
+    # widens a `git add -p` commit to the whole file. Run `cargo fmt --all`.
+    - name: format
+      glob: "*.rs"
+      run: scripts/check.sh format
+
+    - name: clippy
+      glob: "*.{rs,toml}"
+      run: scripts/check.sh clippy
+
+    - name: test
+      glob: "*.{rs,toml,html,js,css,svg}"
+      run: scripts/check.sh test

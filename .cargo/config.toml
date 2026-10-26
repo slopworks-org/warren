@@ -1,0 +1,10 @@
+# Static musl builds of the agent link with the LLVM linker shipped with Rust,
+# so cross-compiling from macOS needs nothing but `rustup target add`.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"

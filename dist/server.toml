@@ -1,0 +1,26 @@
+# Warren server configuration. Only `domain` and `acme_email` are required.
+# DNS: point <domain> and *.<domain> (A/AAAA) at this server.
+
+domain = "warren.example.com"        # admin UI here; resources at <name>.warren.example.com
+acme_email = "admin@example.com"     # Let's Encrypt account contact
+
+# admin_host = "warren.example.com"  # defaults to `domain`
+# data_dir = "/var/lib/warren"
+# listen_http = "0.0.0.0:80"
+# listen_https = "0.0.0.0:443"
+
+# [tls]
+# mode = "acme"                      # acme | files | self-signed
+# acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
+# cert_file = "/etc/warren/cert.pem" # mode = "files" (e.g. a wildcard certificate)
+# key_file = "/etc/warren/key.pem"
+
+# [wireguard]
+# backend = "auto"                   # auto | kernel | userspace
+# port = 51820                       # open this UDP port in the VPS firewall
+# network = "10.77.0.0/16"
+# endpoint = "warren.example.com:51820"
+
+# [log]
+# level = "info"                     # or e.g. "warren_server=debug,info"
+# format = "text"                    # text | json

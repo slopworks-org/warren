@@ -1,0 +1,31 @@
+# Conventional-commit PR titles and no AI attribution, via the org's reusable
+# workflow. The scopes are this repo's crates plus dist, scripts, deps, github
+# and docker.
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-title:
+    uses: slopworks-org/.github/.github/workflows/pr-title.yml@main
+    with:
+      scopes: |
+        agent
+        proto
+        server
+        wgctl
+        dist
+        scripts
+        deps
+        github
+        docker

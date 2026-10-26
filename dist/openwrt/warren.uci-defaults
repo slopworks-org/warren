@@ -1,0 +1,15 @@
+#!/bin/sh
+# Puts the tunnel interface in its own firewall zone so the Warren server can
+# reach services on the router (fw4 rejects input on unknown interfaces).
+uci -q get firewall.warren >/dev/null && exit 0
+uci -q batch <<UCI
+set firewall.warren=zone
+set firewall.warren.name='warren'
+add_list firewall.warren.device='warren0'
+set firewall.warren.input='ACCEPT'
+set firewall.warren.output='ACCEPT'
+set firewall.warren.forward='REJECT'
+commit firewall
+UCI
+/etc/init.d/firewall reload >/dev/null 2>&1
+exit 0

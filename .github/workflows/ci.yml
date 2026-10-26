@@ -1,0 +1,42 @@
+# The scripts/check.sh gate on Linux, where the netlink and TUN code is
+# compiled, linted and tested too.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The toolchain pinned in .tool-versions, so CI and local builds agree.
+      - name: Install Rust
+        run: |
+          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+          rustup toolchain install "$version" --profile minimal --component clippy,rustfmt
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # One step per tool keeps the failing one visible in the run summary.
+      - name: Format
+        run: scripts/check.sh format
+
+      - name: Clippy
+        run: scripts/check.sh clippy
+
+      - name: Run tests
+        run: scripts/check.sh test
