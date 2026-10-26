@@ -14,7 +14,7 @@ crates/
     web/   admin UI (HTML/JS/CSS), embedded into the binary with include_str!
     tests/ e2e.rs, the end-to-end test (ignored by default, run by scripts/e2e.sh)
 docs/      README diagram, light and dark variants
-dist/      config sample, systemd units, OpenWrt init scripts, Dockerfiles
+dist/      config sample, systemd units, OpenWrt init scripts, Dockerfiles, install.sh
 scripts/   build, packaging, Linux container and gate scripts
 ```
 
@@ -45,6 +45,10 @@ scripts/   build, packaging, Linux container and gate scripts
 - End-to-end test: `just e2e` (Docker).
 - Builds: `just agent [aarch64|armv7|x86_64 ...]`, `just server [amd64|arm64]`,
   `just ipk`; output in `dist/out/`.
+- Release: bump `version` in `Cargo.toml`, merge, then push the tag
+  `v<version>` from main. `.github/workflows/release.yml` builds everything
+  and publishes it with `dist/install.sh`, the one-line installer, which reads
+  the release's file names; keep the two in step.
 
 ### Definition of done
 
