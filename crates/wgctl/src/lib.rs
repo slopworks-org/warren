@@ -1,10 +1,12 @@
-//! Minimal netlink control of Linux WireGuard interfaces.
+//! Minimal control of WireGuard interfaces: netlink on Linux, wireguard-go on
+//! macOS.
 //!
 //! Hand-written instead of a netlink crate to keep the agent small: it covers
 //! creating/deleting links, bringing them up, managing addresses, and the
-//! WireGuard generic-netlink GET/SET device commands. On other systems every
-//! call fails with [`std::io::ErrorKind::Unsupported`], so the workspace still
-//! builds there.
+//! WireGuard generic-netlink GET/SET device commands. macOS has no WireGuard
+//! in the kernel, so there the same calls drive wireguard-go over its UAPI
+//! socket. On other systems every call fails with
+//! [`std::io::ErrorKind::Unsupported`], so the workspace still builds there.
 
 use std::fmt;
 use std::io;
@@ -16,12 +18,16 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux as sys;
 
-#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as sys;
+#[cfg(any(target_os = "macos", test))]
 mod uapi;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use unsupported as sys;
 
 /// A 32-byte Curve25519 key, as WireGuard uses for both halves of a key pair.
@@ -184,11 +190,12 @@ pub fn link_index(name: &str) -> Option<u32> {
     sys::link_index(name)
 }
 
-/// Creates a WireGuard interface called `name`.
+/// Creates a WireGuard interface called `name`. On macOS this starts
+/// wireguard-go, and `name` maps to the `utunN` it creates.
 ///
 /// # Errors
-/// When the interface exists, the kernel lacks WireGuard, or the caller lacks
-/// `CAP_NET_ADMIN`.
+/// When the interface exists, the kernel lacks WireGuard (wireguard-go is not
+/// installed on macOS), or the caller lacks `CAP_NET_ADMIN` (root on macOS).
 pub fn create_wireguard_link(name: &str) -> Result<()> {
     sys::create_wireguard_link(name).map_err(|e| Error::new("creating WireGuard interface", name, e))
 }

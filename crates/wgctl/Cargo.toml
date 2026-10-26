@@ -1,6 +1,6 @@
 [package]
 name = "warren-wgctl"
-description = "Minimal netlink control of Linux WireGuard interfaces, links and addresses"
+description = "Minimal control of WireGuard interfaces, links and addresses: netlink on Linux, wireguard-go on macOS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
