@@ -139,6 +139,9 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     if state.config.tls.mode == TlsMode::Acme {
         tasks.push(tokio::spawn(crate::acme::task(Arc::clone(&state))));
     }
+    if state.config.update.check {
+        tasks.push(tokio::spawn(crate::update::task(Arc::clone(&state))));
+    }
     if let Some(listener) = control_listener {
         let router = crate::agent_api::control_router(Arc::clone(&state));
         tasks.push(tokio::spawn(async move {

@@ -125,6 +125,8 @@ pub struct AppState {
     pub basic_cache: Mutex<HashMap<String, i64>>,
     /// Last TOTP step used per user, to refuse replays.
     pub totp_used: Mutex<HashMap<i64, u64>>,
+    /// The latest release on GitHub, once checked.
+    pub latest_release: RwLock<Option<crate::update::Release>>,
     alloc: Mutex<()>,
     agent_reports: Mutex<HashMap<i64, (i64, String)>>,
 }
@@ -189,6 +191,7 @@ impl AppState {
             },
             basic_cache: Mutex::new(HashMap::new()),
             totp_used: Mutex::new(HashMap::new()),
+            latest_release: RwLock::new(None),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
         }

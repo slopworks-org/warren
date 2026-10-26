@@ -1985,6 +1985,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "instant-acme",
  "libc",

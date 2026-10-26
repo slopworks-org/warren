@@ -18,5 +18,6 @@ pub mod secrets;
 pub mod server;
 pub mod state;
 pub mod tls;
+pub mod update;
 pub mod util;
 pub mod wg;

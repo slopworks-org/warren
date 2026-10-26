@@ -200,7 +200,13 @@ function shell(active, content) {
   const banner = me.must_setup_2fa
     ? h('div', { class: 'notice warn', text: 'The administrator requires two-factor authentication. Set it up below to use Warren.' })
     : null;
-  root.replaceChildren(top, h('div', { class: 'layout' }, nav, h('main', {}, banner, content)));
+  root.replaceChildren(top, h('div', { class: 'layout' }, nav, h('main', {}, banner, updateNotice(), content)));
+}
+
+function updateNotice() {
+  if (!server || !server.update || !can('settings.manage')) return null;
+  return h('div', { class: 'notice' }, 'Warren ' + server.update.version + ' is available; this server runs ' + server.version + '. ',
+    h('a', { href: server.update.url, target: '_blank', rel: 'noopener', text: 'Release notes' }));
 }
 
 async function loadMe() {
@@ -702,7 +708,7 @@ async function settingsPage(el) {
 
   const acl = h('div', { class: 'panel' });
   const info = server ? h('div', { class: 'panel pad' }, h('dl', { class: 'kv' },
-    [['Version', server.version], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
+    [['Version', server.version + (server.update ? ' (' + server.update.version + ' is available)' : '')], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
       ['WireGuard endpoint', server.wg_endpoint], ['Tunnel network', server.network + ' (server ' + server.server_ip + ')'],
       ['Server public key', server.public_key], ['Tunnel backend', server.backend], ['TLS', server.tls_mode]]
       .map(([k, v]) => [h('dt', { text: k }), h('dd', { class: k.includes('key') ? 'mono' : null, text: v })]))) : null;
