@@ -153,9 +153,50 @@ async fn config(
     text(StatusCode::NOT_MODIFIED, String::new())
 }
 
+#[derive(Deserialize)]
+struct BinaryQuery {
+    file: String,
+}
+
+/// Handles `GET /agent/v1/binary`: the agent build the device should update to.
+async fn binary(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<BinaryQuery>,
+) -> Response<Body> {
+    let snap = state.snapshot();
+    let known = match peer.ip() {
+        IpAddr::V4(ip) => snap.device_by_ip.get(&ip).and_then(|id| snap.devices.get(id)).is_some_and(|d| d.enabled),
+        IpAddr::V6(_) => false,
+    };
+    if !known {
+        return error(StatusCode::FORBIDDEN, "unknown device");
+    }
+    if snap.agent_target.is_empty() {
+        return error(StatusCode::NOT_FOUND, "no agent update is scheduled");
+    }
+    let Some(file) = warren_proto::AGENT_ASSETS.iter().find(|a| **a == q.file) else {
+        return error(StatusCode::NOT_FOUND, "no such agent build");
+    };
+    match crate::update::agent_binary(&state, &snap.agent_target, file).await {
+        Ok(data) => {
+            let mut r = Response::new(Body::from(data));
+            r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+            r
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, file, "serving an agent build");
+            error(StatusCode::BAD_GATEWAY, "cannot download the agent build")
+        }
+    }
+}
+
 /// Router for the control listener.
 pub fn control_router(state: Arc<AppState>) -> Router {
-    Router::new().route(warren_proto::CONFIG_PATH, get(config)).with_state(state)
+    Router::new()
+        .route(warren_proto::CONFIG_PATH, get(config))
+        .route(warren_proto::BINARY_PATH, get(binary))
+        .with_state(state)
 }
 
 #[cfg(test)]

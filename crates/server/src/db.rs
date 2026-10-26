@@ -1319,6 +1319,26 @@ impl Db {
         }
     }
 
+    /// A value stored next to the settings, e.g. `agent_target`.
+    ///
+    /// # Errors
+    /// On database failure.
+    pub fn value(&self, key: &str) -> DbResult<Option<String>> {
+        Ok(self.c().query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// Stores a value next to the settings.
+    ///
+    /// # Errors
+    /// On database failure.
+    pub fn set_value(&self, key: &str, value: &str) -> DbResult<()> {
+        self.c().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
     /// Replaces the settings.
     ///
     /// # Errors

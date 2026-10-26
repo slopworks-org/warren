@@ -19,6 +19,46 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REGISTER_PATH: &str = "/agent/v1/register";
 /// Control-channel path, served only on the server's tunnel address.
 pub const CONFIG_PATH: &str = "/agent/v1/config";
+/// Control-channel path of agent binaries: `?file=<one of AGENT_ASSETS>`.
+pub const BINARY_PATH: &str = "/agent/v1/binary";
+/// Release file names of the agent builds.
+pub const AGENT_ASSETS: &[&str] = &[
+    "warren-linux-aarch64",
+    "warren-linux-armv7",
+    "warren-linux-x86_64",
+    "warren-macos-aarch64",
+    "warren-macos-x86_64",
+];
+
+/// The release file name of this build, if releases include one.
+#[must_use]
+pub fn agent_asset() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "aarch64") => Some("warren-linux-aarch64"),
+        ("linux", "arm") => Some("warren-linux-armv7"),
+        ("linux", "x86_64") => Some("warren-linux-x86_64"),
+        ("macos", "aarch64") => Some("warren-macos-aarch64"),
+        ("macos", "x86_64") => Some("warren-macos-x86_64"),
+        _ => None,
+    }
+}
+
+/// Parses `1.2.3` or `v1.2.3`; pre-release and build suffixes are refused.
+#[must_use]
+pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = s.strip_prefix('v').unwrap_or(s).split('.').map(|p| p.parse::<u64>().ok());
+    let v = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(v)
+}
+
+/// Whether `candidate` is a later version than `current`.
+#[must_use]
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    match (parse_version(candidate), parse_version(current)) {
+        (Some(c), Some(cur)) => c > cur,
+        _ => false,
+    }
+}
 /// TCP port of the control channel on the server's tunnel address.
 pub const DEFAULT_CTL_PORT: u16 = 7180;
 /// Default UDP port of the WireGuard hub.
@@ -57,6 +97,8 @@ pub struct AgentConfig {
     pub control: String,
     /// Peers to configure; in the hub-and-spoke topology, only the server.
     pub peers: Vec<PeerConfig>,
+    /// Agent version to update to from [`BINARY_PATH`]; empty for none.
+    pub update: String,
 }
 
 impl AgentConfig {
@@ -78,6 +120,9 @@ impl AgentConfig {
         for p in &self.peers {
             let endpoint = if p.endpoint.is_empty() { "-" } else { &p.endpoint };
             kv.push("peer", format!("{} {} {} {}", p.public_key, endpoint, p.allowed_ips.join(","), p.keepalive));
+        }
+        if !self.update.is_empty() {
+            kv.push("update", &self.update);
         }
     }
 
@@ -109,6 +154,7 @@ impl AgentConfig {
             address: kv.req("address")?.to_string(),
             control: kv.req("control")?.to_string(),
             peers,
+            update: kv.get("update").unwrap_or_default().to_string(),
         })
     }
 }
@@ -131,13 +177,36 @@ mod tests {
                 allowed_ips: vec!["10.77.0.0/16".into()],
                 keepalive: 25,
             }],
+            update: String::new(),
         };
         let text = cfg.to_kv().encode();
+        assert!(!text.contains("update"));
         let back = AgentConfig::from_kv(&Kv::parse(&text).unwrap()).unwrap();
         assert_eq!(cfg, back);
+        let with_update = AgentConfig { update: "0.2.0".into(), ..cfg.clone() };
+        assert_eq!(AgentConfig::from_kv(&with_update.to_kv()).unwrap(), with_update);
         let mut kv = Kv::parse(&text).unwrap();
         kv.push("peer", "notakey - x 1");
         assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("peer")));
         assert_eq!(AgentConfig::from_kv(&Kv::new()), Err(Error::MissingField("version")));
+    }
+
+    #[test]
+    fn versions() {
+        assert_eq!(parse_version("v0.12.3"), Some((0, 12, 3)));
+        assert_eq!(parse_version("1.0.0"), Some((1, 0, 0)));
+        assert_eq!(parse_version("v1.0"), None);
+        assert_eq!(parse_version("v1.0.0-rc1"), None);
+        assert_eq!(parse_version("v1.0.0.1"), None);
+        assert!(is_newer("0.10.0", "0.9.9"));
+        assert!(is_newer("v1.0.0", "0.99.0"));
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("0.0.9", "0.1.0"));
+        assert!(!is_newer("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn this_build_has_an_asset() {
+        assert!(agent_asset().is_none_or(|a| AGENT_ASSETS.contains(&a)));
     }
 }

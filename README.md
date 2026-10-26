@@ -87,9 +87,15 @@ the server downloads the release, checks it against `SHA256SUMS` and
 restarts. To install new releases without the button, set `auto = true` in
 the `[update]` section of `server.toml`.
 
-Servers installed before this feature need one upgrade with `install.sh`,
-which installs the new systemd unit. The container image does not update
-itself; pull a new image instead.
+Agents update from the server, inside the tunnel. When an agent runs an
+older version than the server, Devices shows **Update agents**. Each agent
+then downloads its build from the server, checks that the new binary runs,
+replaces itself and restarts. With `auto = true`, agents follow the server
+version without the button.
+
+Servers and agents installed before this feature need one upgrade with
+`install.sh`. On the server, it also installs the new systemd unit. The
+container image does not update itself; pull a new image instead.
 
 ## Also included
 

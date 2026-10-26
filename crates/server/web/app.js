@@ -203,6 +203,13 @@ function shell(active, content) {
   root.replaceChildren(top, h('div', { class: 'layout' }, nav, h('main', {}, banner, updateNotice(), content)));
 }
 
+function olderThan(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] < pb[i];
+  return false;
+}
+
 function updateNotice() {
   if (!server || !server.update || !can('settings.manage')) return null;
   const action = server.self_update
@@ -374,13 +381,30 @@ function ownerSelect(users) {
 
 async function devicesPage(el) {
   const list = h('div', { class: 'panel' });
+  const agents = h('div');
   el.append(h('div', { class: 'head' },
     h('div', {}, h('h1', { text: 'Devices' }), h('p', { class: 'lead', text: 'Machines connected to your Warren network.' })),
-    h('button', { class: 'primary', text: 'Add device', onclick: () => addDeviceDialog(load) })), list);
+    h('button', { class: 'primary', text: 'Add device', onclick: () => addDeviceDialog(load) })), agents, list);
+
+  function agentNotice(devices) {
+    const old = devices.filter((d) => d.kind === 'agent' && d.agent_version && olderThan(d.agent_version, server.version));
+    if (!old.length || !can('settings.manage')) return null;
+    const pending = server.agent_target === server.version;
+    return h('div', { class: 'notice' },
+      old.length + (old.length === 1 ? ' agent runs' : ' agents run') + ' an older version than the server (' + server.version + '). ',
+      pending ? 'They update when they next connect.' : h('button', { class: 'small primary', text: 'Update agents', onclick: async () => {
+        if (await attempt(() => api('POST', '/agents/update'))) {
+          server.agent_target = server.version;
+          toast('Agents update to ' + server.version);
+          load();
+        }
+      } }));
+  }
 
   async function load() {
     const devices = await attempt(() => api('GET', '/devices'));
     if (!devices) return;
+    agents.replaceChildren(server ? agentNotice(devices) || '' : '');
     if (!devices.length) {
       list.replaceChildren(h('div', { class: 'empty', text: 'No devices yet. Add one to get started.' }));
       return;

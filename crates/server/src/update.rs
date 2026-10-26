@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
+pub use warren_proto::{is_newer, parse_version};
 
 /// The GitHub repository releases come from.
 pub const REPO: &str = "slopworks-org/warren";
@@ -86,23 +87,6 @@ pub struct Release {
 struct GithubRelease {
     tag_name: String,
     html_url: String,
-}
-
-/// Parses `1.2.3` or `v1.2.3`; pre-release and build suffixes are refused.
-#[must_use]
-pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = s.strip_prefix('v').unwrap_or(s).split('.').map(|p| p.parse::<u64>().ok());
-    let v = (parts.next()??, parts.next()??, parts.next()??);
-    parts.next().is_none().then_some(v)
-}
-
-/// Whether `candidate` is a later version than `current`.
-#[must_use]
-pub fn is_newer(candidate: &str, current: &str) -> bool {
-    match (parse_version(candidate), parse_version(current)) {
-        (Some(c), Some(cur)) => c > cur,
-        _ => false,
-    }
 }
 
 /// HTTPS client for GitHub.
@@ -271,6 +255,28 @@ fn store_executable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// An agent build of `version`, from `<data_dir>/agents` or else from GitHub.
+///
+/// # Errors
+/// When the file is not cached and cannot be downloaded.
+pub async fn agent_binary(state: &AppState, version: &str, file: &str) -> Result<Bytes, UpdateError> {
+    let root = state.config.data_dir.join("agents");
+    let path = root.join(version).join(file);
+    let _guard = state.agent_download.lock().await;
+    if let Ok(data) = std::fs::read(&path) {
+        return Ok(data.into());
+    }
+    let data = Fetcher::new()?.release_file(&format!("v{version}"), file).await?;
+    if let Ok(dirs) = std::fs::read_dir(&root) {
+        for d in dirs.flatten().filter(|d| d.file_name() != version) {
+            let _ = std::fs::remove_dir_all(d.path());
+        }
+    }
+    store_executable(&path, &data).map_err(UpdateError::Store)?;
+    tracing::info!(version, file, "downloaded agent build");
+    Ok(data)
+}
+
 static UPDATING: AtomicBool = AtomicBool::new(false);
 
 /// Downloads the latest release, stages it and asks the server to restart.
@@ -379,20 +385,6 @@ pub async fn task(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn versions() {
-        assert_eq!(parse_version("v0.12.3"), Some((0, 12, 3)));
-        assert_eq!(parse_version("1.0.0"), Some((1, 0, 0)));
-        assert_eq!(parse_version("v1.0"), None);
-        assert_eq!(parse_version("v1.0.0-rc1"), None);
-        assert_eq!(parse_version("v1.0.0.1"), None);
-        assert!(is_newer("0.10.0", "0.9.9"));
-        assert!(is_newer("v1.0.0", "0.99.0"));
-        assert!(!is_newer("0.1.0", "0.1.0"));
-        assert!(!is_newer("0.0.9", "0.1.0"));
-        assert!(!is_newer("garbage", "0.1.0"));
-    }
 
     #[test]
     fn checksums() {

@@ -23,6 +23,7 @@ pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth)
         "version": warren_proto::VERSION,
         "update": update,
         "self_update": crate::update::self_update_blocker().is_none(),
+        "agent_target": state.snapshot().agent_target,
         "domain": c.domain,
         "admin_host": c.admin_host(),
         "admin_url": c.https_origin(c.admin_host()),
@@ -49,6 +50,14 @@ pub async fn update_server(State(state): State<Arc<AppState>>, ip: Ip, auth: Aut
     })?;
     state.audit(Some(&auth.user), &ip, "server.update", "server", &format!("to {}", release.version));
     Ok(Json(json!({ "version": release.version })))
+}
+
+/// `POST /api/v1/agents/update`: agents update to this server's version.
+pub async fn update_agents(State(state): State<Arc<AppState>>, ip: Ip, auth: Auth) -> ApiResult<Json<Value>> {
+    auth.require(Perm::ManageSettings)?;
+    state.update_agents()?;
+    state.audit(Some(&auth.user), &ip, "agents.update", "agents", &format!("to {}", warren_proto::VERSION));
+    Ok(Json(json!({ "version": warren_proto::VERSION })))
 }
 
 /// `GET /api/v1/users`.
