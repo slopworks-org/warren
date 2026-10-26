@@ -29,58 +29,50 @@ You need:
   the VPS;
 - ports 80/tcp, 443/tcp and 51820/udp open on the VPS.
 
-1. Build the binaries on your computer. There are no releases yet. You need
-   [just](https://github.com/casey/just) and Rust 1.92 or later, and Docker for
-   the server build. The files go to `dist/out/`.
+1. Install the server on the VPS:
    ```sh
-   just server amd64      # or arm64
-   just agent aarch64     # or armv7, x86_64
-   just ipk               # OpenWrt package
+   curl -fsSL https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
+     | sudo sh -s -- server --domain warren.example.com --email you@example.com
    ```
-2. Install the server on the VPS:
-   ```sh
-   sudo install -m 0755 warren-server-linux-amd64 /usr/local/bin/warren-server
-   sudo mkdir -p /etc/warren
-   printf 'domain = "warren.example.com"\nacme_email = "you@example.com"\n' | sudo tee /etc/warren/server.toml
-   sudo cp dist/systemd/warren-server.service /etc/systemd/system/
-   sudo systemctl enable --now warren-server
-   ```
-   Only `domain` and `acme_email` are required. All other options are in
-   [`dist/server.toml`](dist/server.toml).
-3. Create the admin account. Open the one-time setup link from the log:
+   It installs `warren-server`, writes `/etc/warren/server.toml` and starts
+   the systemd service. All other options are in
+   [`dist/server.toml`](dist/server.toml). Run the same command without
+   `--domain` and `--email` to upgrade.
+2. Create the admin account. Open the one-time setup link from the log:
    `journalctl -u warren-server | grep setup`. Or run
    `sudo warren-server create-admin admin`, which prints a password.
-4. Add a device. In the admin, go to Devices → Add device → With the agent →
-   Create token. Run the `warren up --server … --token wrt_…` command that it
-   shows on the device. Then start the agent service (see below).
-5. Publish a service. Go to Resources → Publish service. Set the address, the
+3. Add a device. In the admin, go to Devices → Add device → With the agent →
+   Create token. Install the agent on the device with that token:
+   ```sh
+   curl -fsSL https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
+     | sudo sh -s -- agent --server https://warren.example.com --token wrt_…
+   ```
+   On OpenWrt there is no curl or sudo; run this as root instead:
+   ```sh
+   wget -qO- https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
+     | sh -s -- agent --server https://warren.example.com --token wrt_…
+   ```
+   The script installs `kmod-wireguard` on OpenWrt (opkg or apk), registers
+   the device and starts the agent service. Check it with `warren status`.
+4. Publish a service. Go to Resources → Publish service. Set the address, the
    device and the port.
 
-<details>
-<summary><b>Agent on OpenWrt</b></summary>
-
-```sh
-scp -O dist/out/warren_0.1.0_aarch64_cortex-a53.ipk root@192.168.1.1:/tmp/
-# on the router
-opkg update && opkg install kmod-wireguard /tmp/warren_0.1.0_aarch64_cortex-a53.ipk
-warren up --server https://warren.example.com --token wrt_…
-/etc/init.d/warren enable && /etc/init.d/warren start
-warren status
-```
-
-The package holds the aarch64 agent. If `opkg print-architecture` shows a
-different aarch64 name, build with `just ipk <arch>`. OpenWrt 25.x
-uses apk, so you must install the agent by hand there. Ask your coding agent
-how.
-</details>
+The script checks every download against the release's `SHA256SUMS`.
+`--version v0.1.0` installs a given release. You can also download the
+binaries, the OpenWrt `.ipk` and the service files from the
+[releases page](https://github.com/slopworks-org/warren/releases) and
+install them by hand.
 
 <details>
-<summary><b>Agent on plain Linux</b></summary>
+<summary><b>Build from source</b></summary>
+
+You need [just](https://github.com/casey/just) and Rust 1.92 or later, and
+Docker for the server build. The files go to `dist/out/`.
 
 ```sh
-sudo install -m 0755 warren-linux-x86_64 /usr/local/bin/warren
-sudo warren up --server https://warren.example.com --token wrt_…
-sudo cp dist/systemd/warren.service /etc/systemd/system/ && sudo systemctl enable --now warren
+just server amd64      # or arm64
+just agent aarch64     # or armv7, x86_64
+just ipk               # OpenWrt package
 ```
 </details>
 
