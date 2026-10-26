@@ -1,0 +1,98 @@
+# A GitHub release for each v* tag: the static agents, the OpenWrt package,
+# the static servers, the service files and dist/install.sh, with SHA256SUMS.
+# Release: bump `version` in Cargo.toml, merge, then tag main as v<version>.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    name: Agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check the tag
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          }
+
+      - name: Install Rust
+        run: |
+          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+          rustup toolchain install "$version" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          scripts/build-agent.sh aarch64 armv7 x86_64
+          scripts/build-ipk.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent
+          path: dist/out/
+          if-no-files-found: error
+
+  server:
+    name: Server (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Native runners for both, so neither build runs emulated.
+      - name: Build
+        run: scripts/build-server.sh ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.arch }}
+          path: dist/out/warren-server-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: [agent, server]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Collect files
+        run: |
+          cp dist/install.sh dist/systemd/warren-server.service dist/systemd/warren.service out/
+          cp dist/openwrt/warren.init dist/openwrt/warren.uci-defaults out/
+          cd out && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A tag like v0.2.0-rc.1 is a prerelease, which releases/latest skips.
+        run: |
+          flags=
+          case "$GITHUB_REF_NAME" in *-*) flags=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes $flags out/*
