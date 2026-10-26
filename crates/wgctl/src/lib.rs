@@ -16,6 +16,9 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux as sys;
 
+#[cfg(test)]
+mod uapi;
+
 #[cfg(not(target_os = "linux"))]
 mod unsupported;
 #[cfg(not(target_os = "linux"))]
