@@ -758,10 +758,11 @@ fn check_failures_restart_revoke(
     let r = visitor.get(&format!("https://down.{DOMAIN}:{}/", s.https_port));
     assert_eq!(r.status, 502);
     assert!(r.body.contains("Service unreachable"));
+    assert!(!r.body.contains("router") && !r.body.contains(&agent.addr), "error pages name no device");
     admin.ok("PATCH", &format!("/devices/{}", agent.id), Some(json!({ "enabled": false })));
     let r = visitor.get(&format!("{app}/"));
     assert_eq!(r.status, 503);
-    assert!(r.body.contains("Device offline"));
+    assert!(r.body.contains("Site offline") && !r.body.contains("router"));
     admin.ok("PATCH", &format!("/devices/{}", agent.id), Some(json!({ "enabled": true })));
 
     // The daemon stops (removing its interface) and starts again.

@@ -31,7 +31,6 @@ pub async fn status(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>
     Ok(Json(json!({
         "setup_required": snap.users.is_empty(),
         "registration": snap.settings.registration,
-        "version": warren_proto::VERSION,
     })))
 }
 
