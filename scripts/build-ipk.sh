@@ -39,7 +39,12 @@ exit 0
 PRERM
 chmod 0755 "$work/control/postinst" "$work/control/prerm"
 echo "2.0" > "$work/debian-binary"
-tarx() { tar --uid 0 --gid 0 --format ustar -czf "$@"; }
+# GNU tar (CI) and bsdtar (macOS) spell root ownership differently.
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  tarx() { tar --owner=0 --group=0 --numeric-owner --format ustar -czf "$@"; }
+else
+  tarx() { tar --uid 0 --gid 0 --format ustar -czf "$@"; }
+fi
 (cd "$work/control" && tarx ../control.tar.gz ./control ./postinst ./prerm)
 (cd "$work/data" && tarx ../data.tar.gz ./usr ./etc)
 out="dist/out/warren_${version}_${pkg_arch}.ipk"
