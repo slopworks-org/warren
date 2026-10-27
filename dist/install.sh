@@ -115,14 +115,27 @@ install_server() {
     mkdir -p /etc/warren
     printf 'domain = "%s"\nacme_email = "%s"\n' "$domain" "$email" > /etc/warren/server.toml
     say "Wrote /etc/warren/server.toml; more options: https://github.com/$repo/blob/main/dist/server.toml"
+    # Before the start, so that the server never logs a setup link; the
+    # log can be unreadable (journald without storage, a changed machine-id).
+    if admin=$(/usr/local/bin/warren-server --config /etc/warren/server.toml create-admin admin 2>&1); then
+      created=1
+    else
+      created=''
+      echo "warning: $admin" >&2
+    fi
   fi
   systemctl daemon-reload
   systemctl enable warren-server >/dev/null 2>&1
   systemctl restart warren-server
   say "$(/usr/local/bin/warren-server --version) is running"
   if [ -z "$upgrade" ]; then
-    echo "Open the one-time setup link to create the admin account:"
-    echo "  journalctl -u warren-server | grep setup"
+    if [ -n "$created" ]; then
+      echo "Sign in at https://$domain as admin and change the password:"
+      echo "$admin" | sed -n 's/^Password: /  password: /p'
+    else
+      echo "Create an admin with 'warren-server create-admin <name>'"
+      echo "or set a new password with 'warren-server reset-password <name>'."
+    fi
     echo "Open ports 80/tcp, 443/tcp and 51820/udp if a firewall is in front of this server."
   fi
 }

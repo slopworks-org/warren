@@ -35,13 +35,14 @@ You need:
    curl -fsSL https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
      | sudo sh -s -- server --domain warren.example.com --email you@example.com
    ```
-   It installs `warren-server`, writes `/etc/warren/server.toml` and starts
-   the systemd service. All other options are in
-   [`dist/server.toml`](dist/server.toml). Run the same command without
+   It installs `warren-server`, writes `/etc/warren/server.toml`, creates
+   the `admin` account and starts the systemd service. All other options are
+   in [`dist/server.toml`](dist/server.toml). Run the same command without
    `--domain` and `--email` to upgrade.
-2. Create the admin account. Open the one-time setup link from the log:
-   `journalctl -u warren-server | grep setup`. Or run
-   `sudo warren-server create-admin admin`, which prints a password.
+2. Sign in at `https://warren.example.com` as `admin` with the password that
+   the installer prints, and change the password. If you installed the server
+   another way, run `sudo warren-server create-admin admin`; it prints a
+   password.
 3. Add a device. In the admin, go to Devices → Add device → With the agent →
    Create token. Install the agent on the device with that token:
    ```sh
