@@ -25,6 +25,7 @@ getrandom = "0.2"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

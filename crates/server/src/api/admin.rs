@@ -11,14 +11,17 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use warren_proto::codec::b64url_encode;
 
 /// `GET /api/v1/server`: facts about this server.
 pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth) -> Json<Value> {
     let c = &state.config;
+    let latest = state.latest_release.read().unwrap_or_else(PoisonError::into_inner).clone();
+    let update = latest.filter(|r| crate::update::is_newer(&r.version, warren_proto::VERSION));
     Json(json!({
         "version": warren_proto::VERSION,
+        "update": update,
         "domain": c.domain,
         "admin_host": c.admin_host(),
         "admin_url": c.https_origin(c.admin_host()),

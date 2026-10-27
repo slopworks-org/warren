@@ -151,6 +151,20 @@ impl Default for LogConfig {
     }
 }
 
+/// `[update]` section.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Look for a new release on GitHub once a day.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig { check: true }
+    }
+}
+
 /// The whole configuration file.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +198,9 @@ pub struct Config {
     /// Logging settings.
     #[serde(default)]
     pub log: LogConfig,
+    /// Release checks.
+    #[serde(default)]
+    pub update: UpdateConfig,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -374,6 +391,7 @@ mod tests {
         assert_eq!(c.resource_host("App").as_deref(), Some("app.w.example.com"));
         assert_eq!(c.resource_host("my.other.org").as_deref(), Some("my.other.org"));
         assert_eq!(c.resource_host("bad_name"), None);
+        assert!(c.update.check);
     }
 
     #[test]
