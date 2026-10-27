@@ -127,6 +127,8 @@ pub struct AppState {
     pub totp_used: Mutex<HashMap<i64, u64>>,
     /// The latest release on GitHub, once checked.
     pub latest_release: RwLock<Option<crate::update::Release>>,
+    /// Stops the server so that systemd restarts it into a staged update.
+    pub restart: Notify,
     alloc: Mutex<()>,
     agent_reports: Mutex<HashMap<i64, (i64, String)>>,
 }
@@ -192,6 +194,7 @@ impl AppState {
             basic_cache: Mutex::new(HashMap::new()),
             totp_used: Mutex::new(HashMap::new()),
             latest_release: RwLock::new(None),
+            restart: Notify::new(),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
         }

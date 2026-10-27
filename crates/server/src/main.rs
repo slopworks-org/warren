@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use warren_server::config::{Config, LogFormat};
-use warren_server::server;
+use warren_server::server::{self, Stop};
 
 #[derive(Parser)]
 #[command(name = "warren-server", version, about = "Warren server: WireGuard hub, reverse proxy and web admin")]
@@ -42,6 +42,8 @@ enum Command {
     },
     /// Validate the configuration file and exit.
     CheckConfig,
+    /// Install a downloaded update; the systemd unit runs this before each start.
+    ApplyUpdate,
 }
 
 fn init_logging(config: &Config) {
@@ -75,11 +77,21 @@ fn main() -> ExitCode {
     let result = match cli.command.unwrap_or(Command::Run) {
         Command::CheckConfig => {
             println!("{}: ok (admin at {})", cli.config.display(), config.https_origin(config.admin_host()));
-            Ok(())
+            Ok(Stop::Signal)
         }
-        Command::CreateAdmin { username, password_stdin } => server::create_admin(&config, &username, password_stdin),
+        Command::ApplyUpdate => match warren_server::update::apply_staged(&config.data_dir) {
+            Ok(Some(version)) => {
+                println!("installed warren-server {version}");
+                Ok(Stop::Signal)
+            }
+            Ok(None) => Ok(Stop::Signal),
+            Err(source) => Err(server::ServerError::Io { what: "installing the update".into(), source }),
+        },
+        Command::CreateAdmin { username, password_stdin } => {
+            server::create_admin(&config, &username, password_stdin).map(|()| Stop::Signal)
+        }
         Command::ResetPassword { username, password_stdin, reset_2fa } => {
-            server::reset_password(&config, &username, password_stdin, reset_2fa)
+            server::reset_password(&config, &username, password_stdin, reset_2fa).map(|()| Stop::Signal)
         }
         Command::Run => {
             init_logging(&config);
@@ -96,7 +108,8 @@ fn main() -> ExitCode {
         }
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Stop::Signal) => ExitCode::SUCCESS,
+        Ok(Stop::Restart) => ExitCode::from(warren_server::update::RESTART_EXIT),
         Err(e) => {
             print_error(&e);
             ExitCode::FAILURE

@@ -157,11 +157,13 @@ impl Default for LogConfig {
 pub struct UpdateConfig {
     /// Look for a new release on GitHub once a day.
     pub check: bool,
+    /// Install a new release without waiting for an administrator.
+    pub auto: bool,
 }
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        UpdateConfig { check: true }
+        UpdateConfig { check: true, auto: false }
     }
 }
 
@@ -331,6 +333,9 @@ impl Config {
             }
             _ => {}
         }
+        if cfg.update.auto && !cfg.update.check {
+            return Err(ConfigError::Invalid("update.auto needs update.check = true".into()));
+        }
         Ok(cfg)
     }
 
@@ -403,6 +408,7 @@ mod tests {
         assert!(Config::from_toml(&format!("{base}[wireguard]\nnetwork = \"10.77.0.1/16\"\n")).is_err());
         assert!(Config::from_toml(&format!("{base}[wireguard]\nnetwork = \"10.0.0.0/31\"\n")).is_err());
         assert!(Config::from_toml("domain = \"x.com\"\n[tls]\nmode = \"files\"\n").is_err());
+        assert!(Config::from_toml(&format!("{base}[update]\ncheck = false\nauto = true\n")).is_err());
     }
 
     #[test]
