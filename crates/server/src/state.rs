@@ -26,6 +26,7 @@ use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, PeerConfig, codec};
 /// first packet after a session turns 2 minutes old, so a connected device
 /// handshakes at least every ~145 s.
 pub const ONLINE_WINDOW: i64 = 210;
+const AGENT_TARGET: &str = "agent_target";
 
 /// What the proxy and the tunnel need, read without locking the database.
 #[derive(Default)]
@@ -48,6 +49,8 @@ pub struct Snapshot {
     pub acl: Acl,
     /// Admin-editable settings.
     pub settings: Settings,
+    /// The version agents update to; empty until an administrator asks.
+    pub agent_target: String,
 }
 
 impl Snapshot {
@@ -129,6 +132,8 @@ pub struct AppState {
     pub latest_release: RwLock<Option<crate::update::Release>>,
     /// Stops the server so that systemd restarts it into a staged update.
     pub restart: Notify,
+    /// Held while an agent binary downloads from GitHub.
+    pub agent_download: tokio::sync::Mutex<()>,
     alloc: Mutex<()>,
     agent_reports: Mutex<HashMap<i64, (i64, String)>>,
 }
@@ -195,6 +200,7 @@ impl AppState {
             totp_used: Mutex::new(HashMap::new()),
             latest_release: RwLock::new(None),
             restart: Notify::new(),
+            agent_download: tokio::sync::Mutex::new(()),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
         }
@@ -250,11 +256,21 @@ impl AppState {
             peers,
             acl: Acl::compile(&nodes, &acl_rules),
             settings: self.db.settings()?,
+            agent_target: self.db.value(AGENT_TARGET)?.unwrap_or_default(),
         };
         *self.snapshot.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(snap);
         self.generation.send_modify(|g| *g += 1);
         self.acme_wake.notify_one();
         Ok(())
+    }
+
+    /// Tells every agent to update to this server's version.
+    ///
+    /// # Errors
+    /// On database failure.
+    pub fn update_agents(&self) -> Result<(), DbError> {
+        self.db.set_value(AGENT_TARGET, warren_proto::VERSION)?;
+        self.rebuild()
     }
 
     /// Picks a free tunnel address and stores a device with it, serialized
@@ -284,6 +300,7 @@ impl AppState {
                 allowed_ips: vec![self.network.to_string()],
                 keepalive: DEFAULT_KEEPALIVE,
             }],
+            update: self.snapshot().agent_target.clone(),
         };
         cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;
         cfg
@@ -327,7 +344,10 @@ impl AppState {
         {
             let mut reports = lock(&self.agent_reports);
             match reports.get(&device) {
-                Some((last, fp)) if *fp == fingerprint || t - last < 600 => return,
+                // A new version is recorded at once, so the admin sees an update land.
+                Some((last, fp)) if *fp == fingerprint || (t - last < 600 && fp.ends_with(&format!("\n{version}"))) => {
+                    return;
+                }
                 _ => reports.insert(device, (t, fingerprint)),
             };
         }

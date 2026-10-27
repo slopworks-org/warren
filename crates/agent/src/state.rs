@@ -190,6 +190,7 @@ mod tests {
                 address: "10.77.0.2/16".into(),
                 control: "10.77.0.1:7180".into(),
                 peers: vec![],
+                update: String::new(),
             },
         };
         saved.store(&paths.config()).unwrap();

@@ -120,6 +120,9 @@ pub async fn run(config: Config) -> Result<Stop, ServerError> {
 
     let state = Arc::new(AppState::new(config, db, &server_key, cookie_key, certs, backend));
     state.rebuild()?;
+    if state.config.update.auto && state.snapshot().agent_target != warren_proto::VERSION {
+        state.update_agents()?;
+    }
     if state.db.user_count()? == 0 {
         let token = crate::util::token();
         let origin = state.config.https_origin(state.config.admin_host());

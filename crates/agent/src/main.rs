@@ -9,6 +9,7 @@ mod daemon;
 mod error;
 mod http;
 mod log;
+mod selfupdate;
 mod state;
 mod status;
 mod tunnel;

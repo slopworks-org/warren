@@ -7,7 +7,7 @@ use crate::cli::Args;
 use crate::error::{Error, Result};
 use crate::state::{self, Saved};
 use crate::up::{hostname, os_tag};
-use crate::{http, log, stopping, tunnel};
+use crate::{http, log, selfupdate, stopping, tunnel};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use warren_proto::{AgentConfig, CONFIG_PATH, Kv, LONG_POLL_SECS};
@@ -19,6 +19,8 @@ const MAX_BACKOFF: u64 = 60;
 /// A long-poll that returns sooner than this was not held by the server
 /// (e.g. a misbehaving proxy); pausing keeps the loop from spinning.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// A failed update to the same version is tried again after this long.
+const UPDATE_RETRY: Duration = Duration::from_secs(3600);
 
 /// Sleeps in one-second steps so a stop signal is noticed promptly.
 fn sleep(secs: u64) {
@@ -120,6 +122,7 @@ pub fn run(args: &Args) -> Result<()> {
     let mut applied = false;
     let mut backoff = 0;
     let mut last_refresh: Option<Instant> = None;
+    let mut failed_update: Option<(String, Instant)> = None;
     // The first poll returns at once, so `warren status` shows the
     // connection right after start instead of after the first long-poll.
     let mut first = true;
@@ -156,6 +159,15 @@ pub fn run(args: &Args) -> Result<()> {
                     apply_new_config(args, &mut saved, cfg, &key, &mut st);
                 } else if wait > 0 && started.elapsed() < MIN_POLL_INTERVAL {
                     sleep(MIN_POLL_INTERVAL.as_secs());
+                }
+                let target = &saved.tunnel.update;
+                let retry = failed_update.as_ref().is_none_or(|(v, at)| v != target || at.elapsed() > UPDATE_RETRY);
+                if warren_proto::is_newer(target, warren_proto::VERSION) && retry {
+                    log!(Info, "updating the agent", version = target);
+                    let e = selfupdate::update(&saved.tunnel.control, target);
+                    log!(Error, "cannot update the agent", error = e);
+                    st.last_error = format!("cannot update to {target}: {e}");
+                    failed_update = Some((target.clone(), Instant::now()));
                 }
             }
             Err(_) if stopping() => break,

@@ -9,6 +9,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE: usize = 256 * 1024;
+const MAX_DOWNLOAD: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reads wake up this often to notice a stop signal promptly.
 const READ_SLICE: Duration = Duration::from_secs(1);
@@ -30,6 +31,24 @@ pub fn request(
     body: Option<&str>,
     timeout: Duration,
 ) -> io::Result<Response> {
+    let (status, body) = exchange(addr, host, method, path, body, timeout, MAX_RESPONSE)?;
+    Ok(Response { status, body: String::from_utf8_lossy(&body).into_owned() })
+}
+
+/// GETs a binary body of up to 16 MiB.
+pub fn download(addr: &str, path: &str, timeout: Duration) -> io::Result<(u16, Vec<u8>)> {
+    exchange(addr, addr, "GET", path, None, timeout, MAX_DOWNLOAD)
+}
+
+fn exchange(
+    addr: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+    max: usize,
+) -> io::Result<(u16, Vec<u8>)> {
     let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
     let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{addr} did not resolve"));
     let mut stream = None;
@@ -66,7 +85,7 @@ pub fn request(
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > MAX_RESPONSE {
+                if buf.len() > max {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "response too large"));
                 }
                 if complete(&buf) {
@@ -112,7 +131,7 @@ fn complete(buf: &[u8]) -> bool {
 
 /// Parses a complete response; a body shorter than its `Content-Length`
 /// (the connection dropped) is an error, never a silently partial config.
-fn parse(buf: &[u8]) -> io::Result<Response> {
+fn parse(buf: &[u8]) -> io::Result<(u16, Vec<u8>)> {
     let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
     let end = header_end(buf).ok_or_else(|| bad("incomplete response head"))?;
     let head = String::from_utf8_lossy(&buf[..end]);
@@ -124,7 +143,7 @@ fn parse(buf: &[u8]) -> io::Result<Response> {
     if let Some(n) = content_length(&head) {
         body = body.get(..n).ok_or_else(|| bad("truncated response body"))?;
     }
-    Ok(Response { status, body: String::from_utf8_lossy(body).into_owned() })
+    Ok((status, body.to_vec()))
 }
 
 #[cfg(test)]
@@ -135,12 +154,11 @@ mod tests {
     fn parses_response() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX: y\r\n\r\nabcdef";
         assert!(complete(raw));
-        let r = parse(raw).unwrap();
-        assert_eq!((r.status, r.body.as_str()), (200, "abc"));
+        assert_eq!(parse(raw).unwrap(), (200, b"abc".to_vec()));
         assert!(!complete(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc"));
         assert!(parse(b"garbage").is_err());
         assert!(parse(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc").is_err(), "truncated");
         assert!(parse(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc").is_err());
-        assert_eq!(parse(b"HTTP/1.0 304 Not Modified\r\n\r\n").unwrap().status, 304);
+        assert_eq!(parse(b"HTTP/1.0 304 Not Modified\r\n\r\n").unwrap().0, 304);
     }
 }
