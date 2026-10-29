@@ -9,6 +9,7 @@ use crate::acl::{Acl, Node, Rule};
 use crate::auth::RateLimiter;
 use crate::config::{Config, Net4};
 use crate::db::{AuditEntry, Db, DbError, Device, Resource, Settings, User};
+use crate::lan::{self, LanReport, Seen};
 use crate::tls::CertStore;
 use crate::util::{fnv64, now};
 use crate::wg::{Backend, PeerSpec, PeerStats};
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, watch};
-use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, PeerConfig, codec};
+use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, LAN_KEEPALIVE, PeerConfig, codec};
 
 /// A device counts as online if it completed a handshake this recently.
 /// Agents send a keepalive every 25 s, and WireGuard re-handshakes on the
@@ -136,6 +137,7 @@ pub struct AppState {
     pub agent_download: tokio::sync::Mutex<()>,
     alloc: Mutex<()>,
     agent_reports: Mutex<HashMap<i64, (i64, String)>>,
+    lan_reports: RwLock<HashMap<i64, LanReport>>,
 }
 
 /// Device fields plus live tunnel state, as the API shows them.
@@ -203,6 +205,7 @@ impl AppState {
             agent_download: tokio::sync::Mutex::new(()),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
+            lan_reports: RwLock::new(HashMap::new()),
         }
     }
 
@@ -264,6 +267,12 @@ impl AppState {
         Ok(())
     }
 
+    /// Wakes long-polling agents to recompute their configs, for changes
+    /// that live outside the snapshot.
+    fn notify_agents(&self) {
+        self.generation.send_modify(|g| *g += 1);
+    }
+
     /// Tells every agent to update to this server's version.
     ///
     /// # Errors
@@ -300,11 +309,60 @@ impl AppState {
                 allowed_ips: vec![self.network.to_string()],
                 keepalive: DEFAULT_KEEPALIVE,
             }],
-            lan_peers: Vec::new(),
+            lan_peers: self.lan_peers(d),
             update: self.snapshot().agent_target.clone(),
         };
         cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;
         cfg
+    }
+
+    /// Agents on the same LAN as `d` that it may exchange any traffic with.
+    /// Port rules are enforced only by the hub, so pairs limited by them stay on it.
+    fn lan_peers(&self, d: &Device) -> Vec<PeerConfig> {
+        if !self.config.wireguard.lan_peers {
+            return Vec::new();
+        }
+        let snap = self.snapshot();
+        let reports = self.lan_reports.read().unwrap_or_else(PoisonError::into_inner);
+        let stats = self.stats.read().unwrap_or_else(PoisonError::into_inner);
+        let seen = |id: i64| {
+            let public = stats.get(&id)?.endpoint?.ip();
+            Some(Seen { report: reports.get(&id)?, public })
+        };
+        let Some(me) = seen(d.id) else { return Vec::new() };
+        let mut out: Vec<(Ipv4Addr, PeerConfig)> = snap
+            .devices
+            .values()
+            .filter(|o| o.id != d.id && o.enabled && snap.users.get(&o.user_id).is_some_and(|u| !u.disabled))
+            .filter(|o| {
+                snap.acl.all.contains(&(d.address, o.address)) && snap.acl.all.contains(&(o.address, d.address))
+            })
+            .filter_map(|o| {
+                let at = lan::endpoint(&me, &seen(o.id)?)?;
+                let peer = PeerConfig {
+                    public_key: o.public_key.clone(),
+                    endpoint: at.to_string(),
+                    allowed_ips: vec![format!("{}/32", o.address)],
+                    keepalive: LAN_KEEPALIVE,
+                };
+                Some((o.address, peer))
+            })
+            .collect();
+        out.sort_by_key(|(ip, _)| *ip);
+        out.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// Stores what an agent reports about its LAN; wakes the agents when it changed.
+    pub fn record_lan(&self, device: i64, report: Option<LanReport>) {
+        let mut reports = self.lan_reports.write().unwrap_or_else(PoisonError::into_inner);
+        let changed = match report {
+            Some(r) => reports.insert(device, r.clone()).is_none_or(|old| old != r),
+            None => reports.remove(&device).is_some(),
+        };
+        drop(reports);
+        if changed {
+            self.notify_agents();
+        }
     }
 
     /// A plain `wg-quick` configuration for a device without the agent.
@@ -440,7 +498,7 @@ pub async fn stats_task(state: Arc<AppState>) {
             }
         };
         let snap = state.snapshot();
-        let mut by_device = HashMap::new();
+        let mut by_device: HashMap<i64, PeerStats> = HashMap::new();
         for d in snap.devices.values() {
             let Some(key) = codec::decode_key(&d.public_key) else { continue };
             let Some(s) = raw.get(&key) else { continue };
@@ -455,7 +513,17 @@ pub async fn stats_task(state: Arc<AppState>) {
                 }
             }
         }
+        // LAN pairing depends on where devices connect from.
+        let public = |m: &HashMap<i64, PeerStats>, id| m.get(&id).and_then(|s| s.endpoint).map(|e| e.ip());
+        let moved = {
+            let reports = state.lan_reports.read().unwrap_or_else(PoisonError::into_inner);
+            let old = state.stats.read().unwrap_or_else(PoisonError::into_inner);
+            reports.keys().any(|&id| public(&old, id) != public(&by_device, id))
+        };
         *state.stats.write().unwrap_or_else(PoisonError::into_inner) = by_device;
+        if moved {
+            state.notify_agents();
+        }
     }
 }
 
