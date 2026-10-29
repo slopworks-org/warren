@@ -1,6 +1,7 @@
 //! Applying the server's desired state to the kernel WireGuard interface.
 
 use crate::error::{Error, Result};
+use crate::lan;
 use crate::state::Saved;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, SystemTime};
@@ -24,10 +25,30 @@ fn parse_ip(s: &str) -> Result<AllowedIp> {
     s.parse().map_err(|_| Error::InvalidConfig("invalid address"))
 }
 
+/// Whether `key` is the public key of `p`.
+pub fn same_key(p: &PeerConfig, key: &[u8; 32]) -> bool {
+    peer_key(p).is_ok_and(|k| k == *key)
+}
+
+fn allowed_ips(p: &PeerConfig) -> Result<Vec<AllowedIp>> {
+    p.allowed_ips.iter().map(|s| parse_ip(s)).collect()
+}
+
+fn peer_set(p: &PeerConfig, allowed: Vec<AllowedIp>) -> Result<PeerSet> {
+    Ok(PeerSet {
+        public_key: peer_key(p)?,
+        endpoint: resolve(&p.endpoint),
+        keepalive: Some(p.keepalive),
+        allowed_ips: Some(allowed),
+        remove: false,
+    })
+}
+
 /// Creates the interface if needed and makes it match `saved`.
 ///
 /// Peers are updated in place rather than replaced, so a config change does
-/// not drop established sessions.
+/// not drop established sessions. LAN peers get their addresses only while
+/// [`lan`] finds the direct path working.
 pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     let iface = saved.interface.as_str();
     if wg::link_index(iface).is_none() {
@@ -36,23 +57,24 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     }
     let current = wg::get_device(iface)?;
     let mut set = DeviceSet { private_key: Some(*key), ..DeviceSet::default() };
-    let mut wanted = Vec::new();
     for p in &saved.tunnel.peers {
-        let public_key = peer_key(p)?;
-        wanted.push(public_key);
-        let allowed = p.allowed_ips.iter().map(|s| parse_ip(s)).collect::<Result<Vec<_>>>()?;
-        set.peers.push(PeerSet {
-            public_key,
-            endpoint: resolve(&p.endpoint),
-            keepalive: Some(p.keepalive),
-            allowed_ips: Some(allowed),
-            remove: false,
-        });
+        set.peers.push(peer_set(p, allowed_ips(p)?)?);
     }
+    let mut lan_peers = Vec::new();
+    for p in &saved.tunnel.lan_peers {
+        lan_peers.push((peer_key(p)?, allowed_ips(p)?));
+    }
+    let mut links = lan::lock();
+    links.track(iface, lan_peers);
+    for p in &saved.tunnel.lan_peers {
+        set.peers.push(peer_set(p, links.routed(&peer_key(p)?))?);
+    }
+    let wanted: Vec<_> = set.peers.iter().map(|p| p.public_key).collect();
     for old in current.peers.iter().filter(|p| !wanted.contains(&p.public_key)) {
         set.peers.push(PeerSet { public_key: old.public_key, remove: true, ..PeerSet::default() });
     }
     wg::set_device(iface, &set)?;
+    drop(links);
     wg::ensure_address(iface, parse_ip(&saved.tunnel.address)?, saved.mtu)?;
     Ok(())
 }

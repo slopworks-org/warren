@@ -2,12 +2,14 @@
 //! WireGuard tunnel up.
 //!
 //! Size matters here (the agent runs on routers), so it uses only `std`,
-//! blocking I/O on one thread, and hand-written parsing.
+//! blocking I/O and hand-written parsing. One thread runs the control loop,
+//! another watches direct paths to LAN peers.
 
 mod cli;
 mod daemon;
 mod error;
 mod http;
+mod lan;
 mod log;
 mod selfupdate;
 mod state;
