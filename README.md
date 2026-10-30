@@ -107,6 +107,13 @@ must be allowed to exchange all traffic. By default, this applies to the
 devices of one user. Port rules apply only on the server, so pairs that
 have only port rules always go through the VPS.
 
+Blocking a user or disabling a device revokes access through the server.
+An established direct LAN connection can remain active if the agents can
+no longer reach the server to receive updated configuration. This is
+intentional: Warren does not isolate devices on their local network.
+The direct tunnel grants no additional access through the server or to
+other Warren peers.
+
 Each agent checks the direct path. If no packets come from the other agent
 for 25 seconds, the agent sends the traffic through the VPS again.
 `warren status` shows the path to each LAN peer. If a host firewall blocks
