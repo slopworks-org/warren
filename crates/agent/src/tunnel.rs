@@ -62,12 +62,14 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     }
     let mut lan_peers = Vec::new();
     for p in &saved.tunnel.lan_peers {
-        lan_peers.push((peer_key(p)?, allowed_ips(p)?));
+        lan_peers.push(peer_set(p, allowed_ips(p)?)?);
     }
     let mut links = lan::lock();
     links.track(iface, lan_peers);
     for p in &saved.tunnel.lan_peers {
-        set.peers.push(peer_set(p, links.routed(&peer_key(p)?))?);
+        if !links.suspended(&peer_key(p)?) {
+            set.peers.push(peer_set(p, links.routed(&peer_key(p)?))?);
+        }
     }
     let wanted: Vec<_> = set.peers.iter().map(|p| p.public_key).collect();
     for old in current.peers.iter().filter(|p| !wanted.contains(&p.public_key)) {

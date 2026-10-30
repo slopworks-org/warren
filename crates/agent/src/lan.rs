@@ -4,8 +4,10 @@
 //! keepalive but no allowed IPs, so WireGuard keeps a session with it and
 //! routes nothing there. A watcher thread gives a LAN peer its tunnel address
 //! while packets keep arriving from it and takes the address away when they
-//! stop. Traffic to that device then goes through the server again, whose
-//! peer covers the whole tunnel network.
+//! stop. A failed peer is removed for a retry interval to clear its session
+//! and stop keepalives that could keep the remote direct route alive. Traffic
+//! to that device then goes through the server again, whose peer covers the
+//! whole tunnel network.
 
 use crate::log;
 use std::collections::BTreeMap;
@@ -23,12 +25,18 @@ const SILENCE: Duration = Duration::from_secs(25);
 /// messages count as received bytes, so traffic alone does not prove that
 /// the path works both ways; a completed handshake does.
 const SESSION: Duration = Duration::from_secs(180);
+// Stop all direct transmissions long enough for the remote silence timer,
+// including a watcher tick, to expire before probing with fresh session keys.
+const RETRY: Duration = Duration::from_secs(30);
 const MAX_ADDRESSES: usize = 8;
 /// Bridges and links of containers and VMs. Their addresses repeat on every
 /// host that runs the same software, so they do not identify a LAN.
 const VIRTUAL_PREFIXES: &[&str] = &["docker", "veth", "virbr", "vnet", "cni", "flannel", "podman", "lxc", "lxd"];
 
+#[derive(Clone)]
 struct Peer {
+    probe: PeerSet,
+    removed: Option<Instant>,
     ips: Vec<AllowedIp>,
     direct: bool,
     rx: Option<u64>,
@@ -49,6 +57,35 @@ impl Peer {
         let changed = alive != self.direct;
         self.direct = alive;
         changed
+    }
+
+    fn update(&mut self, info: Option<&wg::PeerInfo>, now: Instant) -> Option<PeerSet> {
+        if let Some(removed) = self.removed {
+            if now.duration_since(removed) < RETRY {
+                return None;
+            }
+            self.removed = None;
+            self.rx = None;
+            self.heard = None;
+            let mut probe = self.probe.clone();
+            probe.allowed_ips = Some(Vec::new());
+            return Some(probe);
+        }
+        let handshake = info.and_then(|i| i.last_handshake).and_then(|t| SystemTime::now().duration_since(t).ok());
+        if !self.observe(info.map_or(0, |i| i.rx_bytes), handshake, now) {
+            return None;
+        }
+        if self.direct {
+            Some(PeerSet { public_key: self.probe.public_key, allowed_ips: Some(self.routed()), ..PeerSet::default() })
+        } else {
+            // Removing only AllowedIPs leaves keepalives flowing in the working
+            // direction. The other end would retain its /32 and reject packets
+            // from this device forwarded by the hub (source validation).
+            // Delete the session too, so neither old keys nor keepalives can
+            // preserve that asymmetric ownership during the retry interval.
+            self.removed = Some(now);
+            Some(PeerSet { public_key: self.probe.public_key, remove: true, ..PeerSet::default() })
+        }
     }
 
     fn routed(&self) -> Vec<AllowedIp> {
@@ -72,15 +109,29 @@ pub fn lock() -> MutexGuard<'static, Links> {
 
 impl Links {
     /// Starts tracking `peers` of `iface` and forgets all others.
-    pub fn track(&mut self, iface: &str, peers: Vec<(Key, Vec<AllowedIp>)>) {
+    pub fn track(&mut self, iface: &str, peers: Vec<PeerSet>) {
         if self.iface != iface {
             self.iface = iface.to_string();
             self.peers.clear();
         }
-        self.peers.retain(|k, _| peers.iter().any(|(p, _)| p == k));
-        for (key, ips) in peers {
-            self.peers.entry(key).or_insert(Peer { ips: Vec::new(), direct: false, rx: None, heard: None }).ips = ips;
+        self.peers.retain(|k, _| peers.iter().any(|p| p.public_key == *k));
+        for probe in peers {
+            let p = self.peers.entry(probe.public_key).or_insert(Peer {
+                probe: probe.clone(),
+                removed: None,
+                ips: Vec::new(),
+                direct: false,
+                rx: None,
+                heard: None,
+            });
+            p.ips = probe.allowed_ips.clone().unwrap_or_default();
+            p.probe = probe;
         }
+    }
+
+    /// Whether a failed peer must remain absent to let the remote fall back.
+    pub fn suspended(&self, key: &Key) -> bool {
+        self.peers.get(key).is_some_and(|p| p.removed.is_some())
     }
 
     /// Allowed IPs the LAN peer `key` must have now.
@@ -96,29 +147,19 @@ impl Links {
         let Ok(dev) = wg::get_device(&self.iface) else { return };
         let now = Instant::now();
         let mut set = DeviceSet::default();
+        let previous = self.peers.clone();
         for (key, p) in &mut self.peers {
-            let Some(info) = dev.peers.iter().find(|i| i.public_key == *key) else { continue };
-            let handshake = info.last_handshake.and_then(|t| SystemTime::now().duration_since(t).ok());
-            if p.observe(info.rx_bytes, handshake, now) {
-                let addr = p.ips.first().map(ToString::to_string).unwrap_or_default();
-                let endpoint = info.endpoint.map(|e| e.to_string()).unwrap_or_default();
-                let msg =
-                    if p.direct { "direct LAN path up" } else { "direct LAN path down; going through the server" };
-                log!(Info, msg, peer = addr, endpoint = endpoint);
-                set.peers.push(PeerSet { public_key: *key, allowed_ips: Some(p.routed()), ..PeerSet::default() });
+            let info = dev.peers.iter().find(|i| i.public_key == *key);
+            if let Some(change) = p.update(info, now) {
+                log!(Info, "updating direct LAN path", direct = p.direct, removed = change.remove);
+                set.peers.push(change);
             }
         }
-        if set.peers.is_empty() {
-            return;
-        }
-        if let Err(e) = wg::set_device(&self.iface, &set) {
+        if !set.peers.is_empty()
+            && let Err(e) = wg::set_device(&self.iface, &set)
+        {
             log!(Warn, "cannot update LAN routes", error = e);
-            // Undo, so the next tick tries again.
-            for s in &set.peers {
-                if let Some(p) = self.peers.get_mut(&s.public_key) {
-                    p.direct = !p.direct;
-                }
-            }
+            self.peers = previous;
         }
     }
 }
@@ -195,10 +236,48 @@ pub fn addresses(skip: &str) -> Vec<AllowedIp> {
 mod tests {
     use super::*;
 
+    fn probe(key: Key, ip: AllowedIp) -> PeerSet {
+        PeerSet { public_key: key, allowed_ips: Some(vec![ip]), keepalive: Some(5), ..PeerSet::default() }
+    }
+
+    #[test]
+    fn fallback_deletes_session_and_config_cannot_resurrect_it() {
+        let now = Instant::now();
+        let mut links = Links { iface: String::new(), peers: BTreeMap::new() };
+        let config = probe([1; 32], "10.77.0.5/32".parse().unwrap());
+        links.track("wg0", vec![config.clone()]);
+        let p = links.peers.get_mut(&[1; 32]).unwrap();
+        p.direct = true;
+        p.heard = Some(now);
+        p.rx = Some(100);
+        let info = wg::PeerInfo { rx_bytes: 100, last_handshake: Some(SystemTime::now()), ..wg::PeerInfo::default() };
+        let down = now + SILENCE;
+        assert!(p.update(Some(&info), down).unwrap().remove);
+        assert_eq!(p.routed(), vec![]);
+        links.track("wg0", vec![config]);
+        assert!(links.suspended(&[1; 32]));
+        let p = links.peers.get_mut(&[1; 32]).unwrap();
+        assert!(p.update(None, (down + RETRY).checked_sub(TICK).unwrap()).is_none());
+        let retry = p.update(None, down + RETRY).unwrap();
+        assert!(!retry.remove);
+        assert_eq!(retry.allowed_ips, Some(vec![]));
+        assert_eq!(retry.keepalive, Some(5));
+        assert!(p.rx.is_none() && p.heard.is_none());
+        assert!(p.update(Some(&wg::PeerInfo::default()), down + RETRY + TICK).is_none());
+        assert!(!p.direct);
+    }
+
     #[test]
     fn peer_is_direct_while_it_is_heard() {
         let t0 = Instant::now();
-        let mut p = Peer { ips: vec!["10.77.0.5/32".parse().unwrap()], direct: false, rx: None, heard: None };
+        let mut p = Peer {
+            probe: PeerSet::default(),
+            removed: None,
+            ips: vec!["10.77.0.5/32".parse().unwrap()],
+            direct: false,
+            rx: None,
+            heard: None,
+        };
         let hs = Some(Duration::from_secs(5));
         assert!(!p.observe(500, hs, t0), "the first reading is only a baseline");
         assert!(!p.observe(500, hs, t0 + TICK));
@@ -217,12 +296,12 @@ mod tests {
     fn track_keeps_state_of_known_peers() {
         let ip: AllowedIp = "10.77.0.5/32".parse().unwrap();
         let mut links = Links { iface: String::new(), peers: BTreeMap::new() };
-        links.track("wg0", vec![([1; 32], vec![ip]), ([2; 32], vec![])]);
+        links.track("wg0", vec![probe([1; 32], ip), probe([2; 32], ip)]);
         links.peers.get_mut(&[1; 32]).unwrap().direct = true;
-        links.track("wg0", vec![([1; 32], vec![ip])]);
+        links.track("wg0", vec![probe([1; 32], ip)]);
         assert_eq!(links.routed(&[1; 32]), vec![ip]);
         assert!(links.routed(&[2; 32]).is_empty() && links.peers.len() == 1);
-        links.track("wg1", vec![([1; 32], vec![ip])]);
+        links.track("wg1", vec![probe([1; 32], ip)]);
         assert!(links.routed(&[1; 32]).is_empty(), "another interface starts over");
     }
 
