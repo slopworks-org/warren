@@ -79,9 +79,14 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// Age of the most recent handshake with any peer.
-pub fn handshake_age(dev: &DeviceInfo) -> Option<Duration> {
-    let latest = dev.peers.iter().filter_map(|p| p.last_handshake).max()?;
+/// Age of the most recent handshake with a configured server peer.
+pub fn handshake_age(dev: &DeviceInfo, servers: &[PeerConfig]) -> Option<Duration> {
+    let latest = dev
+        .peers
+        .iter()
+        .filter(|p| servers.iter().any(|s| peer_key(s).is_ok_and(|k| k == p.public_key)))
+        .filter_map(|p| p.last_handshake)
+        .max()?;
     SystemTime::now().duration_since(latest).ok()
 }
 
@@ -116,13 +121,28 @@ mod tests {
     }
 
     #[test]
-    fn handshake_age_uses_latest_peer() {
+    fn lan_handshakes_do_not_mask_a_stale_server() {
+        let servers = vec![PeerConfig {
+            public_key: codec::encode_key(&[1; 32]),
+            endpoint: String::new(),
+            allowed_ips: vec![],
+            keepalive: 0,
+        }];
         let mut dev = DeviceInfo::default();
-        assert_eq!(handshake_age(&dev), None);
+        assert_eq!(handshake_age(&dev, &servers), None);
         dev.peers.push(wg::PeerInfo {
-            last_handshake: Some(SystemTime::now() - Duration::from_secs(30)),
+            public_key: [2; 32],
+            last_handshake: Some(SystemTime::now()),
             ..wg::PeerInfo::default()
         });
-        assert!(handshake_age(&dev).unwrap() >= Duration::from_secs(30));
+        assert_eq!(handshake_age(&dev, &servers), None);
+        dev.peers.push(wg::PeerInfo {
+            public_key: [1; 32],
+            last_handshake: Some(SystemTime::now() - Duration::from_secs(300)),
+            ..wg::PeerInfo::default()
+        });
+        assert!(handshake_age(&dev, &servers).unwrap() >= Duration::from_secs(300));
+        dev.peers[1].last_handshake = Some(SystemTime::now());
+        assert!(handshake_age(&dev, &servers).unwrap() < Duration::from_secs(1));
     }
 }

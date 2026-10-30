@@ -45,7 +45,8 @@ pub fn status(args: &Args) -> Result<()> {
     }
     match wg::get_device(&saved.interface) {
         Ok(dev) => {
-            let hs = tunnel::handshake_age(&dev).map_or_else(|| "never".to_string(), |a| format!("{} ago", ago(a)));
+            let hs = tunnel::handshake_age(&dev, &saved.tunnel.peers)
+                .map_or_else(|| "never".to_string(), |a| format!("{} ago", ago(a)));
             let (rx, tx) = dev.peers.iter().fold((0, 0), |(r, t), p| (r + p.rx_bytes, t + p.tx_bytes));
             println!("Handshake:  {hs}");
             println!("Traffic:    received {}, sent {}", bytes(rx), bytes(tx));

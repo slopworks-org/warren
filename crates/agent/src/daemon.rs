@@ -192,7 +192,7 @@ pub fn run(args: &Args) -> Result<()> {
         }
 
         if let Ok(dev) = wg::get_device(&saved.interface) {
-            let stale = tunnel::handshake_age(&dev).is_none_or(|age| age > STALE_HANDSHAKE);
+            let stale = tunnel::handshake_age(&dev, &saved.tunnel.peers).is_none_or(|age| age > STALE_HANDSHAKE);
             let due = last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
             if stale && due {
                 last_refresh = Some(Instant::now());
