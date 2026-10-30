@@ -119,6 +119,8 @@ pub struct WgConfig {
     pub control_port: u16,
     /// MTU of the tunnel interface.
     pub mtu: u32,
+    /// Let agents on the same LAN reach each other directly.
+    pub lan_peers: bool,
 }
 
 impl Default for WgConfig {
@@ -131,6 +133,7 @@ impl Default for WgConfig {
             endpoint: None,
             control_port: DEFAULT_CTL_PORT,
             mtu: 1420,
+            lan_peers: true,
         }
     }
 }

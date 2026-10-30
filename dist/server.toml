@@ -20,6 +20,7 @@ acme_email = "admin@example.com"     # Let's Encrypt account contact
 # port = 51820                       # open this UDP port in the VPS firewall
 # network = "10.77.0.0/16"
 # endpoint = "warren.example.com:51820"
+# lan_peers = true                   # agents on one LAN connect directly, not through this server
 
 # [log]
 # level = "info"                     # or e.g. "warren_server=debug,info"

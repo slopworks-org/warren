@@ -65,6 +65,30 @@ impl Netns {
         Netns { name: name.to_string(), host_if }
     }
 
+    /// A namespace behind `router`, joined to it by a veth pair. The router
+    /// gets `{subnet}.1` and is the default route.
+    fn behind(name: &str, router: &Netns, subnet: &str) -> Netns {
+        let _ = run(&["ip", "netns", "del", name]);
+        let (router_if, dev_if) = (format!("{name}r"), format!("{name}d"));
+        must(&["ip", "netns", "add", name]);
+        must(&["ip", "link", "add", &router_if, "type", "veth", "peer", "name", &dev_if]);
+        must(&["ip", "link", "set", &router_if, "netns", &router.name]);
+        must(&["ip", "link", "set", &dev_if, "netns", name]);
+        router.must(&["ip", "addr", "add", &format!("{subnet}.1/24"), "dev", &router_if]);
+        router.must(&["ip", "link", "set", &router_if, "up"]);
+        let ns = Netns { name: name.to_string(), host_if: router_if };
+        ns.must(&["ip", "addr", "add", &format!("{subnet}.2/24"), "dev", &dev_if]);
+        ns.must(&["ip", "link", "set", &dev_if, "up"]);
+        ns.must(&["ip", "link", "set", "lo", "up"]);
+        ns.must(&["ip", "route", "add", "default", "via", &format!("{subnet}.1")]);
+        ns
+    }
+
+    fn must(&self, args: &[&str]) {
+        let out = self.exec(args);
+        assert!(out.status.success(), "{args:?} in {}: {}", self.name, String::from_utf8_lossy(&out.stderr));
+    }
+
     fn exec(&self, args: &[&str]) -> std::process::Output {
         let mut full = vec!["ip", "netns", "exec", &self.name];
         full.extend_from_slice(args);
@@ -387,6 +411,7 @@ struct Scenario {
     backend: &'static str,
     subnet: &'static str,
     manual_subnet: &'static str,
+    lan_subnet: &'static str,
     network: &'static str,
     http_port: u16,
     https_port: u16,
@@ -455,7 +480,7 @@ fn scenario(s: &Scenario) {
     }));
     if let Err(panic) = result {
         eprintln!("---- server log ----\n{}", fs::read_to_string(dir.join("server.log")).unwrap_or_default());
-        for f in ["agent.log", "agent2.log"] {
+        for f in ["agent.log", "agent2.log", "nas.log"] {
             eprintln!("---- {f} ----\n{}", fs::read_to_string(dir.join(f)).unwrap_or_default());
         }
         std::panic::resume_unwind(panic);
@@ -493,6 +518,7 @@ fn flows(s: &Scenario, dir: &Path, dev: &Netns, admin: &mut Client, agent_bin: &
     check_mandatory_2fa(dir, admin, s.https_port);
     check_api_token(dir, admin, s.https_port);
     check_agentless_and_acl(s, dir, admin, &bob, bob_id, &agent);
+    check_lan_peers(s, dir, dev, admin, agent_bin, &agent);
     check_failures_restart_revoke(s, dir, dev, admin, &visitor, &mut agent);
     check_audit(admin, &bob);
 }
@@ -744,6 +770,68 @@ fn check_agentless_and_acl(s: &Scenario, dir: &Path, admin: &Client, bob: &Clien
     assert!(other_port.stdout.is_empty(), "only the allowed port is open");
 }
 
+/// A second agent behind the first one, which acts as a NAT router, talks
+/// to it directly over their LAN, and through the hub once that path breaks.
+fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, agent_bin: &str, agent: &Agent) {
+    let nas = Netns::behind(&format!("wl{}", s.tag), router, s.lan_subnet);
+    router.must(&["sysctl", "-qw", "net.ipv4.ip_forward=1"]);
+    let nat = format!(
+        "add table ip lan; add chain ip lan post {{ type nat hook postrouting priority 100; }}; \
+         add rule ip lan post oifname \"wd{}d\" masquerade",
+        s.tag
+    );
+    router.must(&["nft", &nat]);
+
+    let token = admin.ok("POST", "/devices/tokens", Some(json!({ "name": "nas" })));
+    let nas_dir = dir.join("nas");
+    let iface = format!("wrn{}", s.tag);
+    let (cfg_dir, run_dir) = (nas_dir.join("etc"), nas_dir.join("run"));
+    let common =
+        ["--config-dir", cfg_dir.to_str().unwrap(), "--run-dir", run_dir.to_str().unwrap(), "--interface", &iface];
+    let server_url = format!("http://{}.1:{}", s.subnet, s.http_port);
+    let mut up = vec![agent_bin, "up", "--server", &server_url, "--token", token["token"].as_str().unwrap()];
+    up.extend(common);
+    nas.must(&up);
+    let mut run_args = vec![agent_bin, "run"];
+    run_args.extend(common);
+    let mut daemon = nas.spawn(&run_args, &dir.join("nas.log"));
+    nas.serve(8000);
+    let device = || {
+        let devices = admin.ok("GET", "/devices", None);
+        devices.as_array().unwrap().iter().find(|d| d["name"] == "nas").unwrap().clone()
+    };
+    wait_for("the NAS to come online", Duration::from_secs(30), || device()["online"] == json!(true));
+    let (nas_id, nas_addr) = (device()["id"].as_i64().unwrap(), device()["address"].as_str().unwrap().to_string());
+
+    let has_route = |ns: &Netns, iface: &str, addr: &str| {
+        let out = ns.exec(&["wg", "show", iface, "allowed-ips"]);
+        String::from_utf8_lossy(&out.stdout).contains(&format!("{addr}/32"))
+    };
+    let reach_nas = || {
+        let out = router.exec(&["curl", "-s", "--max-time", "3", &format!("http://{nas_addr}:8000/lan")]);
+        String::from_utf8_lossy(&out.stdout).contains("hello from device")
+    };
+    wait_for("a direct path between the router and the NAS", Duration::from_secs(90), || {
+        has_route(router, &agent.iface, &nas_addr) && has_route(&nas, &iface, &agent.addr)
+    });
+    wait_for("the NAS to answer over the direct path", Duration::from_secs(10), reach_nas);
+
+    let lan_ip = format!("{}.1", s.lan_subnet);
+    let block = format!(
+        "add table ip block; add chain ip block in {{ type filter hook input priority 0; }}; \
+         add chain ip block out {{ type filter hook output priority 0; }}; \
+         add rule ip block in ip saddr {lan_ip} meta l4proto udp drop; \\
+         add rule ip block out ip daddr {lan_ip} meta l4proto udp drop"
+    );
+    nas.must(&["nft", &block]);
+    wait_for("the router to reach the NAS through the hub", Duration::from_secs(60), || {
+        !has_route(router, &agent.iface, &nas_addr) && reach_nas()
+    });
+
+    daemon.terminate();
+    admin.ok("DELETE", &format!("/devices/{nas_id}"), None);
+}
+
 /// Error pages, an agent restart ("reboot") and revocation.
 fn check_failures_restart_revoke(
     s: &Scenario,
@@ -809,6 +897,7 @@ fn kernel_backend() {
         backend: "kernel",
         subnet: "192.168.77",
         manual_subnet: "192.168.177",
+        lan_subnet: "172.20.77",
         network: "10.88.0.0/16",
         http_port: 18080,
         https_port: 18443,
@@ -824,6 +913,7 @@ fn userspace_backend() {
         backend: "userspace",
         subnet: "192.168.78",
         manual_subnet: "192.168.178",
+        lan_subnet: "172.20.78",
         network: "10.89.0.0/16",
         http_port: 28080,
         https_port: 28443,
