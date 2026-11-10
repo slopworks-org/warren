@@ -300,6 +300,7 @@ impl AppState {
                 allowed_ips: vec![self.network.to_string()],
                 keepalive: DEFAULT_KEEPALIVE,
             }],
+            lan_peers: Vec::new(),
             update: self.snapshot().agent_target.clone(),
         };
         cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;

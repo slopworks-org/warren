@@ -7,7 +7,7 @@ use crate::cli::Args;
 use crate::error::{Error, Result};
 use crate::state::{self, Saved};
 use crate::up::{hostname, os_tag};
-use crate::{http, log, selfupdate, stopping, tunnel};
+use crate::{http, lan, log, selfupdate, stopping, tunnel};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use warren_proto::{AgentConfig, CONFIG_PATH, Kv, LONG_POLL_SECS};
@@ -49,13 +49,24 @@ enum Poll {
     Unchanged,
 }
 
+/// Reports where devices on the same LAN can reach this one directly.
+fn lan_query(saved: &Saved) -> String {
+    let port = wg::get_device(&saved.interface).map_or(0, |d| d.listen_port);
+    let addrs: Vec<String> = lan::addresses(&saved.interface).iter().map(ToString::to_string).collect();
+    if port == 0 || addrs.is_empty() {
+        return String::new();
+    }
+    format!("&lan={}&port={port}", percent_encode(&addrs.join(",")))
+}
+
 fn poll(saved: &Saved, wait: u64) -> Result<Poll> {
     let path = format!(
-        "{CONFIG_PATH}?v={}&wait={wait}&agent={}&os={}&hostname={}",
+        "{CONFIG_PATH}?v={}&wait={wait}&agent={}&os={}&hostname={}{}",
         saved.tunnel.version,
         warren_proto::VERSION,
         percent_encode(&os_tag()),
         percent_encode(&hostname()),
+        lan_query(saved),
     );
     let control = &saved.tunnel.control;
     let resp = http::request(control, control, "GET", &path, None, Duration::from_secs(wait + 15))
@@ -118,6 +129,7 @@ pub fn run(args: &Args) -> Result<()> {
     let key = state::load_key(&args.paths.key())?;
     log!(Info, "starting", version = warren_proto::VERSION, iface = saved.interface, device = saved.tunnel.name);
 
+    lan::spawn_watcher();
     let mut st = Status { state: "starting", last_contact: 0, last_error: String::new() };
     let mut applied = false;
     let mut backoff = 0;

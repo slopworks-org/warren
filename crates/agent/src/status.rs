@@ -49,6 +49,11 @@ pub fn status(args: &Args) -> Result<()> {
             let (rx, tx) = dev.peers.iter().fold((0, 0), |(r, t), p| (r + p.rx_bytes, t + p.tx_bytes));
             println!("Handshake:  {hs}");
             println!("Traffic:    received {}, sent {}", bytes(rx), bytes(tx));
+            for p in &t.lan_peers {
+                let direct = dev.peers.iter().any(|d| tunnel::same_key(p, &d.public_key) && !d.allowed_ips.is_empty());
+                let path = if direct { "direct" } else { "through the server" };
+                println!("LAN peer:   {} at {}, {path}", p.allowed_ips.join(","), p.endpoint);
+            }
         }
         Err(e) if wg::link_index(&saved.interface).is_none() => println!("Tunnel:     down ({e})"),
         Err(e) => println!("Tunnel:     unknown ({e}; run as root for details)"),

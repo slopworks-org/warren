@@ -67,6 +67,9 @@ pub const DEFAULT_WG_PORT: u16 = 51820;
 pub const DEFAULT_KEEPALIVE: u16 = 25;
 /// How long the server holds a config long-poll open, in seconds.
 pub const LONG_POLL_SECS: u64 = 50;
+/// Keepalive of direct peers on the same LAN. Each side then hears from the
+/// other at least this often, so a missing reply soon shows a broken path.
+pub const LAN_KEEPALIVE: u16 = 10;
 
 /// A WireGuard peer as the server describes it to an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +82,29 @@ pub struct PeerConfig {
     pub allowed_ips: Vec<String>,
     /// Persistent keepalive interval in seconds; 0 disables it.
     pub keepalive: u16,
+}
+
+impl PeerConfig {
+    /// `key endpoint ips keepalive`, with `-` for an empty endpoint.
+    fn encode(&self) -> String {
+        let endpoint = if self.endpoint.is_empty() { "-" } else { &self.endpoint };
+        format!("{} {endpoint} {} {}", self.public_key, self.allowed_ips.join(","), self.keepalive)
+    }
+
+    fn parse(line: &str, field: &'static str) -> Result<Self, Error> {
+        let mut it = line.split(' ');
+        let (Some(key), Some(ep), Some(ips), Some(ka), None) = (it.next(), it.next(), it.next(), it.next(), it.next())
+        else {
+            return Err(Error::BadField(field));
+        };
+        codec::decode_key(key).ok_or(Error::BadField(field))?;
+        Ok(PeerConfig {
+            public_key: key.to_string(),
+            endpoint: if ep == "-" { String::new() } else { ep.to_string() },
+            allowed_ips: ips.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+            keepalive: ka.parse().map_err(|_| Error::BadField(field))?,
+        })
+    }
 }
 
 /// Desired tunnel state pushed by the server over the control channel.
@@ -97,12 +123,17 @@ pub struct AgentConfig {
     pub control: String,
     /// Peers to configure; in the hub-and-spoke topology, only the server.
     pub peers: Vec<PeerConfig>,
+    /// Devices on the same LAN to reach directly. The agent routes a device's
+    /// address to it only while the direct path works, and through the server
+    /// otherwise.
+    pub lan_peers: Vec<PeerConfig>,
     /// Agent version to update to from [`BINARY_PATH`]; empty for none.
     pub update: String,
 }
 
 impl AgentConfig {
-    /// Serializes into `kv` pairs; peers become repeated `peer` lines.
+    /// Serializes into `kv` pairs; peers become repeated `peer` lines and
+    /// LAN peers `lan_peer` lines, which older agents ignore.
     #[must_use]
     pub fn to_kv(&self) -> Kv {
         let mut kv = Kv::new();
@@ -118,8 +149,10 @@ impl AgentConfig {
         kv.push("address", &self.address);
         kv.push("control", &self.control);
         for p in &self.peers {
-            let endpoint = if p.endpoint.is_empty() { "-" } else { &p.endpoint };
-            kv.push("peer", format!("{} {} {} {}", p.public_key, endpoint, p.allowed_ips.join(","), p.keepalive));
+            kv.push("peer", p.encode());
+        }
+        for p in &self.lan_peers {
+            kv.push("lan_peer", p.encode());
         }
         if !self.update.is_empty() {
             kv.push("update", &self.update);
@@ -131,29 +164,15 @@ impl AgentConfig {
     /// # Errors
     /// When a field is missing or malformed.
     pub fn from_kv(kv: &Kv) -> Result<Self, Error> {
-        let mut peers = Vec::new();
-        for line in kv.get_all("peer") {
-            let mut it = line.split(' ');
-            let (Some(key), Some(ep), Some(ips), Some(ka), None) =
-                (it.next(), it.next(), it.next(), it.next(), it.next())
-            else {
-                return Err(Error::BadField("peer"));
-            };
-            codec::decode_key(key).ok_or(Error::BadField("peer"))?;
-            peers.push(PeerConfig {
-                public_key: key.to_string(),
-                endpoint: if ep == "-" { String::new() } else { ep.to_string() },
-                allowed_ips: ips.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
-                keepalive: ka.parse().map_err(|_| Error::BadField("peer"))?,
-            });
-        }
+        let peers = |field| kv.get_all(field).map(|l| PeerConfig::parse(l, field)).collect::<Result<Vec<_>, _>>();
         Ok(AgentConfig {
             version: kv.parse_field("version")?,
             device_id: kv.parse_field("device_id")?,
             name: kv.req("name")?.to_string(),
             address: kv.req("address")?.to_string(),
             control: kv.req("control")?.to_string(),
-            peers,
+            peers: peers("peer")?,
+            lan_peers: peers("lan_peer")?,
             update: kv.get("update").unwrap_or_default().to_string(),
         })
     }
@@ -177,6 +196,12 @@ mod tests {
                 allowed_ips: vec!["10.77.0.0/16".into()],
                 keepalive: 25,
             }],
+            lan_peers: vec![PeerConfig {
+                public_key: codec::encode_key(&[8u8; 32]),
+                endpoint: "192.168.1.10:41000".into(),
+                allowed_ips: vec!["10.77.0.6/32".into()],
+                keepalive: LAN_KEEPALIVE,
+            }],
             update: String::new(),
         };
         let text = cfg.to_kv().encode();
@@ -188,6 +213,9 @@ mod tests {
         let mut kv = Kv::parse(&text).unwrap();
         kv.push("peer", "notakey - x 1");
         assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("peer")));
+        let mut kv = Kv::parse(&text).unwrap();
+        kv.push("lan_peer", "notakey - x 1");
+        assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("lan_peer")));
         assert_eq!(AgentConfig::from_kv(&Kv::new()), Err(Error::MissingField("version")));
     }
 
