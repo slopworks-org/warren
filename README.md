@@ -98,6 +98,29 @@ Servers and agents installed before this feature need one upgrade with
 `install.sh`. On the server, it also installs the new systemd unit. The
 container image does not update itself; pull a new image instead.
 
+## Devices on one LAN
+
+Two agents on the same LAN send traffic to each other directly, not
+through the VPS. The server pairs two agents when it sees them behind the
+same public address and they have addresses in one subnet. The two devices
+must be allowed to exchange all traffic. By default, this applies to the
+devices of one user. Port rules apply only on the server, so pairs that
+have only port rules always go through the VPS.
+
+Blocking a user or disabling a device revokes access through the server.
+An established direct LAN connection can remain active if the agents can
+no longer reach the server to receive updated configuration. This is
+intentional: Warren does not isolate devices on their local network.
+The direct tunnel grants no additional access through the server or to
+other Warren peers.
+
+Each agent checks the direct path. If no packets come from the other agent
+for 25 seconds, the agent sends the traffic through the VPS again.
+`warren status` shows the path to each LAN peer. If a host firewall blocks
+the agent's WireGuard port, the two agents stay on the VPS path. Phones and
+laptops with the WireGuard app always use the VPS. To turn this feature
+off, set `lan_peers = false` in the `[wireguard]` section of `server.toml`.
+
 ## Also included
 
 Users and roles, two-factor login (TOTP), device ACLs, an audit log, and an
@@ -109,8 +132,8 @@ HTTP API for all admin actions.
   certificate, set `mode = "files"` in the `[tls]` section.
 - Only IPv4 inside the tunnel.
 - The agent needs kernel WireGuard on Linux and wireguard-go on macOS.
-- No mesh between devices, no OIDC, no raw TCP/UDP forwarding, no multiple
-  servers.
+- No direct paths between devices on different networks, no OIDC, no raw
+  TCP/UDP forwarding, no multiple servers.
 
 ## Change the code
 
