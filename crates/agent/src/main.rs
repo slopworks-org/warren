@@ -11,6 +11,7 @@ mod error;
 mod http;
 mod lan;
 mod log;
+mod privilege;
 mod selfupdate;
 mod state;
 mod status;
@@ -66,6 +67,10 @@ fn main() -> ExitCode {
     {
         eprintln!("warren: unknown log level {level:?}");
         return ExitCode::from(2);
+    }
+    if let Err(e) = privilege::elevate(&args) {
+        eprintln!("warren: {e}");
+        return ExitCode::FAILURE;
     }
     let result = match args.command {
         Command::Up => up::run(&args),

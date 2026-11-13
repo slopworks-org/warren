@@ -58,6 +58,8 @@ You need:
    The script installs `kmod-wireguard` on OpenWrt (opkg or apk), registers
    the device and starts the agent service (systemd, OpenWrt init or
    launchd). Check it with `warren status`.
+   Agent commands automatically request administrator privileges through `sudo`
+   when needed. On systems without `sudo`, run the agent as root.
 4. Publish a service. Go to Resources → Publish service. Set the address, the
    device and the port.
 

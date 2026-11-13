@@ -22,6 +22,9 @@ COMMON OPTIONS:
 `--server` is the server's address, e.g. https://vpn.example.com. Registration
 talks plain HTTP on port 80 (or the port of an http:// URL) and is authenticated
 with the token, so the agent needs no TLS stack.
+
+up, run, status and down automatically request administrator privileges through
+sudo when needed. On systems without sudo, run these commands as root.
 ";
 
 /// Which subcommand to run.
