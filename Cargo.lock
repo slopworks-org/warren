@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "warren-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "warren-proto",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "warren-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hmac",
  "sha2",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "warren-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "axum",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "warren-wgctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
