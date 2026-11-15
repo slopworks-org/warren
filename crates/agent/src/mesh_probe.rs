@@ -46,12 +46,20 @@ impl Probe {
 
     /// Sends a new challenge. Failed sends do not prolong the route's lifetime.
     pub fn send(&mut self, socket: &UdpSocket, ip: Ipv4Addr, now: Instant) {
-        let Ok(nonce) = crate::state::random_bytes::<16>() else { return };
+        // Keep the same outstanding challenge while the other watcher's
+        // independently scheduled receive loop is handling it.
+        let (nonce, sent) = if let Some(pending) = self.pending.filter(|(_, sent)| now.duration_since(*sent) < SILENCE)
+        {
+            pending
+        } else {
+            let Ok(nonce) = crate::state::random_bytes::<16>() else { return };
+            (nonce, now)
+        };
         let mut packet = [0; PACKET_LEN];
         packet[0] = 1;
         packet[1..].copy_from_slice(&nonce);
         if socket.send_to(&packet, SocketAddr::new(IpAddr::V6(address(ip)), PORT)).is_ok() {
-            self.pending = Some((nonce, now));
+            self.pending = Some((nonce, sent));
         }
     }
 

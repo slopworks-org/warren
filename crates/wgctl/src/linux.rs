@@ -401,6 +401,21 @@ pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool
     }
 }
 
+pub fn routes_to(name: &str, destination: IpAddr) -> io::Result<bool> {
+    let family = if destination.is_ipv4() { AF_INET } else { AF_INET6 };
+    let prefix = if destination.is_ipv4() { 32 } else { 128 };
+    let header = [u8::try_from(family).unwrap_or_default(), prefix, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut msg = Msg::new(&header);
+    msg.attr(1, &ip_bytes(&destination));
+    let replies = Socket::open(libc::NETLINK_ROUTE)?.request(msg, 26, 0)?;
+    let wanted = index(name)?;
+    Ok(replies.iter().any(|reply| {
+        reply
+            .get(12..)
+            .is_some_and(|attrs| Attrs(attrs).any(|(kind, value)| kind == 4 && ne_u32(value) == Some(wanted)))
+    }))
+}
+
 pub fn allow_asymmetric(name: &str) -> io::Result<()> {
     // Loose mode accepts authenticated packets whose return route uses the other
     // tunnel. Value 2 also overrides a strict global rp_filter value of 1.

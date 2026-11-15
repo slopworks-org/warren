@@ -133,7 +133,7 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     /// Serializes into `kv` pairs; peers become repeated `peer` lines and
-    /// LAN peers `lan_peer` lines, which older agents ignore.
+    /// LAN peers `lan_peer_v2` lines, which older agents ignore.
     #[must_use]
     pub fn to_kv(&self) -> Kv {
         let mut kv = Kv::new();
@@ -208,6 +208,8 @@ mod tests {
         assert!(!text.contains("update"));
         let back = AgentConfig::from_kv(&Kv::parse(&text).unwrap()).unwrap();
         assert_eq!(cfg, back);
+        let legacy = text.replace("lan_peer_v2=", "lan_peer=");
+        assert_eq!(AgentConfig::from_kv(&Kv::parse(&legacy).unwrap()).unwrap().lan_peers, []);
         let with_update = AgentConfig { update: "0.2.0".into(), ..cfg.clone() };
         assert_eq!(AgentConfig::from_kv(&with_update.to_kv()).unwrap(), with_update);
         let mut kv = Kv::parse(&text).unwrap();

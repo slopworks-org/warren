@@ -41,6 +41,14 @@ pub fn lock() -> MutexGuard<'static, Links> {
 }
 
 impl Links {
+    /// Forgets routes and the listener after the direct interface disappears.
+    pub fn reset(&mut self) {
+        self.iface.clear();
+        self.source = None;
+        self.socket = None;
+        self.peers.clear();
+    }
+
     /// Tracks the configured direct peers and removes stale application routes.
     pub fn track(&mut self, iface: &str, source: Ipv4Addr, peers: Vec<(Key, Ipv4Addr)>) -> wg::Result<()> {
         let reset = self.iface != iface || self.source != Some(source);

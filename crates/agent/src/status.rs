@@ -50,7 +50,9 @@ pub fn status(args: &Args) -> Result<()> {
             println!("Handshake:  {hs}");
             println!("Traffic:    received {}, sent {}", bytes(rx), bytes(tx));
             for p in &t.lan_peers {
-                let direct = dev.peers.iter().any(|d| tunnel::same_key(p, &d.public_key) && !d.allowed_ips.is_empty());
+                let direct = p.allowed_ips.first().and_then(|ip| ip.parse::<wg::AllowedIp>().ok()).is_some_and(|ip| {
+                    wg::routes_to(&crate::lan::interface(&saved.interface), ip.addr).unwrap_or(false)
+                });
                 let path = if direct { "direct" } else { "through the server" };
                 println!("LAN peer:   {} at {}, {path}", p.allowed_ips.join(","), p.endpoint);
             }

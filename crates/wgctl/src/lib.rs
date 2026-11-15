@@ -265,6 +265,14 @@ pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool
     sys::host_route(name, destination, source, present).map_err(|e| Error::new("updating host route on", name, e))
 }
 
+/// Whether the operating system currently routes `destination` through `name`.
+///
+/// # Errors
+/// When route lookup fails or the interface does not exist.
+pub fn routes_to(name: &str, destination: IpAddr) -> Result<bool> {
+    sys::routes_to(name, destination).map_err(|e| Error::new("reading route through", name, e))
+}
+
 /// Permits asymmetric return paths on an interface without disabling source checks.
 ///
 /// # Errors
@@ -314,12 +322,20 @@ pub fn set_forwarding(name: &str, on: bool) -> Result<()> {
 /// # Errors
 /// When any of the underlying address or link operations fails.
 pub fn ensure_address(name: &str, addr: AllowedIp, mtu: u32) -> Result<()> {
+    ensure_addresses(name, &[addr], mtu)
+}
+
+/// Makes sure `name` carries exactly `addresses`, then brings it up.
+///
+/// # Errors
+/// When any address or link operation fails.
+pub fn ensure_addresses(name: &str, addresses: &[AllowedIp], mtu: u32) -> Result<()> {
     let current = list_addresses(name)?;
-    for a in current.iter().filter(|a| **a != addr) {
-        del_address(name, *a)?;
+    for address in current.iter().filter(|a| !addresses.contains(a)) {
+        del_address(name, *address)?;
     }
-    if !current.contains(&addr) {
-        add_address(name, addr)?;
+    for address in addresses.iter().filter(|a| !current.contains(a)) {
+        add_address(name, *address)?;
     }
     set_link_up(name, mtu)
 }

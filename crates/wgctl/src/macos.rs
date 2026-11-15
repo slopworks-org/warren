@@ -250,6 +250,18 @@ pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool
     }
 }
 
+pub fn routes_to(name: &str, destination: IpAddr) -> io::Result<bool> {
+    let real = real(name)?;
+    let family = if destination.is_ipv4() { "-inet" } else { "-inet6" };
+    let output = Command::new("/sbin/route").args(["-n", "get", family, &destination.to_string()]).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("route lookup failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim().strip_prefix("interface:").is_some_and(|iface| iface.trim() == real)))
+}
+
 #[expect(clippy::unnecessary_wraps, reason = "shared platform interface returns I/O failures on Linux")]
 pub fn allow_asymmetric(_: &str) -> io::Result<()> {
     // macOS does not apply Linux's per-interface IPv4 reverse path filter.
