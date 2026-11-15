@@ -228,6 +228,34 @@ pub fn set_device(name: &str, set: &DeviceSet) -> io::Result<()> {
     uapi::set_device(&socket(&real(name)?), set)
 }
 
+pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool) -> io::Result<()> {
+    let real = real(name)?;
+    let family = if destination.is_ipv4() { "-inet" } else { "-inet6" };
+    let destination = destination.to_string();
+    let source = source.to_string();
+    if present {
+        let args = ["-q", "-n", "add", family, "-host", &destination, "-interface", &real, "-ifa", &source];
+        if run("/sbin/route", &args).is_ok() {
+            Ok(())
+        } else {
+            let mut change = args;
+            change[2] = "change";
+            run("/sbin/route", &change)
+        }
+    } else {
+        // Deleting an absent route is harmless. A wrong interface must not
+        // delete another tunnel's route.
+        let _ = run("/sbin/route", &["-q", "-n", "delete", family, "-host", &destination, "-interface", &real]);
+        Ok(())
+    }
+}
+
+#[expect(clippy::unnecessary_wraps, reason = "shared platform interface returns I/O failures on Linux")]
+pub fn allow_asymmetric(_: &str) -> io::Result<()> {
+    // macOS does not apply Linux's per-interface IPv4 reverse path filter.
+    Ok(())
+}
+
 pub fn set_forwarding(_: &str, _: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "per-interface forwarding needs Linux"))
 }
