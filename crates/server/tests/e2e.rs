@@ -839,10 +839,10 @@ fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, age
     // must accept authenticated application sources throughout each mismatch.
     router.must(&["ip", "route", "del", &format!("{nas_addr}/32"), "dev", &router_direct]);
     ping_both();
-    router.must(&["ip", "route", "replace", &format!("{nas_addr}/32"), "dev", &router_direct, "src", &agent.addr]);
+    restore_mesh_route(router, &router_direct, &nas_addr, &agent.addr);
     nas.must(&["ip", "route", "del", &format!("{}/32", agent.addr), "dev", &nas_direct]);
     ping_both();
-    nas.must(&["ip", "route", "replace", &format!("{}/32", agent.addr), "dev", &nas_direct, "src", &nas_addr]);
+    restore_mesh_route(&nas, &nas_direct, &agent.addr, &nas_addr);
 
     // Drop only one underlay direction. Neither receiving requests nor
     // receiving unrelated WireGuard traffic may keep an unusable route alive.
@@ -865,6 +865,11 @@ fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, age
 
     daemon.terminate();
     admin.ok("DELETE", &format!("/devices/{nas_id}"), None);
+}
+
+fn restore_mesh_route(ns: &Netns, iface: &str, destination: &str, source: &str) {
+    // Match the ownership metadata of routes installed by the real watcher.
+    ns.must(&["ip", "route", "replace", &format!("{destination}/32"), "dev", iface, "src", source, "proto", "static"]);
 }
 
 /// Error pages, an agent restart ("reboot") and revocation.

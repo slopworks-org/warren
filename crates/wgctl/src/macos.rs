@@ -243,10 +243,21 @@ pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool
             run("/sbin/route", &change)
         }
     } else {
-        // Deleting an absent route is harmless. A wrong interface must not
-        // delete another tunnel's route.
-        let _ = run("/sbin/route", &["-q", "-n", "delete", family, "-host", &destination, "-interface", &real]);
+        // The kernel reports ESRCH as "not in table". Every other failure
+        // must reach the watcher so it retains the route state and retries.
+        let output = Command::new("/sbin/route")
+            .args(["-q", "-n", "delete", family, "-host", &destination, "-interface", &real])
+            .env("LC_ALL", "C")
+            .output()?;
+        deletion_result(output.status.success(), &String::from_utf8_lossy(&output.stderr))
+    }
+}
+
+fn deletion_result(success: bool, stderr: &str) -> io::Result<()> {
+    if success || stderr.lines().any(|line| line.trim() == "route: writing to routing socket: not in table") {
         Ok(())
+    } else {
+        Err(io::Error::other(format!("route delete failed: {}", stderr.trim())))
     }
 }
 
@@ -275,6 +286,14 @@ pub fn set_forwarding(_: &str, _: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_distinguishes_absence_from_failure() {
+        assert!(deletion_result(false, "route: writing to routing socket: not in table\n").is_ok());
+        assert!(deletion_result(false, "route: writing to routing socket: Permission denied\n").is_err());
+        assert!(deletion_result(false, "").is_err());
+        assert!(deletion_result(true, "").is_ok());
+    }
 
     #[test]
     fn networks_and_prefixes() {
