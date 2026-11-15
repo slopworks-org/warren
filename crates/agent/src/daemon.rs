@@ -51,12 +51,12 @@ enum Poll {
 
 /// Reports where devices on the same LAN can reach this one directly.
 fn lan_query(saved: &Saved) -> String {
-    let port = wg::get_device(&saved.interface).map_or(0, |d| d.listen_port);
+    let port = wg::get_device(&lan::interface(&saved.interface)).map_or(0, |d| d.listen_port);
     let addrs: Vec<String> = lan::addresses(&saved.interface).iter().map(ToString::to_string).collect();
     if port == 0 || addrs.is_empty() {
         return String::new();
     }
-    format!("&lan={}&port={port}", percent_encode(&addrs.join(",")))
+    format!("&lan={}&port={port}&mesh=2", percent_encode(&addrs.join(",")))
 }
 
 fn poll(saved: &Saved, wait: u64) -> Result<Poll> {
@@ -129,6 +129,7 @@ pub fn run(args: &Args) -> Result<()> {
     let key = state::load_key(&args.paths.key())?;
     log!(Info, "starting", version = warren_proto::VERSION, iface = saved.interface, device = saved.tunnel.name);
 
+    tunnel::remove_direct(&saved.interface)?;
     lan::spawn_watcher();
     let mut st = Status { state: "starting", last_contact: 0, last_error: String::new() };
     let mut applied = false;
@@ -141,7 +142,10 @@ pub fn run(args: &Args) -> Result<()> {
 
     while !stopping() {
         // (Re)create the interface if it is missing, e.g. after `ifdown`.
-        if !applied || wg::link_index(&saved.interface).is_none() {
+        if !applied
+            || wg::link_index(&saved.interface).is_none()
+            || wg::link_index(&lan::interface(&saved.interface)).is_none()
+        {
             match tunnel::apply(&saved, &key) {
                 Ok(()) => {
                     applied = true;
@@ -209,6 +213,7 @@ pub fn run(args: &Args) -> Result<()> {
     if wg::link_index(&saved.interface).is_some() {
         wg::delete_link(&saved.interface)?;
     }
+    tunnel::remove_direct(&saved.interface)?;
     let _ = std::fs::remove_file(args.paths.status());
     Ok(())
 }

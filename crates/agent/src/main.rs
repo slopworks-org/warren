@@ -11,6 +11,7 @@ mod error;
 mod http;
 mod lan;
 mod log;
+mod mesh_probe;
 mod privilege;
 mod selfupdate;
 mod state;

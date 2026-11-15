@@ -1,129 +1,101 @@
-//! Direct paths to devices on the same LAN.
-//!
-//! The server lists such devices as LAN peers. Each one gets a short
-//! keepalive but no allowed IPs, so WireGuard keeps a session with it and
-//! routes nothing there. A watcher thread gives a LAN peer its tunnel address
-//! while packets keep arriving from it and takes the address away when they
-//! stop. Traffic to that device then goes through the server again, whose
-//! peer covers the whole tunnel network.
+//! Independent direct LAN paths with round-trip liveness and hub fallback.
 
-use crate::log;
+use crate::{log, mesh_probe};
 use std::collections::BTreeMap;
 use std::ffi::CStr;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
-use warren_wgctl::{self as wg, AllowedIp, DeviceSet, Key, PeerSet};
+use std::time::{Duration, Instant};
+use warren_wgctl::{self as wg, AllowedIp, Key};
 
 const TICK: Duration = Duration::from_secs(2);
-/// Silence after which a direct path counts as broken: a few missed
-/// [`warren_proto::LAN_KEEPALIVE`]s.
-const SILENCE: Duration = Duration::from_secs(25);
-/// WireGuard drops a session this long after its handshake. Handshake
-/// messages count as received bytes, so traffic alone does not prove that
-/// the path works both ways; a completed handshake does.
-const SESSION: Duration = Duration::from_secs(180);
 const MAX_ADDRESSES: usize = 8;
-/// Bridges and links of containers and VMs. Their addresses repeat on every
-/// host that runs the same software, so they do not identify a LAN.
 const VIRTUAL_PREFIXES: &[&str] = &["docker", "veth", "virbr", "vnet", "cni", "flannel", "podman", "lxc", "lxd"];
 
+/// Stable auxiliary interface name, within Linux's 15-byte limit.
+pub fn interface(hub: &str) -> String {
+    let hash = hub.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    format!("wm{:012x}", hash & 0xffff_ffff_ffff)
+}
+
 struct Peer {
-    ips: Vec<AllowedIp>,
+    ip: Ipv4Addr,
     direct: bool,
-    rx: Option<u64>,
-    heard: Option<Instant>,
+    probe: mesh_probe::Probe,
 }
 
-impl Peer {
-    /// Records the peer's received-byte counter and the age of its last
-    /// handshake; returns true when the peer must gain or lose its route.
-    fn observe(&mut self, rx: u64, handshake: Option<Duration>, now: Instant) -> bool {
-        // The counter restarts at zero when the interface is recreated.
-        if self.rx.is_some_and(|old| rx > old) {
-            self.heard = Some(now);
-        }
-        self.rx = Some(rx);
-        let alive =
-            self.heard.is_some_and(|t| now.duration_since(t) < SILENCE) && handshake.is_some_and(|a| a < SESSION);
-        let changed = alive != self.direct;
-        self.direct = alive;
-        changed
-    }
-
-    fn routed(&self) -> Vec<AllowedIp> {
-        if self.direct { self.ips.clone() } else { Vec::new() }
-    }
-}
-
-/// LAN peers of the interface and whether each one is reached directly.
+/// LAN peers, whose inbound authentication never changes with route choice.
 pub struct Links {
     iface: String,
+    source: Option<Ipv4Addr>,
+    socket: Option<UdpSocket>,
     peers: BTreeMap<Key, Peer>,
 }
 
-static LINKS: Mutex<Links> = Mutex::new(Links { iface: String::new(), peers: BTreeMap::new() });
+static LINKS: Mutex<Links> =
+    Mutex::new(Links { iface: String::new(), source: None, socket: None, peers: BTreeMap::new() });
 
-/// Hold the guard while changing the interface's peers, so the watcher does
-/// not change them at the same time.
+/// Serializes configuration and route changes against the watcher.
 pub fn lock() -> MutexGuard<'static, Links> {
     LINKS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Links {
-    /// Starts tracking `peers` of `iface` and forgets all others.
-    pub fn track(&mut self, iface: &str, peers: Vec<(Key, Vec<AllowedIp>)>) {
-        if self.iface != iface {
-            self.iface = iface.to_string();
-            self.peers.clear();
-        }
-        self.peers.retain(|k, _| peers.iter().any(|(p, _)| p == k));
-        for (key, ips) in peers {
-            self.peers.entry(key).or_insert(Peer { ips: Vec::new(), direct: false, rx: None, heard: None }).ips = ips;
-        }
-    }
-
-    /// Allowed IPs the LAN peer `key` must have now.
-    pub fn routed(&self, key: &Key) -> Vec<AllowedIp> {
-        self.peers.get(key).map(Peer::routed).unwrap_or_default()
-    }
-
-    /// Routes LAN peers whose direct path came up and unroutes those whose path went down.
-    fn tick(&mut self) {
-        if self.peers.is_empty() {
-            return;
-        }
-        let Ok(dev) = wg::get_device(&self.iface) else { return };
-        let now = Instant::now();
-        let mut set = DeviceSet::default();
-        for (key, p) in &mut self.peers {
-            let Some(info) = dev.peers.iter().find(|i| i.public_key == *key) else { continue };
-            let handshake = info.last_handshake.and_then(|t| SystemTime::now().duration_since(t).ok());
-            if p.observe(info.rx_bytes, handshake, now) {
-                let addr = p.ips.first().map(ToString::to_string).unwrap_or_default();
-                let endpoint = info.endpoint.map(|e| e.to_string()).unwrap_or_default();
-                let msg =
-                    if p.direct { "direct LAN path up" } else { "direct LAN path down; going through the server" };
-                log!(Info, msg, peer = addr, endpoint = endpoint);
-                set.peers.push(PeerSet { public_key: *key, allowed_ips: Some(p.routed()), ..PeerSet::default() });
+    /// Tracks the configured direct peers and removes stale application routes.
+    pub fn track(&mut self, iface: &str, source: Ipv4Addr, peers: Vec<(Key, Ipv4Addr)>) -> wg::Result<()> {
+        let reset = self.iface != iface || self.source != Some(source);
+        for (key, peer) in &self.peers {
+            if peer.direct && (reset || !peers.contains(&(*key, peer.ip))) {
+                wg::host_route(&self.iface, peer.ip.into(), self.source.unwrap_or(source).into(), false)?;
             }
         }
-        if set.peers.is_empty() {
-            return;
+        if reset {
+            self.peers.clear();
+            self.socket = None;
         }
-        if let Err(e) = wg::set_device(&self.iface, &set) {
-            log!(Warn, "cannot update LAN routes", error = e);
-            // Undo, so the next tick tries again.
-            for s in &set.peers {
-                if let Some(p) = self.peers.get_mut(&s.public_key) {
-                    p.direct = !p.direct;
+        self.iface = iface.to_string();
+        self.source = Some(source);
+        self.peers.retain(|key, peer| peers.contains(&(*key, peer.ip)));
+        for (key, ip) in peers {
+            self.peers.entry(key).or_insert(Peer { ip, direct: false, probe: mesh_probe::Probe::default() });
+        }
+        if self.socket.is_none() {
+            match mesh_probe::socket(source) {
+                Ok(socket) => self.socket = Some(socket),
+                Err(error) => log!(Warn, "cannot listen for direct path probes", error = error),
+            }
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        let (Some(socket), Some(source)) = (&self.socket, self.source) else { return };
+        let now = Instant::now();
+        mesh_probe::drain(socket, |sender, packet| {
+            if let Some(peer) = self.peers.values_mut().find(|p| sender.ip() == IpAddr::V6(mesh_probe::address(p.ip))) {
+                mesh_probe::reply(socket, sender, packet);
+                peer.probe.receive(packet, now);
+            }
+        });
+        for peer in self.peers.values_mut() {
+            let alive = peer.probe.alive(now);
+            if alive != peer.direct {
+                match wg::host_route(&self.iface, peer.ip.into(), source.into(), alive) {
+                    Ok(()) => {
+                        peer.direct = alive;
+                        let msg =
+                            if alive { "direct LAN path up" } else { "direct LAN path down; going through the server" };
+                        log!(Info, msg, peer = peer.ip);
+                    }
+                    Err(error) => log!(Warn, "cannot update direct LAN route", error = error),
                 }
             }
+            peer.probe.send(socket, peer.ip, now);
         }
     }
 }
 
-/// Starts the thread that switches LAN peers between direct and through the server.
+/// Starts the direct path responder and route watcher.
 pub fn spawn_watcher() {
     let started = std::thread::Builder::new().name("lan".into()).spawn(|| {
         while !crate::stopping() {
@@ -194,37 +166,6 @@ pub fn addresses(skip: &str) -> Vec<AllowedIp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn peer_is_direct_while_it_is_heard() {
-        let t0 = Instant::now();
-        let mut p = Peer { ips: vec!["10.77.0.5/32".parse().unwrap()], direct: false, rx: None, heard: None };
-        let hs = Some(Duration::from_secs(5));
-        assert!(!p.observe(500, hs, t0), "the first reading is only a baseline");
-        assert!(!p.observe(500, hs, t0 + TICK));
-        assert!(!p.observe(600, None, t0 + 2 * TICK), "handshake messages alone are not a working path");
-        assert!(p.observe(700, hs, t0 + 3 * TICK) && p.direct);
-        assert_eq!(p.routed(), p.ips);
-        assert!(!p.observe(700, hs, t0 + 2 * TICK + SILENCE));
-        assert!(p.observe(700, hs, t0 + 3 * TICK + SILENCE) && !p.direct);
-        assert_eq!(p.routed(), Vec::new());
-        assert!(!p.observe(0, hs, t0 + 20 * TICK), "a counter reset is not traffic");
-        assert!(p.observe(90, hs, t0 + 21 * TICK) && p.direct);
-        assert!(p.observe(95, Some(SESSION), t0 + 22 * TICK) && !p.direct, "the session expired");
-    }
-
-    #[test]
-    fn track_keeps_state_of_known_peers() {
-        let ip: AllowedIp = "10.77.0.5/32".parse().unwrap();
-        let mut links = Links { iface: String::new(), peers: BTreeMap::new() };
-        links.track("wg0", vec![([1; 32], vec![ip]), ([2; 32], vec![])]);
-        links.peers.get_mut(&[1; 32]).unwrap().direct = true;
-        links.track("wg0", vec![([1; 32], vec![ip])]);
-        assert_eq!(links.routed(&[1; 32]), vec![ip]);
-        assert!(links.routed(&[2; 32]).is_empty() && links.peers.len() == 1);
-        links.track("wg1", vec![([1; 32], vec![ip])]);
-        assert!(links.routed(&[1; 32]).is_empty(), "another interface starts over");
-    }
 
     #[test]
     fn virtual_interfaces() {
