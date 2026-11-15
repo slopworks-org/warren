@@ -152,7 +152,7 @@ impl AgentConfig {
             kv.push("peer", p.encode());
         }
         for p in &self.lan_peers {
-            kv.push("lan_peer", p.encode());
+            kv.push("lan_peer_v2", p.encode());
         }
         if !self.update.is_empty() {
             kv.push("update", &self.update);
@@ -172,7 +172,7 @@ impl AgentConfig {
             address: kv.req("address")?.to_string(),
             control: kv.req("control")?.to_string(),
             peers: peers("peer")?,
-            lan_peers: peers("lan_peer")?,
+            lan_peers: peers("lan_peer_v2")?,
             update: kv.get("update").unwrap_or_default().to_string(),
         })
     }
@@ -214,8 +214,8 @@ mod tests {
         kv.push("peer", "notakey - x 1");
         assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("peer")));
         let mut kv = Kv::parse(&text).unwrap();
-        kv.push("lan_peer", "notakey - x 1");
-        assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("lan_peer")));
+        kv.push("lan_peer_v2", "notakey - x 1");
+        assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("lan_peer_v2")));
         assert_eq!(AgentConfig::from_kv(&Kv::new()), Err(Error::MissingField("version")));
     }
 
