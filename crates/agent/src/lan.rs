@@ -24,16 +24,28 @@ struct Peer {
     probe: mesh_probe::Probe,
 }
 
+impl Peer {
+    fn route<E>(&mut self, alive: bool, apply: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
+        if alive == self.direct {
+            return Ok(false);
+        }
+        apply()?;
+        self.direct = alive;
+        Ok(true)
+    }
+}
+
 /// LAN peers, whose inbound authentication never changes with route choice.
 pub struct Links {
     iface: String,
     source: Option<Ipv4Addr>,
     socket: Option<UdpSocket>,
+    bind_failed: bool,
     peers: BTreeMap<Key, Peer>,
 }
 
 static LINKS: Mutex<Links> =
-    Mutex::new(Links { iface: String::new(), source: None, socket: None, peers: BTreeMap::new() });
+    Mutex::new(Links { iface: String::new(), source: None, socket: None, bind_failed: false, peers: BTreeMap::new() });
 
 /// Serializes configuration and route changes against the watcher.
 pub fn lock() -> MutexGuard<'static, Links> {
@@ -46,6 +58,7 @@ impl Links {
         self.iface.clear();
         self.source = None;
         self.socket = None;
+        self.bind_failed = false;
         self.peers.clear();
     }
 
@@ -60,6 +73,7 @@ impl Links {
         if reset {
             self.peers.clear();
             self.socket = None;
+            self.bind_failed = false;
         }
         self.iface = iface.to_string();
         self.source = Some(source);
@@ -67,16 +81,35 @@ impl Links {
         for (key, ip) in peers {
             self.peers.entry(key).or_insert(Peer { ip, direct: false, probe: mesh_probe::Probe::default() });
         }
-        if self.socket.is_none() {
-            match mesh_probe::socket(source) {
-                Ok(socket) => self.socket = Some(socket),
-                Err(error) => log!(Warn, "cannot listen for direct path probes", error = error),
-            }
-        }
+        self.listen();
         Ok(())
     }
 
+    fn listen(&mut self) {
+        let Some(source) = self.source else { return };
+        self.listen_with(|| mesh_probe::socket(source));
+    }
+
+    fn listen_with(&mut self, bind: impl FnOnce() -> std::io::Result<UdpSocket>) {
+        if self.socket.is_some() {
+            return;
+        }
+        match bind() {
+            Ok(socket) => {
+                self.socket = Some(socket);
+                self.bind_failed = false;
+            }
+            Err(error) => {
+                if !self.bind_failed {
+                    log!(Warn, "cannot listen for direct path probes; retrying", error = error);
+                }
+                self.bind_failed = true;
+            }
+        }
+    }
+
     fn tick(&mut self) {
+        self.listen();
         let (Some(socket), Some(source)) = (&self.socket, self.source) else { return };
         let now = Instant::now();
         mesh_probe::drain(socket, |sender, packet| {
@@ -87,16 +120,15 @@ impl Links {
         });
         for peer in self.peers.values_mut() {
             let alive = peer.probe.alive(now);
-            if alive != peer.direct {
-                match wg::host_route(&self.iface, peer.ip.into(), source.into(), alive) {
-                    Ok(()) => {
-                        peer.direct = alive;
-                        let msg =
-                            if alive { "direct LAN path up" } else { "direct LAN path down; going through the server" };
-                        log!(Info, msg, peer = peer.ip);
-                    }
-                    Err(error) => log!(Warn, "cannot update direct LAN route", error = error),
+            let ip = peer.ip;
+            match peer.route(alive, || wg::host_route(&self.iface, ip.into(), source.into(), alive)) {
+                Ok(true) => {
+                    let msg =
+                        if alive { "direct LAN path up" } else { "direct LAN path down; going through the server" };
+                    log!(Info, msg, peer = peer.ip);
                 }
+                Ok(false) => {}
+                Err(error) => log!(Warn, "cannot update direct LAN route", error = error),
             }
             peer.probe.send(socket, peer.ip, now);
         }
@@ -174,6 +206,35 @@ pub fn addresses(skip: &str) -> Vec<AllowedIp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_recovers_after_port_conflict_without_config_change() {
+        let blocker = UdpSocket::bind("[::1]:0").unwrap();
+        let address = blocker.local_addr().unwrap();
+        let mut links = Links {
+            iface: "test".into(),
+            source: Some(Ipv4Addr::LOCALHOST),
+            socket: None,
+            bind_failed: false,
+            peers: BTreeMap::new(),
+        };
+        links.listen_with(|| UdpSocket::bind(address));
+        assert!(links.socket.is_none() && links.bind_failed);
+        links.listen_with(|| UdpSocket::bind(address));
+        assert!(links.socket.is_none() && links.bind_failed);
+        drop(blocker);
+        links.listen_with(|| UdpSocket::bind(address));
+        assert!(links.socket.is_some() && !links.bind_failed);
+    }
+
+    #[test]
+    fn failed_route_deletion_keeps_state_for_retry() {
+        let mut peer = Peer { ip: Ipv4Addr::LOCALHOST, direct: true, probe: mesh_probe::Probe::default() };
+        let failed = peer.route(false, || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(failed.is_err() && peer.direct);
+        assert!(peer.route(false, || Ok::<_, std::io::Error>(())).unwrap());
+        assert!(!peer.direct);
+    }
 
     #[test]
     fn virtual_interfaces() {
