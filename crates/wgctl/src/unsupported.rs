@@ -54,3 +54,7 @@ pub fn host_route(_: &str, _: std::net::IpAddr, _: std::net::IpAddr, _: bool) ->
 pub fn allow_asymmetric(_: &str) -> io::Result<()> {
     no()
 }
+
+pub fn routes_to(_: &str, _: std::net::IpAddr) -> io::Result<bool> {
+    no()
+}

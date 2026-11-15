@@ -804,8 +804,9 @@ fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, age
     let (nas_id, nas_addr) = (device()["id"].as_i64().unwrap(), device()["address"].as_str().unwrap().to_string());
 
     let has_route = |ns: &Netns, iface: &str, addr: &str| {
-        let out = ns.exec(&["wg", "show", iface, "allowed-ips"]);
-        String::from_utf8_lossy(&out.stdout).contains(&format!("{addr}/32"))
+        let out = ns.exec(&["ip", "route", "get", addr]);
+        let route = String::from_utf8_lossy(&out.stdout);
+        !route.contains(&format!("dev {iface} ")) && route.contains("dev wm")
     };
     let reach_nas = || {
         let out = router.exec(&["curl", "-s", "--max-time", "3", &format!("http://{nas_addr}:8000/lan")]);
@@ -816,17 +817,51 @@ fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, age
     });
     wait_for("the NAS to answer over the direct path", Duration::from_secs(10), reach_nas);
 
+    // Idle sessions must remain direct across the former 25-second expiry.
+    let idle = std::env::var("WARREN_MESH_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(35);
+    thread::sleep(Duration::from_secs(idle));
+    assert!(has_route(router, &agent.iface, &nas_addr));
+    assert!(has_route(&nas, &iface, &agent.addr));
+    assert!(reach_nas());
+    let ping_both = || {
+        router.must(&["ping", "-q", "-c", "3", "-W", "2", &nas_addr]);
+        nas.must(&["ping", "-q", "-c", "3", "-W", "2", &agent.addr]);
+    };
+    let direct_iface = |ns: &Netns, addr: &str| {
+        let out = ns.exec(&["ip", "route", "get", addr]);
+        let text = String::from_utf8(out.stdout).unwrap();
+        let words: Vec<_> = text.split_whitespace().collect();
+        words[words.iter().position(|word| *word == "dev").unwrap() + 1].to_string()
+    };
+    let router_direct = direct_iface(router, &nas_addr);
+    let nas_direct = direct_iface(&nas, &agent.addr);
+    // Hold opposite route choices while probes continue. Both interfaces
+    // must accept authenticated application sources throughout each mismatch.
+    router.must(&["ip", "route", "del", &format!("{nas_addr}/32"), "dev", &router_direct]);
+    ping_both();
+    router.must(&["ip", "route", "replace", &format!("{nas_addr}/32"), "dev", &router_direct, "src", &agent.addr]);
+    nas.must(&["ip", "route", "del", &format!("{}/32", agent.addr), "dev", &nas_direct]);
+    ping_both();
+    nas.must(&["ip", "route", "replace", &format!("{}/32", agent.addr), "dev", &nas_direct, "src", &nas_addr]);
+
+    // Drop only one underlay direction. Neither receiving requests nor
+    // receiving unrelated WireGuard traffic may keep an unusable route alive.
     let lan_ip = format!("{}.1", s.lan_subnet);
     let block = format!(
-        "add table ip block; add chain ip block in {{ type filter hook input priority 0; }}; \
-         add chain ip block out {{ type filter hook output priority 0; }}; \
-         add rule ip block in ip saddr {lan_ip} meta l4proto udp drop; \\
+        "add table ip block; add chain ip block out {{ type filter hook output priority 0; }}; \
          add rule ip block out ip daddr {lan_ip} meta l4proto udp drop"
     );
     nas.must(&["nft", &block]);
-    wait_for("the router to reach the NAS through the hub", Duration::from_secs(60), || {
-        !has_route(router, &agent.iface, &nas_addr) && reach_nas()
+    wait_for("both peers to fall back after one-way LAN loss", Duration::from_secs(20), || {
+        !has_route(router, &agent.iface, &nas_addr) && !has_route(&nas, &iface, &agent.addr)
     });
+    ping_both();
+    assert!(reach_nas());
+    nas.must(&["nft", "delete table ip block"]);
+    wait_for("direct paths to recover", Duration::from_secs(20), || {
+        has_route(router, &agent.iface, &nas_addr) && has_route(&nas, &iface, &agent.addr)
+    });
+    ping_both();
 
     daemon.terminate();
     admin.ok("DELETE", &format!("/devices/{nas_id}"), None);

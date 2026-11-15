@@ -116,10 +116,21 @@ intentional: Warren does not isolate devices on their local network.
 The direct tunnel grants no additional access through the server or to
 other Warren peers.
 
-Each agent checks the direct path. If no packets come from the other agent
-for 25 seconds, the agent sends the traffic through the VPS again.
-`warren status` shows the path to each LAN peer. If a host firewall blocks
-the agent's WireGuard port, the two agents stay on the VPS path. Phones and
+Each agent checks the direct path with authenticated round-trip probes every
+two seconds. If no response arrives for eight seconds, it sends application
+traffic through the VPS again. Separate WireGuard interfaces accept traffic
+through either path while the peers make independent routing decisions.
+Direct probes use an internal IPv6 subnet on the auxiliary interface; the
+LAN underlay and application tunnel can remain IPv4 only. If IPv6 is
+disabled on the host, application traffic stays on the VPS path.
+If a host firewall blocks the auxiliary WireGuard UDP port, the two agents
+stay on the VPS path. The generated interface name starts with `wm`.
+
+Safe direct paths require an upgraded server and both upgraded agents.
+During partial upgrades, new and legacy agents exchange traffic through
+the VPS. Upgrade the server first to withdraw legacy direct peer records.
+Old servers cannot negotiate the new direct protocol, so upgraded agents
+use only the VPS until the server is upgraded. Phones and
 laptops with the WireGuard app always use the VPS. To turn this feature
 off, set `lan_peers = false` in the `[wireguard]` section of `server.toml`.
 

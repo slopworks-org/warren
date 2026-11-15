@@ -25,11 +25,6 @@ fn parse_ip(s: &str) -> Result<AllowedIp> {
     s.parse().map_err(|_| Error::InvalidConfig("invalid address"))
 }
 
-/// Whether `key` is the public key of `p`.
-pub fn same_key(p: &PeerConfig, key: &[u8; 32]) -> bool {
-    peer_key(p).is_ok_and(|k| k == *key)
-}
-
 fn allowed_ips(p: &PeerConfig) -> Result<Vec<AllowedIp>> {
     p.allowed_ips.iter().map(|s| parse_ip(s)).collect()
 }
@@ -66,18 +61,24 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     }
     wg::set_device(iface, &set)?;
     wg::ensure_address(iface, parse_ip(&saved.tunnel.address)?, saved.mtu)?;
-    wg::allow_asymmetric(iface)?;
-    apply_direct(saved, key)
+    if let Err(error) = apply_direct(saved, key) {
+        crate::log!(Warn, "direct paths unavailable; using the server", error = error);
+        remove_direct(iface)?;
+        lan::lock().reset();
+    }
+    Ok(())
 }
 
 /// Configures permanent receive permissions separately from application routes.
 fn apply_direct(saved: &Saved, key: &[u8; 32]) -> Result<()> {
+    wg::allow_asymmetric(&saved.interface)?;
     let IpAddr::V4(source) = parse_ip(&saved.tunnel.address)?.addr else {
         return Err(Error::InvalidConfig("mesh requires an IPv4 tunnel address"));
     };
     let iface = lan::interface(&saved.interface);
     let mut links = lan::lock();
     if wg::link_index(&iface).is_none() {
+        links.reset();
         wg::create_wireguard_link(&iface)?;
     }
     let current = wg::get_device(&iface)?;
@@ -95,7 +96,16 @@ fn apply_direct(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     for old in current.peers.iter().filter(|p| !peers.iter().any(|(key, _)| *key == p.public_key)) {
         set.peers.push(PeerSet { public_key: old.public_key, remove: true, ..PeerSet::default() });
     }
-    wg::ensure_address(&iface, AllowedIp { addr: mesh_probe::address(source).into(), cidr: 96 }, saved.mtu)?;
+    // Linux's IPv4 reverse-path validation also requires an IPv4 address
+    // on the receiving device, even in loose mode.
+    wg::ensure_addresses(
+        &iface,
+        &[
+            AllowedIp { addr: source.into(), cidr: 32 },
+            AllowedIp { addr: mesh_probe::address(source).into(), cidr: 96 },
+        ],
+        saved.mtu,
+    )?;
     wg::allow_asymmetric(&iface)?;
     // Remove stale routes before withdrawing their receive permissions.
     links.track(&iface, source, peers)?;
