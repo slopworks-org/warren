@@ -120,6 +120,8 @@ struct PollQuery {
     lan: String,
     #[serde(default)]
     port: u16,
+    #[serde(default)]
+    mesh: u8,
 }
 
 /// Handles `GET /agent/v1/config`: answers at once if the agent's version is
@@ -138,7 +140,8 @@ async fn config(
     if !q.agent.is_empty() {
         let clip = |s: &str| s.chars().take(64).collect::<String>();
         state.record_agent_report(id, &clip(&q.hostname), &clip(&q.os), &clip(&q.agent));
-        state.record_lan(id, LanReport::parse(&q.lan, q.port));
+        // Legacy single-interface agents cannot safely accept asymmetric paths.
+        state.record_lan(id, if q.mesh == 2 { LanReport::parse(&q.lan, q.port) } else { None });
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(q.wait.min(LONG_POLL_SECS + 5));
     let mut rx = state.subscribe();

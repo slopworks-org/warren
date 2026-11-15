@@ -1,9 +1,9 @@
 //! Applying the server's desired state to the kernel WireGuard interface.
 
 use crate::error::{Error, Result};
-use crate::lan;
 use crate::state::Saved;
-use std::net::{SocketAddr, ToSocketAddrs};
+use crate::{lan, mesh_probe};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{Duration, SystemTime};
 use warren_proto::{PeerConfig, codec};
 use warren_wgctl::{self as wg, AllowedIp, DeviceInfo, DeviceSet, PeerSet};
@@ -47,8 +47,8 @@ fn peer_set(p: &PeerConfig, allowed: Vec<AllowedIp>) -> Result<PeerSet> {
 /// Creates the interface if needed and makes it match `saved`.
 ///
 /// Peers are updated in place rather than replaced, so a config change does
-/// not drop established sessions. LAN peers get their addresses only while
-/// [`lan`] finds the direct path working.
+/// not drop established sessions. LAN peers live on a separate interface so
+/// incoming packets remain valid when the endpoints choose different routes.
 pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     let iface = saved.interface.as_str();
     if wg::link_index(iface).is_none() {
@@ -60,22 +60,55 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     for p in &saved.tunnel.peers {
         set.peers.push(peer_set(p, allowed_ips(p)?)?);
     }
-    let mut lan_peers = Vec::new();
-    for p in &saved.tunnel.lan_peers {
-        lan_peers.push((peer_key(p)?, allowed_ips(p)?));
-    }
-    let mut links = lan::lock();
-    links.track(iface, lan_peers);
-    for p in &saved.tunnel.lan_peers {
-        set.peers.push(peer_set(p, links.routed(&peer_key(p)?))?);
-    }
     let wanted: Vec<_> = set.peers.iter().map(|p| p.public_key).collect();
     for old in current.peers.iter().filter(|p| !wanted.contains(&p.public_key)) {
         set.peers.push(PeerSet { public_key: old.public_key, remove: true, ..PeerSet::default() });
     }
     wg::set_device(iface, &set)?;
-    drop(links);
     wg::ensure_address(iface, parse_ip(&saved.tunnel.address)?, saved.mtu)?;
+    wg::allow_asymmetric(iface)?;
+    apply_direct(saved, key)
+}
+
+/// Configures permanent receive permissions separately from application routes.
+fn apply_direct(saved: &Saved, key: &[u8; 32]) -> Result<()> {
+    let IpAddr::V4(source) = parse_ip(&saved.tunnel.address)?.addr else {
+        return Err(Error::InvalidConfig("mesh requires an IPv4 tunnel address"));
+    };
+    let iface = lan::interface(&saved.interface);
+    let mut links = lan::lock();
+    if wg::link_index(&iface).is_none() {
+        wg::create_wireguard_link(&iface)?;
+    }
+    let current = wg::get_device(&iface)?;
+    let mut set = DeviceSet { private_key: Some(*key), ..DeviceSet::default() };
+    let mut peers = Vec::new();
+    for peer in &saved.tunnel.lan_peers {
+        let ips = allowed_ips(peer)?;
+        let [AllowedIp { addr: IpAddr::V4(ip), cidr: 32 }] = ips.as_slice() else {
+            return Err(Error::InvalidConfig("mesh peer must have exactly one IPv4 host address"));
+        };
+        let probe_ip = AllowedIp { addr: mesh_probe::address(*ip).into(), cidr: 128 };
+        set.peers.push(peer_set(peer, vec![ips[0], probe_ip])?);
+        peers.push((peer_key(peer)?, *ip));
+    }
+    for old in current.peers.iter().filter(|p| !peers.iter().any(|(key, _)| *key == p.public_key)) {
+        set.peers.push(PeerSet { public_key: old.public_key, remove: true, ..PeerSet::default() });
+    }
+    wg::ensure_address(&iface, AllowedIp { addr: mesh_probe::address(source).into(), cidr: 96 }, saved.mtu)?;
+    wg::allow_asymmetric(&iface)?;
+    // Remove stale routes before withdrawing their receive permissions.
+    links.track(&iface, source, peers)?;
+    wg::set_device(&iface, &set)?;
+    Ok(())
+}
+
+/// Removes the auxiliary interface and any host routes it owns.
+pub fn remove_direct(hub: &str) -> Result<()> {
+    let iface = lan::interface(hub);
+    if wg::link_index(&iface).is_some() {
+        wg::delete_link(&iface)?;
+    }
     Ok(())
 }
 

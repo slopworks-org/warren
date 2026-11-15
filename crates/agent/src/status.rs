@@ -83,6 +83,7 @@ pub fn down(args: &Args) -> Result<()> {
     } else {
         println!("Interface {iface} is not present.");
     }
+    crate::tunnel::remove_direct(&iface)?;
     if args.forget {
         for path in [args.paths.config(), args.paths.key()] {
             match std::fs::remove_file(&path) {
