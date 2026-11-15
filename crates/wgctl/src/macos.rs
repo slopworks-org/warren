@@ -234,7 +234,10 @@ pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool
     let destination = destination.to_string();
     let source = source.to_string();
     if present {
-        let args = ["-q", "-n", "add", family, "-host", &destination, "-interface", &real, "-ifa", &source];
+        // Both tunnels own the same IPv4 address. Pin the interface as well
+        // as the source address, or macOS can select the hub's interface.
+        let args =
+            ["-q", "-n", "add", family, "-host", &destination, "-interface", &real, "-ifp", &real, "-ifa", &source];
         if run("/sbin/route", &args).is_ok() {
             Ok(())
         } else {
