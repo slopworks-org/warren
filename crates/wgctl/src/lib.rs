@@ -256,6 +256,23 @@ pub fn set_device(name: &str, set: &DeviceSet) -> Result<()> {
     sys::set_device(name, set).map_err(|e| Error::new("configuring WireGuard device", name, e))
 }
 
+/// Installs or removes a host route through `name`, using `source` locally.
+/// Removing a route that is already absent succeeds.
+///
+/// # Errors
+/// When the interface is absent or the operating system rejects the route.
+pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool) -> Result<()> {
+    sys::host_route(name, destination, source, present).map_err(|e| Error::new("updating host route on", name, e))
+}
+
+/// Permits asymmetric return paths on an interface without disabling source checks.
+///
+/// # Errors
+/// When the operating system cannot configure loose reverse path validation.
+pub fn allow_asymmetric(name: &str) -> Result<()> {
+    sys::allow_asymmetric(name).map_err(|e| Error::new("allowing asymmetric routing on", name, e))
+}
+
 /// Whether the kernel can create WireGuard interfaces (built in or as a
 /// loadable module). Probes by creating and deleting a scratch interface.
 ///

@@ -46,3 +46,11 @@ pub fn set_device(_: &str, _: &DeviceSet) -> io::Result<()> {
 pub fn set_forwarding(_: &str, _: bool) -> io::Result<()> {
     no()
 }
+
+pub fn host_route(_: &str, _: std::net::IpAddr, _: std::net::IpAddr, _: bool) -> io::Result<()> {
+    no()
+}
+
+pub fn allow_asymmetric(_: &str) -> io::Result<()> {
+    no()
+}

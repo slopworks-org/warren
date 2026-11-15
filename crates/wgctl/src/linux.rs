@@ -382,6 +382,31 @@ pub fn del_address(name: &str, a: AllowedIp) -> io::Result<()> {
     s.request(m, RTM_DELADDR, 0).map(drop)
 }
 
+pub fn host_route(name: &str, destination: IpAddr, source: IpAddr, present: bool) -> io::Result<()> {
+    let mut socket = Socket::open(libc::NETLINK_ROUTE)?;
+    let family = if destination.is_ipv4() { AF_INET } else { AF_INET6 };
+    let prefix = if destination.is_ipv4() { 32 } else { 128 };
+    // rtmsg: main table, static protocol, link scope, unicast route.
+    let header = [u8::try_from(family).unwrap_or_default(), prefix, 0, 0, 254, 4, 253, 1, 0, 0, 0, 0];
+    let mut msg = Msg::new(&header);
+    msg.attr(1, &ip_bytes(&destination)).attr(4, &index(name)?.to_ne_bytes());
+    if present {
+        msg.attr(7, &ip_bytes(&source));
+    }
+    let result =
+        socket.request(msg, if present { 24 } else { 25 }, if present { NLM_F_CREATE | NLM_F_REPLACE } else { 0 });
+    match result {
+        Err(e) if !present && e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        other => other.map(drop),
+    }
+}
+
+pub fn allow_asymmetric(name: &str) -> io::Result<()> {
+    // Loose mode accepts authenticated packets whose return route uses the other
+    // tunnel. Value 2 also overrides a strict global rp_filter value of 1.
+    std::fs::write(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"), "2")
+}
+
 fn genl_header(cmd: u8) -> [u8; 4] {
     [cmd, 1, 0, 0]
 }
