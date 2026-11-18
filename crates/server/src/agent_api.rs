@@ -1,6 +1,8 @@
 //! Endpoints the agent talks to: registration (plain HTTP, MAC-authenticated)
 //! and the config long-poll (inside the tunnel).
 
+mod routes;
+
 use crate::db::{DbError, Device, ReceiptSigner};
 use crate::lan::LanReport;
 use crate::state::{AppState, Snapshot};
@@ -14,11 +16,10 @@ use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use warren_proto::{AgentConfig, Kv, LONG_POLL_SECS, codec, register};
+use warren_proto::{Kv, LONG_POLL_SECS, codec, register};
 
 // Keep the opt-in response within the Android client's read limit.
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
@@ -179,6 +180,8 @@ struct PollQuery {
     mesh: u8,
     #[serde(default)]
     route_peers: u8,
+    #[serde(default)]
+    route_pages: bool,
 }
 
 // Read outgoing pairs from the compiled hub ACL. Full-access and port-scoped
@@ -193,35 +196,43 @@ fn route_display(snap: &Snapshot, source: Ipv4Addr, budget: usize) -> String {
     let destinations = snap.acl.all.range(range.clone()).chain(snap.acl.ports.range(range).map(|(pair, _)| pair));
     let peers = destinations.filter_map(|(_, ip)| snap.device_by_ip.get(ip)).filter_map(|id| snap.active_device(*id));
     for device in peers.take(MAX_ROUTE_PEERS) {
-        // SQLite can reuse a deleted row id. The key fingerprint survives a
-        // rename or address change and does not expose the WireGuard key.
-        let id = codec::hex_encode(&Sha256::digest(device.public_key.as_bytes())[..16]);
-        let name = clean_name(&device.name).unwrap_or_default();
-        let row = format!("route_peer={id} {} {name}", device.address);
-        let row = row.trim_end();
-        if display.len() + row.len() + 1 > budget {
+        let row = routes::row(device);
+        if display.len() + row.len() > budget {
             break;
         }
-        display.push_str(row);
-        display.push('\n');
+        display.push_str(&row);
     }
     display
 }
 
-fn config_body(snap: &Snapshot, device: &Device, mut cfg: AgentConfig, show_routes: bool) -> (u64, String) {
+fn config_body(
+    state: &AppState,
+    snap: &Snapshot,
+    device: &Device,
+    q: &PollQuery,
+) -> (u64, String, Option<HeaderValue>) {
+    let mut cfg = state.agent_config(snap, device);
     let mut body = cfg.to_kv().encode();
-    if show_routes {
+    if q.route_pages || q.route_peers == 1 {
         // Reserve room for the new version (a positive 63-bit integer).
         let budget = MAX_CONFIG_BYTES.saturating_sub(body.len() + 19 - cfg.version.to_string().len());
-        let display = route_display(snap, device.address, budget);
+        let page = q.route_pages.then(|| routes::first_page(state, snap, device, budget));
+        let display = page.as_ref().map_or_else(|| route_display(snap, device.address, budget), routes::Page::encode);
         if !display.is_empty() {
             body.push_str(&display);
             cfg.version = fnv64(body.as_bytes()) >> 1;
+            if display.len() > budget
+                && let Some(header) = page.and_then(|p| p.config_header(cfg.version))
+            {
+                // If there is no room for even the metadata, move it and the
+                // version to a header. No directory rows fit in this case.
+                return (cfg.version, cfg.to_kv().encode_without("version"), Some(header));
+            }
             body = cfg.to_kv().encode();
             body.push_str(&display);
         }
     }
-    (cfg.version, body)
+    (cfg.version, body, None)
 }
 
 /// Handles `GET /agent/v1/config`: answers at once if the agent's version is
@@ -252,9 +263,16 @@ async fn config(
         let snap = state.snapshot();
         let active = snap.active_device(id).filter(|d| d.address == ip && d.public_key == key);
         let Some(device) = active else { return error(StatusCode::FORBIDDEN, "device disabled or revoked") };
-        let (version, body) = config_body(&snap, device, state.agent_config(&snap, device), q.route_peers == 1);
+        let (version, body, page_header) = config_body(&state, &snap, device, &q);
+        if q.route_pages && body.len() > MAX_CONFIG_BYTES {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "tunnel configuration exceeds the response limit");
+        }
         if version != q.v {
-            return text(StatusCode::OK, body);
+            let mut reply = text(StatusCode::OK, body);
+            if let Some(header) = page_header {
+                reply.headers_mut().insert("warren-route-page", header);
+            }
+            return reply;
         }
         tokio::select! {
             changed = rx.changed() => if changed.is_err() { break },
@@ -306,6 +324,7 @@ async fn binary(
 pub fn control_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route(warren_proto::CONFIG_PATH, get(config))
+        .route("/agent/v1/routes", get(routes::continuation))
         .route(warren_proto::BINARY_PATH, get(binary))
         .with_state(state)
 }
