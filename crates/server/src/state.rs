@@ -301,6 +301,15 @@ impl AppState {
     /// The desired tunnel state for one device, as served to its agent.
     #[must_use]
     pub fn agent_config(&self, snap: &Snapshot, d: &Device) -> AgentConfig {
+        self.build_agent_config(snap, d, self.lan_peers(snap, d))
+    }
+
+    // The signed enrollment receipt only bootstraps the hub connection.
+    pub(crate) fn enrollment_config(&self, d: &Device) -> AgentConfig {
+        self.build_agent_config(&self.snapshot(), d, Vec::new())
+    }
+
+    fn build_agent_config(&self, snap: &Snapshot, d: &Device, lan_peers: Vec<PeerConfig>) -> AgentConfig {
         let mut cfg = AgentConfig {
             version: 0,
             device_id: u64::try_from(d.id).unwrap_or_default(),
@@ -313,7 +322,7 @@ impl AppState {
                 allowed_ips: vec![self.network.to_string()],
                 keepalive: DEFAULT_KEEPALIVE,
             }],
-            lan_peers: self.lan_peers(snap, d),
+            lan_peers,
             update: snap.agent_target.clone(),
         };
         cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;

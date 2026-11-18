@@ -1,15 +1,15 @@
 //! Endpoints the agent talks to: registration (plain HTTP, MAC-authenticated)
 //! and the config long-poll (inside the tunnel).
 
-use crate::db::{DbError, Device};
+use crate::db::{DbError, Device, ReceiptSigner};
 use crate::lan::LanReport;
 use crate::state::{AppState, Snapshot};
-use crate::util::{fnv64, now};
+use crate::util::{fnv64, now, sha256_hex};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::routing::get;
-use http::header::CONTENT_TYPE;
+use http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
@@ -18,12 +18,11 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use warren_proto::register::verify_request;
 use warren_proto::{AgentConfig, Kv, LONG_POLL_SECS, codec, register};
 
-const MAX_ROUTE_PEERS: usize = 256;
 // Keep the opt-in response within the Android client's read limit.
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
+const MAX_ROUTE_PEERS: usize = 256;
 
 fn text(status: StatusCode, body: String) -> Response<Body> {
     let mut r = Response::new(Body::from(body));
@@ -45,8 +44,8 @@ pub fn clean_name(name: &str) -> Option<String> {
     (!n.is_empty()).then_some(n)
 }
 
-/// Handles `POST /agent/v1/register`.
-pub async fn register(state: Arc<AppState>, ip: IpAddr, req: Request<Incoming>) -> Response<Body> {
+/// Handles one-time and resumable registration on their respective paths.
+pub async fn register(state: Arc<AppState>, ip: IpAddr, req: Request<Incoming>, resumable: bool) -> Response<Body> {
     if !state.limits.register_ip.check(&crate::auth::rate_key(ip)) {
         return error(StatusCode::TOO_MANY_REQUESTS, "too many attempts; wait a minute");
     }
@@ -56,17 +55,52 @@ pub async fn register(state: Arc<AppState>, ip: IpAddr, req: Request<Incoming>) 
     let Some(kv) = std::str::from_utf8(&body.to_bytes()).ok().and_then(|t| Kv::parse(t).ok()) else {
         return error(StatusCode::BAD_REQUEST, "malformed request");
     };
-    let denied = || error(StatusCode::FORBIDDEN, "invalid, used or expired token");
+    if resumable && !kv.get_all("resume").eq(["1"]) {
+        return error(StatusCode::BAD_REQUEST, "invalid registration mode");
+    }
+    register_request(&state, ip, &kv, resumable)
+}
+
+fn denied() -> Response<Body> {
+    error(StatusCode::FORBIDDEN, "invalid, used or expired token")
+}
+
+fn receipt_response(
+    state: &AppState,
+    token_id: &str,
+    request_hash: &str,
+    pubkey: &str,
+) -> Result<Option<Response<Body>>, DbError> {
+    let Some((id, receipt)) = state.db.registration_receipt(token_id, request_hash)? else { return Ok(None) };
+    // A previous attempt may have committed before it could update the hub.
+    if state.snapshot().devices.get(&id).is_none_or(|d| d.public_key != pubkey) {
+        state.rebuild()?;
+    }
+    let mut response = text(StatusCode::OK, receipt);
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(Some(response))
+}
+
+fn register_request(state: &AppState, ip: IpAddr, kv: &Kv, resumable: bool) -> Response<Body> {
     let Some(token_id) = kv.get("token_id") else { return denied() };
+    let request_hash = resumable.then(|| sha256_hex(kv.encode().as_bytes()));
+    let recover = || {
+        let (Some(hash), Some(pubkey)) = (&request_hash, kv.get("pubkey")) else { return None };
+        receipt_response(state, token_id, hash, pubkey).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "recovering registration receipt");
+            Some(error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+        })
+    };
     let token = match state.db.reg_token(token_id) {
         Ok(Some(t)) if t.used_at.is_none() && t.expires_at > now() => t,
-        Ok(_) => return denied(),
+        Ok(_) => return recover().unwrap_or_else(denied),
         Err(e) => {
             tracing::error!(error = %e, "looking up registration token");
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
-    if !verify_request(&token.secret, &kv) {
+    let verify = if resumable { register::verify_resumable_request } else { register::verify_request };
+    if !verify(&token.secret, kv) {
         tracing::warn!(%ip, token = token_id, "registration with a bad MAC");
         return denied();
     }
@@ -79,14 +113,26 @@ pub async fn register(state: Arc<AppState>, ip: IpAddr, req: Request<Incoming>) 
     let name =
         clean_name(&token.name).or_else(|| kv.get("name").and_then(clean_name)).unwrap_or_else(|| "device".to_string());
 
-    let created = state.allocate(|addr| state.db.register_device(token_id, &name, pubkey, addr));
+    let sign = |device: &crate::db::Device| {
+        let mut receipt = state.enrollment_config(device).to_kv();
+        receipt.push("resume", "1");
+        register::sign_reply(&token.secret, nonce, &mut receipt);
+        receipt.encode()
+    };
+    let created = state.allocate(|addr| {
+        let receipt = request_hash.as_deref().map(|request_hash| ReceiptSigner { request_hash, sign: &sign });
+        state.db.register_device_inner(token_id, &name, pubkey, addr, receipt)
+    });
     let id = match created {
         Ok(Some(id)) => id,
-        Ok(None) => return denied(),
+        Ok(None) => return recover().unwrap_or_else(denied),
         Err(crate::state::AllocError::Db(DbError::Conflict)) => {
             return error(StatusCode::CONFLICT, "this key is already registered");
         }
         Err(e) => {
+            if let Some(reply) = recover() {
+                return reply;
+            }
             tracing::error!(error = %e, "registering device");
             return error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string());
         }
@@ -105,6 +151,9 @@ pub async fn register(state: Arc<AppState>, ip: IpAddr, req: Request<Incoming>) 
     let owner = snap.users.get(&device.user_id);
     state.audit(owner, &ip.to_string(), "device.register", &format!("device:{id} {name}"), &field("os"));
 
+    if resumable {
+        return recover().unwrap_or_else(denied);
+    }
     let mut reply = state.agent_config(&snap, &device).to_kv();
     register::sign_reply(&token.secret, nonce, &mut reply);
     text(StatusCode::OK, reply.encode())
