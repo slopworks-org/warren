@@ -105,6 +105,11 @@ internal class TunnelSession(
                             delay(1000L * failures)
                             continue
                         }
+                        if (updated == null && profile.config.isBootstrap) {
+                            // An unchanged reply cannot authorize bootstrap-only state.
+                            delay(1000)
+                            continue
+                        }
                         failures = 0
                         first = false
                         refresh = lanDeadline != 0L && SystemClock.elapsedRealtimeNanos() >= lanDeadline
