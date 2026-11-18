@@ -34,8 +34,8 @@ internal data class RoutePage(val revision: String, val peers: List<RoutePeer>, 
     }
 }
 
-// A conflict or revocation invalidates the entire attempt. Only return rows after the
-// directory has ended on the same revision with strictly advancing addresses.
+// Only return rows after the directory has ended on the same revision with
+// strictly advancing addresses. A denied requester must retire its session.
 internal suspend fun AgentConfig.collectRoutePeers(request: suspend (String) -> Reply): List<RoutePeer>? {
     var page = checkNotNull(routePage)
     val revision = page.revision
@@ -48,7 +48,8 @@ internal suspend fun AgentConfig.collectRoutePeers(request: suspend (String) -> 
         val reply = request("/agent/v1/routes?revision=$revision$after")
         when (reply.status) {
             200 -> page = RoutePage.parse(Pairs.parse(reply.body), targets)
-            403, 409 -> return null
+            403 -> throw AgentException(AgentFailure.REVOKED)
+            409 -> return null
             else -> throw AgentException(AgentFailure.PROTOCOL)
         }
         require(page.revision == revision && page.peers.isNotEmpty())

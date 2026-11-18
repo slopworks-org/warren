@@ -9,6 +9,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeNotNull
 import org.junit.Test
 import org.slopworks.warren.agent.AgentConfig
+import org.slopworks.warren.agent.AgentException
+import org.slopworks.warren.agent.AgentFailure
 import org.slopworks.warren.agent.Endpoint
 import org.slopworks.warren.agent.Pairs
 import org.slopworks.warren.agent.Peer
@@ -53,7 +55,10 @@ class RouteDirectoryTest {
             }
         }
         assertNull(runBlocking { first.collectRoutePeers { Reply(409, "") } })
-        assertNull(runBlocking { first.collectRoutePeers { Reply(403, "") } })
+        val denied = assertThrows(AgentException::class.java) {
+            runBlocking { first.collectRoutePeers { Reply(403, "") } }
+        }
+        assertEquals(AgentFailure.REVOKED, denied.failure)
     }
 
     @Test
