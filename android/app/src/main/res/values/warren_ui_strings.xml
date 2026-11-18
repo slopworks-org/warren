@@ -3,6 +3,15 @@
     <string name="warren_ui_brand" translatable="false">Warren</string>
     <string name="warren_ui_back">Back</string>
     <string name="warren_ui_close">Close</string>
+    <string name="warren_ui_add_phone">Add a phone</string>
+    <string name="warren_ui_scan">Scan QR code</string>
+    <string name="warren_ui_choose_photo">Choose a photo</string>
+    <string name="warren_ui_qr_code">QR code</string>
+    <string name="warren_ui_qr_help">Where do I get a QR code?</string>
+    <string name="warren_ui_qr_help_body">In the Warren admin panel, open Devices and add a phone.</string>
+    <string name="warren_ui_enrolling">Adding phone…</string>
+    <string name="warren_ui_torch_on">Turn on flashlight</string>
+    <string name="warren_ui_torch_off">Turn off flashlight</string>
     <string name="warren_ui_error_camera_denied">Camera access is off. Choose a photo to continue.</string>
     <string name="warren_ui_error_camera_unavailable">Couldn’t open the camera. Choose a photo to continue.</string>
     <string name="warren_ui_error_photo_unreadable">Couldn’t open that photo. Choose another photo.</string>
@@ -14,5 +23,8 @@
     <string name="warren_ui_error_vpn_denied">VPN access is required. Tap Connect to try again.</string>
     <string name="warren_ui_error_vpn_failed">Couldn’t start the VPN. Try connecting again.</string>
     <string name="warren_ui_error_tile_failed">Couldn’t add the tile. You can add Warren by editing Quick Settings.</string>
+    <string name="warren_ui_replace_profile">Replace profile</string>
+    <string name="warren_ui_retry_enrollment">Retry enrollment</string>
+    <string name="warren_ui_cancel">Cancel</string>
     <string name="warren_ui_error_server_upgrade">This server needs an update to support enrollment. Retry after updating the server.</string>
 </resources>
