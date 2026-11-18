@@ -5,7 +5,7 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,18 +39,24 @@ fn device(state: &AppState, owner: i64, name: &str, host: u16) -> i64 {
 }
 
 async fn poll(router: &Router, host: u16, query: &str, expected: StatusCode) -> Kv {
-    let req = Request::get(format!("{CONFIG_PATH}?{query}"))
-        .extension(ConnectInfo(SocketAddr::from((ip(host), 50505))))
-        .body(Body::empty())
-        .unwrap();
-    let reply = router.clone().oneshot(req).await.unwrap();
+    request(router, host, &format!("{CONFIG_PATH}?{query}"), expected, 256 * 1024).await
+}
+
+async fn request(router: &Router, host: u16, path: &str, expected: StatusCode, limit: usize) -> Kv {
+    let reply = response(router, host, path).await;
     assert_eq!(reply.status(), expected);
-    let bytes = to_bytes(reply.into_body(), 256 * 1024).await.unwrap();
+    let bytes = to_bytes(reply.into_body(), limit).await.unwrap();
     Kv::parse(std::str::from_utf8(&bytes).unwrap()).unwrap()
 }
 
+async fn response(router: &Router, host: u16, path: &str) -> Response<Body> {
+    let req =
+        Request::get(path).extension(ConnectInfo(SocketAddr::from((ip(host), 50505)))).body(Body::empty()).unwrap();
+    router.clone().oneshot(req).await.unwrap()
+}
+
 fn rows(reply: &Kv) -> Vec<(&str, &str, &str)> {
-    assert_eq!(reply.get("route_peers"), Some("1"));
+    assert!(matches!(reply.get("route_peers"), Some("1" | "2")));
     reply
         .get_all("route_peer")
         .map(|row| {
@@ -92,6 +98,9 @@ async fn route_display_follows_directional_acl_and_live_device_state() {
         [("10.77.0.3", "Home NAS"), ("10.77.0.4", "SSH host"),]
     );
     assert_eq!(legacy.get("route_peers"), None);
+    let small = request(&router, 2, PAGED_CONFIG, StatusCode::OK, PAGE_LIMIT).await;
+    assert_eq!(small.get("route_next"), Some("end"));
+    assert_eq!(rows(&small), peers);
     let mut actual = AgentConfig::from_kv(&display).unwrap();
     let expected = AgentConfig::from_kv(&legacy).unwrap();
     assert_ne!(actual.version, expected.version);
@@ -135,7 +144,8 @@ async fn route_display_is_bounded_and_ordered() {
     let owner = state.db.create_user("owner", "unused", "user").unwrap().id;
     device(&state, owner, "Phone", 2);
     for host in (3..270).rev() {
-        device(&state, owner, &"🖥".repeat(70), host);
+        let name = if host == 3 { "🖥".repeat(70) } else { "x".to_string() };
+        device(&state, owner, &name, host);
     }
     state.rebuild().unwrap();
     let router = control_router(state);
@@ -144,6 +154,168 @@ async fn route_display_is_bounded_and_ordered() {
     assert_eq!(peers.len(), 256);
     for (host, (_, address, name)) in (3..).zip(peers) {
         assert_eq!(address, ip(host).to_string());
+        assert_eq!(name.chars().count(), if host == 3 { 64 } else { 1 });
+    }
+    let first = request(&router, 2, PAGED_CONFIG, StatusCode::OK, PAGE_LIMIT).await;
+    assert_eq!(rows(&first).len(), 256);
+    let rest = enumerate(&router, &first).await;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rows(&rest[0].1).len(), 11);
+    assert_eq!(rows(&rest[0].1).last().unwrap().1, ip(269).to_string());
+}
+
+const PAGED_CONFIG: &str = "/agent/v1/config?route_peers=1&route_pages=true";
+const PAGE_LIMIT: usize = 64 * 1024;
+
+fn continuation(page: &Kv) -> String {
+    let revision = page.req("route_revision").unwrap();
+    match page.req("route_next").unwrap() {
+        "start" => format!("/agent/v1/routes?revision={revision}"),
+        cursor => format!("/agent/v1/routes?revision={revision}&after={cursor}"),
+    }
+}
+
+async fn enumerate(router: &Router, first: &Kv) -> Vec<(String, Kv)> {
+    let mut page = first;
+    let mut rest = Vec::new();
+    while page.get("route_next") != Some("end") {
+        assert!(rest.len() < 3);
+        let path = continuation(page);
+        let next = request(router, 2, &path, StatusCode::OK, PAGE_LIMIT).await;
+        assert_eq!(next.get("route_revision"), first.get("route_revision"));
+        rest.push((path, next));
+        page = &rest.last().unwrap().1;
+    }
+    rest
+}
+
+#[tokio::test]
+async fn config_without_room_for_a_row_can_start_on_the_routes_endpoint() {
+    const CONFIG_LIMIT: usize = 256 * 1024;
+    let state = state();
+    let owner = state.db.create_user("owner", "unused", "user").unwrap().id;
+    let phone = device(&state, owner, "Phone", 2);
+    device(&state, owner, &"🖥".repeat(64), 3);
+    state.rebuild().unwrap();
+    let router = control_router(state.clone());
+    let base = poll(&router, 2, "", StatusCode::OK).await;
+    // Simulate a base config whose payload already takes most of the budget.
+    let name = "x".repeat(CONFIG_LIMIT - base.encode().len() - 180);
+    state.db.update_device(phone, Some(&name), None).unwrap();
+    state.rebuild().unwrap();
+    let first = request(&router, 2, PAGED_CONFIG, StatusCode::OK, CONFIG_LIMIT).await;
+    assert_eq!(first.get("route_next"), Some("start"));
+    assert_eq!(rows(&first), []);
+    let rest = enumerate(&router, &first).await;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rows(&rest[0].1)[0].1, "10.77.0.3");
+
+    let name = "x".repeat(CONFIG_LIMIT - base.encode().len() - 10);
+    state.db.update_device(phone, Some(&name), None).unwrap();
+    state.rebuild().unwrap();
+    let fallback = response(&router, 2, PAGED_CONFIG).await;
+    assert_eq!(fallback.status(), StatusCode::OK);
+    let header = fallback.headers()["warren-route-page"].to_str().unwrap().to_owned();
+    let (version, page) = header.split_once(' ').unwrap();
+    assert_eq!(page, format!("{} start", first.req("route_revision").unwrap()));
+    let body = to_bytes(fallback.into_body(), CONFIG_LIMIT).await.unwrap();
+    let config = Kv::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    assert_eq!(config.req("name").unwrap(), name);
+    assert_eq!(config.get("version"), None);
+    let poll = format!("{PAGED_CONFIG}&v={version}");
+    request(&router, 2, &poll, StatusCode::NOT_MODIFIED, CONFIG_LIMIT).await;
+}
+
+#[tokio::test]
+async fn paged_route_directory_rechecks_acl_and_covers_the_entire_revision() {
+    let state = state();
+    let db = &state.db;
+    let owner = db.create_user("owner", "unused", "user").unwrap().id;
+    let ports = db.create_user("ports", "unused", "user").unwrap().id;
+    let denied = db.create_user("denied", "unused", "user").unwrap().id;
+    let phone = device(&state, owner, "Phone", 2);
+    let stranger = device(&state, denied, "Never visible", 270);
+    let scope = PortSpec::parse_list("tcp:22").unwrap();
+    let mut port_rules = std::collections::HashMap::new();
+    for host in (3..270).rev() {
+        let name = format!("peer-{host} {}", "🖥".repeat(64));
+        if host % 2 == 0 {
+            device(&state, owner, &name, host);
+        } else {
+            let id = device(&state, ports, &name, host);
+            let rule = db.create_acl_rule(Subject::Device(phone), Subject::Device(id), &scope, "").unwrap();
+            port_rules.insert(host, (id, rule));
+        }
+    }
+    state.rebuild().unwrap();
+    let router = control_router(state.clone());
+    let first = request(&router, 2, PAGED_CONFIG, StatusCode::OK, PAGE_LIMIT + 1024).await;
+    assert_eq!(first.get("route_peers"), Some("2"));
+    assert!(first.encode().len() >= PAGE_LIMIT - 320, "the first page must run out of bytes before rows");
+    assert!(rows(&first).len() < 256);
+    let first_path = continuation(&first);
+    request(&router, 270, &first_path, StatusCode::CONFLICT, PAGE_LIMIT).await;
+
+    db.update_device(stranger, Some("Renamed denied peer"), None).unwrap();
+    state.rebuild().unwrap();
+    let unchanged = format!("{PAGED_CONFIG}&v={}", first.req("version").unwrap());
+    request(&router, 2, &unchanged, StatusCode::NOT_MODIFIED, PAGE_LIMIT).await;
+    let rest = enumerate(&router, &first).await;
+    let all = std::iter::once(&first).chain(rest.iter().map(|(_, page)| page)).flat_map(rows).collect::<Vec<_>>();
+    assert_eq!(all.len(), 267);
+    for (host, (_, address, name)) in (3..270).zip(all) {
+        assert_eq!(address, ip(host).to_string());
+        assert!(name.starts_with(&format!("peer-{host} ")));
         assert_eq!(name.chars().count(), 64);
+    }
+    assert!(state.snapshot().acl.allows(ip(2), ip(267), 6, Some(22)));
+    assert!(!state.snapshot().acl.allows(ip(2), ip(267), 6, Some(80)));
+
+    // Revoke a peer on the tail while the old first page is in flight.
+    db.delete_acl_rule(port_rules[&269].1).unwrap();
+    state.rebuild().unwrap();
+    let conflict = request(&router, 2, &first_path, StatusCode::CONFLICT, PAGE_LIMIT).await;
+    assert_eq!(conflict.get_all("route_peer").count(), 0);
+    let changed = request(&router, 2, &unchanged, StatusCode::OK, PAGE_LIMIT + 1024).await;
+    assert_ne!(changed.get("route_revision"), first.get("route_revision"));
+    assert_eq!(rows(&changed), rows(&first));
+
+    // Also remove a peer already read from the first page.
+    db.delete_device(port_rules[&3].0).unwrap();
+    state.rebuild().unwrap();
+    let fresh = request(&router, 2, PAGED_CONFIG, StatusCode::OK, PAGE_LIMIT + 1024).await;
+    let fresh_rest = enumerate(&router, &fresh).await;
+    let hosts = std::iter::once(&fresh)
+        .chain(fresh_rest.iter().map(|(_, page)| page))
+        .flat_map(rows)
+        .map(|(_, address, _)| address.to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(hosts, (4..269).map(|host| ip(host).to_string()).collect::<Vec<_>>());
+
+    let empty = request(&router, 270, PAGED_CONFIG, StatusCode::OK, PAGE_LIMIT).await;
+    assert_eq!(empty.get("route_next"), Some("end"));
+    assert_eq!(rows(&empty), []);
+    db.update_device(phone, None, Some(false)).unwrap();
+    state.rebuild().unwrap();
+    request(&router, 2, &first_path, StatusCode::FORBIDDEN, PAGE_LIMIT).await;
+
+    // Optional wire transcript for the Android test of the same exchanges.
+    if let Some(path) = std::env::var_os("WARREN_ROUTE_TEST_TRANSCRIPT") {
+        let mut transcript = String::new();
+        let mut record = |path: &str, status: u16, body: &Kv| {
+            use std::fmt::Write as _;
+            write!(transcript, "{status}\n{path}\n{}\0", body.encode()).unwrap();
+        };
+        record(PAGED_CONFIG, 200, &first);
+        for (path, page) in &rest {
+            record(path, 200, page);
+        }
+        record(&first_path, 409, &conflict);
+        record(PAGED_CONFIG, 200, &fresh);
+        for (path, page) in &fresh_rest {
+            record(path, 200, page);
+        }
+        record(PAGED_CONFIG, 200, &empty);
+        std::fs::write(path, transcript).unwrap();
     }
 }
