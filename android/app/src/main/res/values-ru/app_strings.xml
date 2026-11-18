@@ -3,4 +3,9 @@
     <string name="notification_channel_vpn">VPN-подключение</string>
     <string name="notification_vpn">Warren VPN включён</string>
     <string name="notification_disconnect">Отключить</string>
+    <string name="status_off">Отключён</string>
+    <string name="status_connecting">Подключение</string>
+    <string name="status_connected">Подключён</string>
+    <string name="status_recovering">Переподключение</string>
+    <string name="status_disconnecting">Отключение</string>
 </resources>

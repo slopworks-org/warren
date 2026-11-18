@@ -1,8 +1,8 @@
 package org.slopworks.warren.vpn
 
+import android.app.PendingIntent
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
-import android.net.VpnService
 import android.system.OsConstants
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -32,8 +32,9 @@ internal data class VpnStatus(
 )
 
 internal class TunnelSession(
-    private val service: VpnService,
+    private val service: WarrenVpnService,
     private val store: ProfileStore,
+    private val pending: PendingIntent,
     private val publish: (VpnStatus) -> Unit,
 ) {
     suspend fun run(underlay: Underlay, endpoints: HubEndpoints) = lifetime.run {
@@ -50,6 +51,7 @@ internal class TunnelSession(
             .setMtu(mtu)
             .addAddress(ip.inet(), profile.config.address.bits)
             .allowFamily(OsConstants.AF_INET6)
+            .setConfigureIntent(pending)
             .setUnderlyingNetworks(arrayOf(underlay.network))
             .setMetered(false)
         profile.config.hub.allowed.forEach { route ->

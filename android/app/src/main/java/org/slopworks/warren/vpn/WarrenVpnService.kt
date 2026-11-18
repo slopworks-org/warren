@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import org.slopworks.warren.MainActivity
 import org.slopworks.warren.R
 import org.slopworks.warren.agent.PendingEnrollment
 import org.slopworks.warren.agent.Profile
@@ -45,7 +46,8 @@ internal class WarrenVpnService : VpnService() {
             stopByUser()
             return START_NOT_STICKY
         }
-        startForeground(NOTIFICATION, notification())
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        startForeground(NOTIFICATION, notification(open))
         // A queued foreground start can run after the app replaces the profile.
         if (!runCatching { store.wantsVpn }.getOrDefault(false) || VpnService.prepare(this) != null) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -57,7 +59,7 @@ internal class WarrenVpnService : VpnService() {
         update(VpnStatus(Phase.CONNECTING))
         running = scope.launch {
             try {
-                val session = TunnelSession(this@WarrenVpnService, store) {
+                val session = TunnelSession(this@WarrenVpnService, store, open) {
                     if (generation == current) update(it)
                 }
                 var attempted = false
@@ -94,13 +96,14 @@ internal class WarrenVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun notification(): Notification {
+    private fun notification(open: PendingIntent): Notification {
         val stop = PendingIntent.getService(this, 0, Intent(this, javaClass).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_warren_vpn)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(getString(R.string.notification_vpn))
+            .setContentIntent(open)
             .addAction(Notification.Action.Builder(null, getString(R.string.notification_disconnect), stop).build())
             .setOngoing(true)
             .build()
