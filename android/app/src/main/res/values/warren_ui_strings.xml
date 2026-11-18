@@ -1,8 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="warren_ui_route_detail" translatable="false">%1$s · %2$s</string>
     <string name="warren_ui_brand" translatable="false">Warren</string>
     <string name="warren_ui_back">Back</string>
     <string name="warren_ui_close">Close</string>
+    <string name="warren_ui_routes">Routes</string>
+    <string name="warren_ui_routes_loading">Loading routes…</string>
+    <string name="warren_ui_routes_unavailable">Routes are unavailable.</string>
+    <string name="warren_ui_routes_empty">No peer routes yet.</string>
+    <string name="warren_ui_direct">Direct</string>
+    <string name="warren_ui_direct_wifi">Direct over Wi-Fi</string>
+    <string name="warren_ui_relay">Via server</string>
+    <string name="warren_ui_path_unavailable">Unavailable</string>
+    <string name="warren_ui_expanded">Expanded</string>
+    <string name="warren_ui_collapsed">Collapsed</string>
     <string name="warren_ui_add_phone">Add a phone</string>
     <string name="warren_ui_scan">Scan QR code</string>
     <string name="warren_ui_choose_photo">Choose a photo</string>
