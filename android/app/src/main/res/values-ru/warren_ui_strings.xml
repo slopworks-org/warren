@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="warren_ui_back">Назад</string>
+    <string name="warren_ui_close">Закрыть</string>
+    <string name="warren_ui_error_camera_denied">Нет доступа к камере. Выберите фото.</string>
+    <string name="warren_ui_error_camera_unavailable">Не удалось открыть камеру. Выберите фото.</string>
+    <string name="warren_ui_error_photo_unreadable">Не удалось открыть фото. Выберите другое.</string>
+    <string name="warren_ui_error_qr_not_found">QR-код не найден. Попробуйте другое фото.</string>
+    <string name="warren_ui_error_invalid_code">Это не код подключения Warren. Чтобы получить код, добавьте телефон в админке.</string>
+    <string name="warren_ui_error_expired_code">Код больше не действует. Создайте новый в админке.</string>
+    <string name="warren_ui_error_enrollment_failed">Не удалось завершить регистрацию. Повторите попытку.</string>
+    <string name="warren_ui_error_server_unreachable">Сервер недоступен. Проверьте подключение к интернету и попробуйте ещё раз.</string>
+    <string name="warren_ui_error_vpn_denied">Нужен доступ к VPN. Нажмите «Подключить», чтобы попробовать ещё раз.</string>
+    <string name="warren_ui_error_vpn_failed">Не удалось запустить VPN. Попробуйте подключиться ещё раз.</string>
+    <string name="warren_ui_error_tile_failed">Не удалось добавить плитку. Добавьте Warren через редактирование быстрых настроек.</string>
+    <string name="warren_ui_error_server_upgrade">Для регистрации нужно обновить сервер. Повторите попытку после обновления.</string>
+</resources>
