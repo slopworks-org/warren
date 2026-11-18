@@ -34,7 +34,7 @@ pub async fn security_headers(mut resp: Response) -> Response {
     h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
-    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.entry(CACHE_CONTROL).or_insert(HeaderValue::from_static("no-cache"));
     h.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(

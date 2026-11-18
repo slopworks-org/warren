@@ -60,6 +60,10 @@ You need:
    launchd). Check it with `warren status`.
    Agent commands automatically request administrator privileges through `sudo`
    when needed. On systems without `sudo`, run the agent as root.
+
+   For the native Warren Android app, choose **Devices → Add device → Warren
+   Android app** and scan the one-time enrollment QR in the app. **WireGuard
+   config** still creates a configuration for the standard WireGuard app.
 4. Publish a service. Go to Resources → Publish service. Set the address, the
    device and the port.
 
@@ -68,6 +72,9 @@ The script checks every download against the release's `SHA256SUMS`.
 binaries, the OpenWrt `.ipk` and the service files from the
 [releases page](https://github.com/slopworks-org/warren/releases) and
 install them by hand.
+
+See [Android enrollment](docs/android-enrollment.md) for the client protocol
+and isolated lab setup.
 
 <details>
 <summary><b>Build from source</b></summary>
