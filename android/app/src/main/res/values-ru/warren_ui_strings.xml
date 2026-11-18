@@ -2,6 +2,13 @@
 <resources>
     <string name="warren_ui_back">Назад</string>
     <string name="warren_ui_close">Закрыть</string>
+    <string name="warren_ui_connected">Подключено</string>
+    <string name="warren_ui_off">VPN выключен</string>
+    <string name="warren_ui_connecting">Подключаемся</string>
+    <string name="warren_ui_recovering">Восстанавливаем связь</string>
+    <string name="warren_ui_disconnecting">Отключаемся</string>
+    <string name="warren_ui_connect">Подключить</string>
+    <string name="warren_ui_disconnect">Отключить</string>
     <string name="warren_ui_routes">Маршруты</string>
     <string name="warren_ui_routes_loading">Загружаем маршруты…</string>
     <string name="warren_ui_routes_unavailable">Маршруты недоступны.</string>
@@ -12,6 +19,18 @@
     <string name="warren_ui_path_unavailable">Недоступен</string>
     <string name="warren_ui_expanded">Развёрнуто</string>
     <string name="warren_ui_collapsed">Свёрнуто</string>
+    <string name="warren_ui_connection">Подключение</string>
+    <string name="warren_ui_connection_actions">Действия с подключением</string>
+    <string name="warren_ui_details">Сведения</string>
+    <string name="warren_ui_connection_details">О подключении</string>
+    <string name="warren_ui_server">Сервер</string>
+    <string name="warren_ui_resources">Ресурсы Warren</string>
+    <string name="warren_ui_through_vpn">Через VPN из всех приложений</string>
+    <string name="warren_ui_other_internet">Остальной интернет</string>
+    <string name="warren_ui_bypasses_vpn">Напрямую</string>
+    <string name="warren_ui_auto_connect">Автоподключение</string>
+    <string name="warren_ui_auto_connect_detail">После смены сети и перезагрузки</string>
+    <string name="warren_ui_add_tile">Добавить плитку</string>
     <string name="warren_ui_add_phone">Добавить телефон</string>
     <string name="warren_ui_scan">Сканировать QR-код</string>
     <string name="warren_ui_choose_photo">Выбрать из фото</string>
@@ -33,6 +52,8 @@
     <string name="warren_ui_error_vpn_failed">Не удалось запустить VPN. Попробуйте подключиться ещё раз.</string>
     <string name="warren_ui_error_tile_failed">Не удалось добавить плитку. Добавьте Warren через редактирование быстрых настроек.</string>
     <string name="warren_ui_replace_profile">Заменить профиль</string>
+    <string name="warren_ui_replace_profile_detail">Текущий профиль сохранится, пока сервер не примет новый код. После настройки можно подключиться с новым профилем.</string>
+    <string name="warren_ui_replace_confirm">Продолжить</string>
     <string name="warren_ui_retry_enrollment">Повторить регистрацию</string>
     <string name="warren_ui_cancel">Отмена</string>
     <string name="warren_ui_error_server_upgrade">Для регистрации нужно обновить сервер. Повторите попытку после обновления.</string>
