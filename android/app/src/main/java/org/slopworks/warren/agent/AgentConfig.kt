@@ -60,6 +60,20 @@ internal data class Peer(val key: String, val endpoint: Endpoint, val allowed: L
     }
 }
 
+internal data class RoutePeer(val id: String, val address: Ipv4, val name: String?) {
+    companion object {
+        private val idPattern = Regex("[0-9a-f]{32}")
+
+        fun parse(text: String): RoutePeer {
+            val parts = text.split(' ', limit = 3)
+            require(parts.size >= 2 && idPattern.matches(parts[0]))
+            val name = parts.getOrNull(2)?.trim()?.takeIf { it.isNotEmpty() }
+            require(name == null || (name.codePointCount(0, name.length) <= 64 && name.none(Char::isISOControl)))
+            return RoutePeer(parts[0], Ipv4.parse(parts[1]), name)
+        }
+    }
+}
+
 internal class AgentConfig(
     val wire: String,
     val version: ULong,
@@ -69,7 +83,14 @@ internal class AgentConfig(
     val control: Endpoint,
     val hub: Peer,
     val lan: List<Peer>,
+    val routePeers: List<RoutePeer>?,
+    val routePage: RoutePage?,
 ) {
+    // A legacy server can omit rows at its count or byte limit. At most
+    // 317 bytes per row plus 19 version digits were reserved on that server.
+    val legacyRoutesMayBeTruncated = routePeers != null &&
+        (routePeers.size == ROUTE_PAGE_ROWS || wire.toByteArray(Charsets.UTF_8).size > MAX_RESPONSE - 317 - 19)
+
     companion object {
         fun parse(fields: Pairs): AgentConfig {
             val address = Prefix.parse(fields.one("address"))
@@ -86,8 +107,14 @@ internal class AgentConfig(
                 route.ip
             }
             require(addresses.distinct().size == lan.size && lan.map(Peer::key).distinct().size == lan.size)
+            val marker = fields.all("route_peers")
+            require(marker in listOf(emptyList(), listOf("1"), listOf("2")))
+            val targets = RouteTargets(address.ip, controlIp, hub.allowed)
+            val routePeers = if (marker == listOf("1")) targets.parse(fields) else null
+            val routePage = if (marker == listOf("2")) RoutePage.parse(fields, targets) else null
+            require(marker.isNotEmpty() || fields.all("route_peer").isEmpty())
             return AgentConfig(fields.encode("mac"), fields.one("version").toULong(),
-                fields.one("device_id").toULong(), fields.one("name"), address, control, hub, lan)
+                fields.one("device_id").toULong(), fields.one("name"), address, control, hub, lan, routePeers, routePage)
         }
     }
 }
