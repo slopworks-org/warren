@@ -275,6 +275,156 @@ func (lab *nativeLab) rejectLAN(t *testing.T, to int) {
 	}
 }
 
+func TestEncryptedLANAndHubRemainIndependent(t *testing.T) {
+	lab := newNativeLab(t)
+	lab.send(t, 0, 1, true)
+	lab.send(t, 1, 2, true)
+
+	lab.renewLAN(t)
+	lab.proveLAN(t)
+	for from, peer := range lab.peers {
+		lab.send(t, from, 3, false)
+		lab.hubPort.enqueue(ipPacket(lab.peers[1-from].ip, peer.ip, 4))
+		expectPacket(t, peer.tun.written, 4)
+	}
+
+	// Each orientation keeps a working one-way UDP path but cannot produce
+	// a round trip. In both cases control continues to renew the same lease.
+	for from, peer := range lab.peers {
+		lab.relay.blocked.Store(1 << from)
+		dropped := lab.relay.dropped[from].Load()
+		peer.engine.sendProbes()
+		await(t, 5*time.Second, func() bool { return lab.relay.dropped[from].Load() > dropped })
+		lab.send(t, 1-from, 5, false)
+		for range 4 {
+			lab.elapsed.Add(int64(3 * time.Second))
+			lab.renewLAN(t)
+		}
+		for i, peer := range lab.peers {
+			if peer.engine.paths() != "" {
+				t.Fatal("one-way LAN remained selected with a renewed control lease")
+			}
+			lab.send(t, i, 6, true)
+		}
+		lab.relay.blocked.Store(0)
+		lab.proveLAN(t)
+		lab.send(t, 0, 7, false)
+		lab.send(t, 1, 8, false)
+	}
+}
+
+func TestEncryptedLANIngressWithStaggeredOutboundProofs(t *testing.T) {
+	lab := newNativeLab(t)
+	lab.renewLAN(t)
+	lab.proveFrom(t, 1)
+	lab.elapsed.Add(int64(probeTTL / 2))
+	lab.proveFrom(t, 0)
+	lab.relay.blocked.Store(1 << 1)
+	lab.elapsed.Add(int64(probeTTL / 2))
+	a, b := lab.peers[0], lab.peers[1]
+	for _, peer := range lab.peers {
+		peer.engine.mu.Lock()
+		live := peer.engine.authorized(peer.engine.elapsed())
+		peer.engine.mu.Unlock()
+		if !live {
+			t.Fatal("both control leases must be live")
+		}
+	}
+	if a.engine.paths() != b.ipText || b.engine.paths() != "" {
+		t.Fatal("expected fresh outbound proof only on A")
+	}
+	dropped := lab.relay.dropped[1].Load()
+	b.engine.sendProbes()
+	await(t, 5*time.Second, func() bool { return lab.relay.dropped[1].Load() > dropped })
+	lab.send(t, 0, 1, false)
+	lab.send(t, 1, 2, true)
+	lab.hubPort.enqueue(ipPacket(b.ip, a.ip, 2))
+	expectPacket(t, a.tun.written, 2)
+	if b.engine.receiveLAN(ipPacket(a.ip+32, b.ip, 3)) || b.engine.receiveLAN(ipPacket(a.ip, b.ip+32, 3)) {
+		t.Fatal("LAN accepted an unauthorized source or nonlocal destination")
+	}
+	requireOK(t, b.engine.configureLAN("replace_peers=true\n", "", 0))
+	lab.rejectLAN(t, 1)
+}
+
+func TestSuspendExpiresLANAuthorizationAndProof(t *testing.T) {
+	lab := newNativeLab(t)
+	lab.renewLAN(t)
+	lab.proveLAN(t)
+	lab.send(t, 0, 1, false)
+	lab.send(t, 1, 2, false)
+
+	lab.relay.blocked.Store(3)
+	a, b := lab.peers[0], lab.peers[1]
+	a.engine.sendProbes()
+	a.engine.mu.Lock()
+	oldNonce := a.engine.peers[b.ip].probe.nonce
+	a.engine.mu.Unlock()
+	oldResponse := probePacket(b.ip, a.ip, 2, oldNonce[:])
+
+	// Only the injected elapsed clock advances, as CLOCK_BOOTTIME does
+	// while Go's scheduler and monotonic timers are paused in suspend.
+	lab.elapsed.Add(int64(testAuthorizationTTL))
+	a.engine.receiveLAN(oldResponse)
+	lab.rejectLAN(t, 0)
+	lab.send(t, 0, 3, true)
+
+	lab.renewLAN(t)
+	a.engine.receiveLAN(oldResponse)
+	a.engine.receiveLAN(probePacket(b.ip, a.ip, 1, oldNonce[:]))
+	lab.send(t, 0, 4, true)
+
+	lab.relay.blocked.Store(0)
+	lab.proveLAN(t)
+	lab.send(t, 0, 5, false)
+	lab.send(t, 1, 6, false)
+}
+
+func TestDelayedPollCannotAuthorizeLAN(t *testing.T) {
+	for _, name := range []string{"initial", "unchanged"} {
+		t.Run(name, func(t *testing.T) {
+			lab := newNativeLab(t)
+			a, b := lab.peers[0], lab.peers[1]
+			if name == "unchanged" {
+				lab.renewLAN(t)
+				lab.proveLAN(t)
+				lab.elapsed.Add(int64(time.Second))
+			}
+			request := time.Duration(lab.elapsed.Load())
+			deadline := request + testAuthorizationTTL
+			// The hub responded after a normal five-second poll. Simulate suspend
+			// after that observation and resume at the request's exact deadline.
+			lab.elapsed.Add(int64(5 * time.Second))
+			lab.elapsed.Store(int64(deadline))
+			requireOK(t, a.engine.configureLAN(a.config, b.ipText, deadline))
+			lab.rejectLAN(t, 0)
+			if a.engine.paths() != "" {
+				t.Fatal("the delayed reply reauthorized a direct path")
+			}
+			lab.send(t, 0, 1, true)
+
+			// A timely renewal may authorize ingress, but it must not reuse old
+			// outbound proof or extend the lease from the time of installation.
+			freshDeadline := time.Duration(lab.elapsed.Load()) + testAuthorizationTTL
+			lab.elapsed.Add(int64(5 * time.Second))
+			requireOK(t, a.engine.configureLAN(a.config, b.ipText, freshDeadline))
+			a.engine.mu.Lock()
+			lease := a.engine.lease
+			a.engine.mu.Unlock()
+			if lease != freshDeadline || !a.engine.receiveLAN(ipPacket(b.ip, a.ip, 2)) {
+				t.Fatal("timely reply did not install the request-bounded ingress lease")
+			}
+			lab.send(t, 0, 3, true)
+			requireOK(t, b.engine.configureLAN(b.config, a.ipText, freshDeadline))
+			lab.proveFrom(t, 0)
+			lab.send(t, 0, 4, false)
+			lab.elapsed.Store(int64(freshDeadline))
+			lab.rejectLAN(t, 0)
+			lab.send(t, 0, 5, true)
+		})
+	}
+}
+
 func TestQueuedLANPacketFallsBackWhenProofExpires(t *testing.T) {
 	lab := newNativeLab(t)
 	lab.renewLAN(t)
@@ -294,4 +444,52 @@ func TestQueuedLANPacketFallsBackWhenProofExpires(t *testing.T) {
 		t.Fatal("queued data reached the LAN WireGuard device with expired proof")
 	}
 	expectPacket(t, lab.hubTun.written, 1)
+}
+
+func TestDeniedForwardingLeavesOnlyHubControlAndDiscardsOldLANLease(t *testing.T) {
+	lab := newNativeLab(t)
+	lab.renewLAN(t)
+	lab.proveFrom(t, 0)
+	a, b := lab.peers[0], lab.peers[1]
+	control := a.engine.control
+	tcp := func(src, dst uint32, sourcePort, destinationPort uint16) []byte {
+		packet := append(ipPacket(src, dst, 0)[:20], make([]byte, 20)...)
+		packet[3], packet[9], packet[32] = 40, 6, 0x50
+		binary.BigEndian.PutUint16(packet[20:], sourcePort)
+		binary.BigEndian.PutUint16(packet[22:], destinationPort)
+		return packet
+	}
+	request := tcp(a.ip, control, 40000, a.engine.controlPort)
+	reply := tcp(control, a.ip, a.engine.controlPort, 40000)
+	data := ipPacket(a.ip, b.ip, 1)
+
+	// Recheck at the device queue when forwarding is withdrawn.
+	port := newPort(a.tun)
+	defer port.Close()
+	port.toPeer = a.engine.transmitHub
+	port.enqueue(data)
+	a.engine.setForwarding(false)
+	port.enqueue(request)
+	bufs, sizes := [][]byte{make([]byte, mtu)}, []int{0}
+	_, err := port.Read(bufs, sizes, 0)
+	requireOK(t, err)
+	if sizes[0] != len(request) || !a.engine.receiveHub(reply) {
+		t.Fatal("control TCP could not pass the forwarding gate")
+	}
+	if a.engine.receiveHub(tcp(control, a.ip, 22, 40000)) ||
+		a.engine.receiveHub(ipPacket(b.ip, a.ip, 2)) ||
+		a.engine.transmitHub(tcp(a.ip, control, 40000, 22)) ||
+		a.engine.transmitHub(tcp(a.ip, b.ip, 40000, a.engine.controlPort)) ||
+		a.engine.transmitLAN(data) {
+		t.Fatal("disabled tunnel accepted non-control traffic")
+	}
+	request[6] = 0x20 // more fragments
+	if a.engine.transmitHub(request) {
+		t.Fatal("fragmented packet bypassed the control gate")
+	}
+	lab.rejectLAN(t, 0)
+
+	a.engine.setForwarding(true)
+	lab.rejectLAN(t, 0)
+	lab.send(t, 0, 3, true)
 }
