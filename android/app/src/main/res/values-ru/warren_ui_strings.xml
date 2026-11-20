@@ -2,6 +2,15 @@
 <resources>
     <string name="warren_ui_back">Назад</string>
     <string name="warren_ui_close">Закрыть</string>
+    <string name="warren_ui_add_phone">Добавить телефон</string>
+    <string name="warren_ui_scan">Сканировать QR-код</string>
+    <string name="warren_ui_choose_photo">Выбрать из фото</string>
+    <string name="warren_ui_qr_code">QR-код</string>
+    <string name="warren_ui_qr_help">Где взять QR-код?</string>
+    <string name="warren_ui_qr_help_body">В админке Warren откройте «Устройства» и добавьте телефон.</string>
+    <string name="warren_ui_enrolling">Добавляем телефон…</string>
+    <string name="warren_ui_torch_on">Включить подсветку</string>
+    <string name="warren_ui_torch_off">Выключить подсветку</string>
     <string name="warren_ui_error_camera_denied">Нет доступа к камере. Выберите фото.</string>
     <string name="warren_ui_error_camera_unavailable">Не удалось открыть камеру. Выберите фото.</string>
     <string name="warren_ui_error_photo_unreadable">Не удалось открыть фото. Выберите другое.</string>
@@ -13,5 +22,8 @@
     <string name="warren_ui_error_vpn_denied">Нужен доступ к VPN. Нажмите «Подключить», чтобы попробовать ещё раз.</string>
     <string name="warren_ui_error_vpn_failed">Не удалось запустить VPN. Попробуйте подключиться ещё раз.</string>
     <string name="warren_ui_error_tile_failed">Не удалось добавить плитку. Добавьте Warren через редактирование быстрых настроек.</string>
+    <string name="warren_ui_replace_profile">Заменить профиль</string>
+    <string name="warren_ui_retry_enrollment">Повторить регистрацию</string>
+    <string name="warren_ui_cancel">Отмена</string>
     <string name="warren_ui_error_server_upgrade">Для регистрации нужно обновить сервер. Повторите попытку после обновления.</string>
 </resources>
