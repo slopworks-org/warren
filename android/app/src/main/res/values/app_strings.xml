@@ -4,4 +4,9 @@
     <string name="notification_channel_vpn">VPN connection</string>
     <string name="notification_vpn">Warren VPN is enabled</string>
     <string name="notification_disconnect">Disconnect</string>
+    <string name="status_off">Disconnected</string>
+    <string name="status_connecting">Connecting</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_recovering">Reconnecting</string>
+    <string name="status_disconnecting">Disconnecting</string>
 </resources>

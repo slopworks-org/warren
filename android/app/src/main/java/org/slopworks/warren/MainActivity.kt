@@ -3,9 +3,13 @@ package org.slopworks.warren
 import android.Manifest
 import android.app.Activity
 import android.app.Application
+import android.app.StatusBarManager
+import android.content.ComponentName
 import android.content.pm.PackageManager
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -41,6 +45,7 @@ import org.slopworks.warren.ui.WarrenUiState
 import org.slopworks.warren.ui.WarrenVpnStatus
 import org.slopworks.warren.vpn.Phase
 import org.slopworks.warren.vpn.VpnStatus
+import org.slopworks.warren.vpn.WarrenTile
 import org.slopworks.warren.vpn.WarrenVpnService
 
 class MainActivity : ComponentActivity() {
@@ -111,7 +116,7 @@ class MainActivity : ComponentActivity() {
             }
             WarrenAction.CLOSE_SCANNER -> model.update { copy(scanner = false, error = null, torch = null) }
             WarrenAction.TOGGLE_TORCH -> camera?.toggleTorch()
-            WarrenAction.ADD_TILE -> Unit
+            WarrenAction.ADD_TILE -> addTile()
             WarrenAction.REPLACE_PROFILE -> model.replaceProfile()
             WarrenAction.RETRY_ENROLLMENT -> model.retryEnrollment()
             WarrenAction.CANCEL_ENROLLMENT -> model.cancelEnrollment()
@@ -123,6 +128,22 @@ class MainActivity : ComponentActivity() {
         if (runCatching { WarrenVpnService.connect(this) }.isFailure) model.error(WarrenError.VPN_FAILED)
     }
 
+    private fun addTile() {
+        if (Build.VERSION.SDK_INT < 33) return
+        model.error(null)
+        val statusBar = getSystemService(StatusBarManager::class.java)
+        statusBar.requestAddTileService(
+            ComponentName(this, WarrenTile::class.java), getString(R.string.app_name),
+            Icon.createWithResource(this, R.drawable.ic_warren_vpn), mainExecutor,
+        ) { result ->
+            when (result) {
+                StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED,
+                StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED -> model.update { copy(tileAdded = true) }
+                StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_NOT_ADDED -> Unit
+                else -> model.error(WarrenError.TILE_FAILED)
+            }
+        }
+    }
 }
 
 internal data class Screen(
@@ -132,6 +153,7 @@ internal data class Screen(
     val pending: Boolean = false,
     val scanner: Boolean = false,
     val torch: Boolean? = null,
+    val tileAdded: Boolean = false,
     val error: WarrenError? = null,
 ) {
     val canReadCode get() = !busy && !pending && (profile == null || replacing)
@@ -157,6 +179,7 @@ internal data class Screen(
                 else -> WarrenRoutes.Unavailable
             },
             details = WarrenConnectionDetails(profile.server, splitTunnel = true, reconnects = true),
+            canAddTile = !tileAdded && Build.VERSION.SDK_INT >= 33,
             error = error ?: if (vpn.failed) WarrenError.VPN_FAILED else null,
         )
     }
