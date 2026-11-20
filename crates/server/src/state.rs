@@ -48,6 +48,8 @@ pub struct Snapshot {
     pub peers: Vec<PeerSpec>,
     /// Compiled device-to-device ACL.
     pub acl: Acl,
+    // Per-source route revisions are computed on demand for this snapshot.
+    pub(crate) route_revisions: Mutex<HashMap<Ipv4Addr, String>>,
     /// Admin-editable settings.
     pub settings: Settings,
     /// The version agents update to; empty until an administrator asks.
@@ -262,6 +264,7 @@ impl AppState {
             resources,
             peers,
             acl: Acl::compile(&nodes, &acl_rules),
+            route_revisions: Mutex::default(),
             settings: self.db.settings()?,
             agent_target: self.db.value(AGENT_TARGET)?.unwrap_or_default(),
         };
