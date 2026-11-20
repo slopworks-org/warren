@@ -9,6 +9,8 @@ use crate::state::AppState;
 use crate::util::{now, random};
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::response::IntoResponse;
+use http::header::CACHE_CONTROL;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -67,20 +69,37 @@ pub struct TokenReq {
     user_id: Option<i64>,
     #[serde(default)]
     ttl_minutes: Option<u32>,
+    #[serde(default)]
+    android_qr: bool,
 }
 
-/// `POST /api/v1/devices/tokens`: a one-time token for `warren up`.
+/// `POST /api/v1/devices/tokens`: a one-time agent token, optionally with an Android QR.
 pub async fn create_token(
     State(state): State<Arc<AppState>>,
     ip: Ip,
     auth: Auth,
     Json(req): Json<TokenReq>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<impl IntoResponse> {
     let owner = owner_for(&state, &auth, req.user_id)?;
     let ttl = req.ttl_minutes.unwrap_or(state.snapshot().settings.token_ttl_minutes).clamp(5, 24 * 60);
     let token = RegToken { id: random::<TOKEN_ID_LEN>(), secret: random::<TOKEN_SECRET_LEN>() };
     let name = req.name.as_deref().and_then(clean_name).unwrap_or_default();
     let expires_at = now() + i64::from(ttl) * 60;
+    let server = state.config.https_origin(state.config.admin_host());
+    let encoded = token.encode();
+    let mut response = json!({
+        "token": encoded,
+        "expires_at": expires_at,
+        "command": format!("warren up --server {server} --token {encoded}"),
+    });
+    if req.android_qr {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("v", "1")
+            .append_pair("server", &server)
+            .append_pair("token", &encoded)
+            .finish();
+        response["qr_svg"] = json!(qr_svg(&format!("warren://enroll?{query}"))?);
+    }
     state.db.create_reg_token(&RegTokenRow {
         id: token.id_hex(),
         user_id: owner,
@@ -96,13 +115,7 @@ pub async fn create_token(
         &format!("user:{owner}"),
         &format!("token {} {name}", token.id_hex()),
     );
-    let server = state.config.https_origin(state.config.admin_host());
-    let encoded = token.encode();
-    Ok(Json(json!({
-        "token": encoded,
-        "expires_at": expires_at,
-        "command": format!("warren up --server {server} --token {encoded}"),
-    })))
+    Ok(([(CACHE_CONTROL, "no-store")], Json(response)))
 }
 
 #[derive(Deserialize)]

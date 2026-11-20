@@ -109,8 +109,8 @@ function codeBlock(text) {
   return h('div', { class: 'copyline' }, h('div', { class: 'code', text }), copyButton(text));
 }
 
-function qrImage(svg) {
-  return h('div', { class: 'qr' }, h('img', { alt: 'QR code', src: 'data:image/svg+xml;base64,' + btoa(svg) }));
+function qrImage(svg, alt = 'QR code') {
+  return h('div', { class: 'qr' }, h('img', { alt, src: 'data:image/svg+xml;base64,' + btoa(svg) }));
 }
 
 function field(label, input, hint) {
@@ -474,33 +474,49 @@ async function addDeviceDialog(reload) {
     const ttl = select([[15, '15 minutes'], [60, '1 hour'], [1440, '24 hours']], 60);
     const pub = h('input', { class: 'mono', placeholder: 'optional: the device’s public key' });
     const result = h('div');
+    const modes = [['agent', 'With the agent'], ['android', 'Warren Android app'], ['config', 'WireGuard config']];
     function render() {
-      tabs.replaceChildren(
-        h('button', { type: 'button', class: mode === 'agent' ? 'on' : null, text: 'With the agent', onclick: () => { mode = 'agent'; render(); } }),
-        h('button', { type: 'button', class: mode === 'config' ? 'on' : null, text: 'WireGuard config', onclick: () => { mode = 'config'; render(); } }));
+      tabs.replaceChildren(...modes.map(([value, text]) => h('button', {
+        type: 'button', class: mode === value ? 'on' : null, text, onclick: () => {
+          if (ctl.submit.disabled || mode === value) return;
+          mode = value;
+          ctl.error.textContent = '';
+          render();
+        },
+      })));
       result.replaceChildren();
       ctl.submit.hidden = false;
-      if (mode === 'agent') {
-        ctl.submit.textContent = 'Create token';
+      const ownerField = owner ? [field('Owner', owner)] : [];
+      if (mode !== 'config') {
+        const android = mode === 'android';
+        ctl.submit.textContent = android ? 'Create QR code' : 'Create token';
         pane.replaceChildren(
-          h('p', { class: 'hint', text: 'Creates a one-time token. Run the shown command on the device; it keeps its private key to itself.' }),
+          h('p', { class: 'hint', text: android ? 'Create a one-time enrollment code to scan in the Warren Android app.'
+            : 'Creates a one-time token. Run the shown command on the device; it keeps its private key to itself.' }),
           field('Name (optional)', name, 'Defaults to the device’s host name.'),
-          owner ? field('Owner', owner) : null, field('Token valid for', ttl), result);
+          ...ownerField, field('Token valid for', ttl), result);
       } else {
         ctl.submit.textContent = 'Create config';
         pane.replaceChildren(
           h('p', { class: 'hint', text: 'For devices without the agent (phones, laptops with a WireGuard app). The configuration is static.' }),
-          field('Name', name), owner ? field('Owner', owner) : null,
+          field('Name', name), ...ownerField,
           field('Public key', pub, 'Leave empty to generate a key pair; the private key is shown once and never stored.'), result);
       }
     }
     body.append(tabs, pane);
     render();
     return async () => {
+      if (ctl.submit.hidden) return false;
       const user_id = owner ? Number(owner.value) : undefined;
-      if (mode === 'agent') {
-        const r = await api('POST', '/devices/tokens', { name: name.value || null, user_id, ttl_minutes: Number(ttl.value) });
-        result.replaceChildren(
+      if (mode !== 'config') {
+        const android = mode === 'android';
+        const r = await api('POST', '/devices/tokens', {
+          name: name.value || null, user_id, ttl_minutes: Number(ttl.value), android_qr: android || undefined,
+        });
+        if (android) result.replaceChildren(
+          qrImage(r.qr_svg, 'Warren Android enrollment QR code'),
+          h('div', { class: 'hint', text: 'Scan in the Warren Android app. This code works once and expires ' + fmtTime(r.expires_at) + '. To replace a used or expired code, open Add device again.' }));
+        else result.replaceChildren(
           h('label', { text: 'On the device, run' }), codeBlock(r.command),
           h('div', { class: 'hint', text: 'The token works once and expires ' + fmtTime(r.expires_at) + '. Then start the service: on OpenWrt /etc/init.d/warren enable && /etc/init.d/warren start, with systemd systemctl enable --now warren.' }));
       } else {
