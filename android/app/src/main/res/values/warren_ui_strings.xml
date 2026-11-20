@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="warren_ui_brand" translatable="false">Warren</string>
+    <string name="warren_ui_back">Back</string>
+    <string name="warren_ui_close">Close</string>
+    <string name="warren_ui_error_camera_denied">Camera access is off. Choose a photo to continue.</string>
+    <string name="warren_ui_error_camera_unavailable">Couldn’t open the camera. Choose a photo to continue.</string>
+    <string name="warren_ui_error_photo_unreadable">Couldn’t open that photo. Choose another photo.</string>
+    <string name="warren_ui_error_qr_not_found">No QR code found. Try another photo.</string>
+    <string name="warren_ui_error_invalid_code">This isn’t a Warren setup code. Add a phone in the admin panel to get one.</string>
+    <string name="warren_ui_error_expired_code">This code is no longer valid. Create a new one in the admin panel.</string>
+    <string name="warren_ui_error_enrollment_failed">Couldn’t complete enrollment. Try again.</string>
+    <string name="warren_ui_error_server_unreachable">Couldn’t reach the server. Check your internet connection and try again.</string>
+    <string name="warren_ui_error_vpn_denied">VPN access is required. Tap Connect to try again.</string>
+    <string name="warren_ui_error_vpn_failed">Couldn’t start the VPN. Try connecting again.</string>
+    <string name="warren_ui_error_tile_failed">Couldn’t add the tile. You can add Warren by editing Quick Settings.</string>
+    <string name="warren_ui_error_server_upgrade">This server needs an update to support enrollment. Retry after updating the server.</string>
+</resources>
