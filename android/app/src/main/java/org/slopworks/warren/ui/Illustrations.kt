@@ -1,6 +1,6 @@
 package org.slopworks.warren.ui
 
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateColor
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.updateTransition
 import androidx.compose.foundation.Canvas
@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -35,10 +36,70 @@ import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 import org.slopworks.warren.R
 
-private enum class TunnelMood { ACTIVE, OFF, RECOVERING }
+internal enum class TunnelMood { ACTIVE, OFF, RECOVERING }
+
+internal data class TunnelPalette(
+    val backdrop: Color,
+    val face: Color,
+    val middle: Color,
+    val back: Color,
+    val edge: Color,
+    val line: Color,
+    val shadow: Color,
+    val packet: Color,
+    val archShadowAlpha: Float,
+    val packetShadowAlpha: Float,
+)
+
+internal fun tunnelPalette(colors: ColorScheme, dark: Boolean, mood: TunnelMood): TunnelPalette {
+    if (mood == TunnelMood.OFF) {
+        return TunnelPalette(
+            colors.surfaceContainer, colors.outline, colors.outlineVariant,
+            colors.surfaceContainerHigh, colors.outline, colors.outlineVariant,
+            colors.onSurface, colors.outline, 0.06f, 0.14f,
+        )
+    }
+
+    val container = if (mood == TunnelMood.ACTIVE) colors.primaryContainer else colors.secondaryContainer
+    val primary = colors.primary
+    if (dark) {
+        val backdrop = if (container.luminance() > 0.22f) {
+            lerp(colors.surfaceContainer, container, 0.27f)
+        } else {
+            container
+        }
+        return TunnelPalette(
+            backdrop = backdrop,
+            face = lerp(primary, colors.onSurface, 0.14f),
+            middle = lerp(primary, backdrop, 0.36f),
+            back = lerp(primary, backdrop, 0.60f),
+            edge = lerp(backdrop, colors.surface, 0.32f),
+            line = lerp(primary, backdrop, 0.24f),
+            shadow = colors.surface,
+            packet = colors.tertiary,
+            archShadowAlpha = 0.24f,
+            packetShadowAlpha = 0.28f,
+        )
+    }
+
+    val middle = lerp(primary, colors.primaryContainer, 0.52f)
+    return TunnelPalette(
+        backdrop = container,
+        face = lerp(primary, colors.primaryContainer, 0.19f),
+        middle = middle,
+        back = lerp(middle, colors.primaryContainer, 0.5f),
+        edge = lerp(primary, colors.onPrimaryContainer, 0.25f),
+        line = lerp(primary, colors.outline, 0.35f),
+        shadow = colors.onPrimaryContainer,
+        packet = colors.tertiaryContainer,
+        archShadowAlpha = 0.11f,
+        packetShadowAlpha = 0.14f,
+    )
+}
 
 private val ActiveFrame = GenericShape { size, _ ->
     val w = size.width
@@ -65,15 +126,37 @@ internal fun TunnelIllustration(status: WarrenVpnStatus) {
         TunnelMood.RECOVERING -> RoundedCornerShape(65.dp, 90.dp, 65.dp, 90.dp)
         TunnelMood.ACTIVE -> ActiveFrame
     }
-    val backdrop by animateColorAsState(
-        when (mood) {
-            TunnelMood.OFF -> colors.surfaceContainer
-            TunnelMood.RECOVERING -> colors.secondaryContainer
-            TunnelMood.ACTIVE -> colors.primaryContainer
-        },
-        label = "Tunnel backdrop",
-    )
     val transition = updateTransition(mood, label = "Tunnel")
+    val backdrop by transition.animateColor(label = "Backdrop") {
+        tunnelPalette(colors, dark, it).backdrop
+    }
+    val face by transition.animateColor(label = "Front arch") {
+        tunnelPalette(colors, dark, it).face
+    }
+    val middle by transition.animateColor(label = "Middle arch") {
+        tunnelPalette(colors, dark, it).middle
+    }
+    val back by transition.animateColor(label = "Rear arch") {
+        tunnelPalette(colors, dark, it).back
+    }
+    val edge by transition.animateColor(label = "Arch edge") {
+        tunnelPalette(colors, dark, it).edge
+    }
+    val line by transition.animateColor(label = "Ground line") {
+        tunnelPalette(colors, dark, it).line
+    }
+    val shadow by transition.animateColor(label = "Shadow") {
+        tunnelPalette(colors, dark, it).shadow
+    }
+    val packet by transition.animateColor(label = "Packet") {
+        tunnelPalette(colors, dark, it).packet
+    }
+    val archShadowAlpha by transition.animateFloat(label = "Arch shadow alpha") {
+        tunnelPalette(colors, dark, it).archShadowAlpha
+    }
+    val packetShadowAlpha by transition.animateFloat(label = "Packet shadow alpha") {
+        tunnelPalette(colors, dark, it).packetShadowAlpha
+    }
     val spread by transition.animateFloat(label = "Arch spacing") { if (it == TunnelMood.RECOVERING) 1f else 0f }
     val packetX by transition.animateFloat(label = "Packet position X") {
         when (it) {
@@ -90,20 +173,6 @@ internal fun TunnelIllustration(status: WarrenVpnStatus) {
         }
     }
     val off = mood == TunnelMood.OFF
-    val primary = colors.primary
-    val mixed = lerp(primary, colors.primaryContainer, if (dark) 0.32f else 0.52f)
-    val face = if (off) colors.outline else lerp(primary, colors.primaryContainer, if (dark) 0.12f else 0.19f)
-    val middle = if (off) colors.outlineVariant else mixed
-    val back = if (off) colors.surfaceContainerHigh else lerp(mixed, colors.primaryContainer, 0.5f)
-    val edge = when {
-        off -> colors.outline
-        dark -> lerp(colors.primaryContainer, primary, 0.33f)
-        else -> lerp(primary, colors.onPrimaryContainer, 0.25f)
-    }
-    val line = if (off) colors.outlineVariant else lerp(primary, colors.outline, 0.35f)
-    val shadow = if (off) colors.onSurface else colors.onPrimaryContainer
-    val packet = if (off) colors.outline else if (dark) colors.tertiary else colors.tertiaryContainer
-
     Canvas(
         Modifier.widthIn(max = 294.dp).fillMaxWidth().aspectRatio(1.48f)
             .clip(frame).background(backdrop),
@@ -115,12 +184,12 @@ internal fun TunnelIllustration(status: WarrenVpnStatus) {
         }) {
             tunnelGround(line, dashed = mood != TunnelMood.ACTIVE, off = off)
             val frontShift = if (off) 7f else 7f * spread
-            tunnelArch(206f + 17f * spread, 96f, 41f, 19f, back, edge, shadow, off)
-            tunnelArch(168f + 7f * spread, 114f, 45f, 22f, middle, edge, shadow, off)
-            tunnelArch(124f - frontShift, 135f, 49f, 23f, face, edge, shadow, off)
+            tunnelArch(206f + 17f * spread, 96f, 41f, 19f, back, edge, shadow, archShadowAlpha)
+            tunnelArch(168f + 7f * spread, 114f, 45f, 22f, middle, edge, shadow, archShadowAlpha)
+            tunnelArch(124f - frontShift, 135f, 49f, 23f, face, edge, shadow, archShadowAlpha)
             val radius = if (off) 7.5f else 10f
             drawOval(
-                shadow.copy(alpha = 0.14f),
+                shadow.copy(alpha = packetShadowAlpha),
                 topLeft = Offset(packetX + 3f - radius, packetY + radius - 4f),
                 size = Size(radius * 2.2f, 6f),
             )
@@ -168,11 +237,11 @@ private fun DrawScope.tunnelArch(
     face: Color,
     edge: Color,
     shadow: Color,
-    off: Boolean,
+    shadowAlpha: Float,
 ) {
     rotate(9f, pivot = Offset(x + 7f, y - 1f)) {
         drawOval(
-            shadow.copy(alpha = if (off) 0.06f else 0.11f),
+            shadow.copy(alpha = shadowAlpha),
             topLeft = Offset(x - radius, y - 9f),
             size = Size(2f * radius + 14f, 16f),
         )

@@ -1,6 +1,7 @@
 package org.slopworks.warren.ui
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +20,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -32,11 +34,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -98,21 +102,25 @@ internal fun RoutesScreen(routes: WarrenRoutes, onBack: () -> Unit) {
     }
 }
 
+internal fun expandedPeerFill(colors: ColorScheme, dark: Boolean): Color =
+    lerp(colors.surfaceContainerHigh, colors.primary, if (dark) 0.08f else 0.06f)
+
 @Composable
 private fun PeerCard(peer: WarrenPeer, expanded: Boolean, shape: Shape, onToggle: () -> Unit) {
     val colors = MaterialTheme.colorScheme
-    val fill = if (expanded) colors.primaryContainer else colors.surfaceContainer
-    val ink = if (expanded) colors.onPrimaryContainer else colors.onSurface
+    val dark = isSystemInDarkTheme()
+    val fill = if (expanded) expandedPeerFill(colors, dark) else colors.surfaceContainer
+    val border = if (expanded) BorderStroke(1.dp, colors.primary.copy(alpha = if (dark) 0.28f else 0.24f)) else null
     val canExpand = peer.path != WarrenPath.UNAVAILABLE
-    Surface(shape = shape, color = fill, contentColor = ink) {
+    Surface(shape = shape, color = fill, contentColor = colors.onSurface, border = border) {
         Column {
             if (canExpand) {
                 val description = stringResource(if (expanded) R.string.warren_ui_expanded else R.string.warren_ui_collapsed)
                 Surface(
                     onClick = onToggle,
                     modifier = Modifier.semantics { stateDescription = description },
-                    color = fill,
-                    contentColor = ink,
+                    color = Color.Transparent,
+                    contentColor = colors.onSurface,
                 ) {
                     PeerHeader(peer, expanded)
                 }
@@ -131,6 +139,7 @@ private fun PeerCard(peer: WarrenPeer, expanded: Boolean, shape: Shape, onToggle
 @Composable
 private fun PeerHeader(peer: WarrenPeer, expanded: Boolean) {
     val colors = MaterialTheme.colorScheme
+    val dark = isSystemInDarkTheme()
     val subtitle = when (peer.path) {
         WarrenPath.DIRECT -> R.string.warren_ui_direct
         WarrenPath.DIRECT_WIFI -> R.string.warren_ui_direct_wifi
@@ -142,8 +151,8 @@ private fun PeerHeader(peer: WarrenPeer, expanded: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        val tile = if (expanded) colors.primary.copy(alpha = 0.15f) else colors.surfaceContainerHigh
-        Surface(shape = RoundedCornerShape(13.dp), color = tile, contentColor = colors.onSurfaceVariant) {
+        val tile = if (expanded) colors.primary.copy(alpha = if (dark) 0.18f else 0.14f) else colors.surfaceContainerHigh
+        Surface(shape = RoundedCornerShape(13.dp), color = tile, contentColor = if (expanded) colors.primary else colors.onSurfaceVariant) {
             Box(Modifier.size(37.dp), contentAlignment = Alignment.Center) {
                 WarrenIcon(R.drawable.warren_ui_storage, Modifier.size(21.dp))
             }
@@ -159,7 +168,7 @@ private fun PeerHeader(peer: WarrenPeer, expanded: Boolean) {
             WarrenIcon(
                 R.drawable.warren_ui_expand,
                 Modifier.size(22.dp).rotate(angle),
-                tint = colors.onSurfaceVariant,
+                tint = if (expanded) colors.primary else colors.onSurfaceVariant,
             )
         }
     }
@@ -170,8 +179,9 @@ private fun PathDiagram(path: WarrenPath) {
     val relay = path == WarrenPath.RELAY
     val colors = MaterialTheme.colorScheme
     val live = colors.primary
-    val idle = colors.onPrimaryContainer.copy(alpha = 0.48f)
-    val packet = if (isSystemInDarkTheme()) colors.tertiary else colors.tertiaryContainer
+    val dark = isSystemInDarkTheme()
+    val idle = colors.onSurfaceVariant.copy(alpha = if (dark) 0.40f else 0.42f)
+    val packet = if (dark) colors.tertiary else colors.tertiaryContainer
     Box(Modifier.widthIn(max = 270.dp).fillMaxWidth().height(152.dp)) {
         Canvas(Modifier.fillMaxSize()) {
             val left = size.width * 0.15f
@@ -194,7 +204,7 @@ private fun PathDiagram(path: WarrenPath) {
                 cap = StrokeCap.Round, pathEffect = if (relay) dashes else null,
             )
             val dot = if (relay) Offset(size.width * 0.324f, 57.dp.toPx()) else Offset(middle, base)
-            drawCircle(colors.onPrimaryContainer, 5.1.dp.toPx(), dot)
+            drawCircle(colors.primary, 5.1.dp.toPx(), dot)
             drawCircle(packet, 3.8.dp.toPx(), dot)
         }
         RouteNode(
@@ -234,11 +244,12 @@ private val PeerNodeShape = GenericShape { size, _ ->
 @Composable
 private fun RouteNode(icon: Int, active: Boolean, shape: Shape, modifier: Modifier, small: Boolean = false) {
     val colors = MaterialTheme.colorScheme
+    val dark = isSystemInDarkTheme()
     Surface(
         modifier = modifier,
         shape = shape,
-        color = if (active) colors.primary else colors.primary.copy(alpha = 0.15f),
-        contentColor = if (active) colors.onPrimary else colors.onPrimaryContainer,
+        color = if (active) colors.primary else colors.onSurface.copy(alpha = if (dark) 0.10f else 0.08f),
+        contentColor = if (active) colors.onPrimary else colors.onSurfaceVariant,
     ) {
         Box(contentAlignment = Alignment.Center) {
             WarrenIcon(icon, Modifier.size(if (small) 19.dp else 22.dp))

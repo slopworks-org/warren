@@ -16,7 +16,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
-private val LightColors = lightColorScheme(
+internal val LightColors = lightColorScheme(
     primary = Color(0xFF4A539C),
     onPrimary = Color.White,
     primaryContainer = Color(0xFFE2E3FF),
@@ -37,7 +37,7 @@ private val LightColors = lightColorScheme(
     outlineVariant = Color(0xFFC6C5D5),
 )
 
-private val DarkColors = darkColorScheme(
+internal val DarkColors = darkColorScheme(
     primary = Color(0xFFB9C2FF),
     onPrimary = Color(0xFF202A68),
     primaryContainer = Color(0xFF33375E),
