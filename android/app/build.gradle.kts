@@ -141,4 +141,5 @@ dependencies {
     implementation("androidx.camera:camera-view:1.5.3")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

@@ -25,9 +25,19 @@ internal class PendingEnrollment(
     val request: SignedRequest,
 )
 
-internal class ProfileStore(context: Context) {
-    private val file = AtomicFile(File(context.noBackupFilesDir, "agent"))
-    private val prefs = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
+internal class ProfileStore(
+    private val readBytes: () -> ByteArray,
+    private val writeBytes: (ByteArray) -> Unit,
+    private val key: (create: Boolean) -> SecretKey,
+    private val legacyWantsVpn: () -> Boolean,
+) {
+    constructor(context: Context) : this(
+        AtomicFile(File(context.noBackupFilesDir, "agent")),
+        { context.getSharedPreferences("connection", Context.MODE_PRIVATE).getBoolean("connected", false) },
+    )
+
+    private constructor(file: AtomicFile, legacyWantsVpn: () -> Boolean) :
+        this(file::readFully, { file.writeVerified(it) }, ::androidKey, legacyWantsVpn)
 
     var wantsVpn: Boolean
         get() = synchronized(lock) {
@@ -98,13 +108,14 @@ internal class ProfileStore(context: Context) {
         check(!json.has("key") || json.retiring())
         json.remove("pending")
         write(json.put("server", profile.server).put("key", profile.privateKey)
-            .put("config", profile.config.wire).put("connected", false))
+            .put("config", AgentConfig.bootstrapWire(profile.config.wire)).put("connected", false))
     }
 
     fun saveConfig(profile: Profile) = synchronized(lock) {
         val json = read()
-        if (!json.retiring() && json.optString("key") == profile.privateKey) {
-            write(json.put("config", profile.config.wire))
+        if (json.wantsVpn() && json.optString("key") == profile.privateKey) {
+            val bootstrap = AgentConfig.bootstrapWire(profile.config.wire)
+            if (json.getString("config") != bootstrap) write(json.put("config", bootstrap))
         }
     }
 
@@ -114,7 +125,7 @@ internal class ProfileStore(context: Context) {
     private fun JSONObject.retiring(): Boolean = optJSONObject("pending")?.optBoolean("retiring") == true
 
     private fun JSONObject.wantsVpn(): Boolean =
-        has("key") && !retiring() && optBoolean("connected", prefs.getBoolean("connected", false))
+        has("key") && !retiring() && optBoolean("connected", legacyWantsVpn())
 
     private fun JSONObject.privateKey(): String =
         getString("key").also { require(Regex("[0-9a-f]{64}").matches(it)) }
@@ -124,21 +135,29 @@ internal class ProfileStore(context: Context) {
         else null
 
     private fun read(): JSONObject {
-        val bytes = try { file.readFully() } catch (_: FileNotFoundException) { return JSONObject() }
+        val bytes = try { readBytes() } catch (_: FileNotFoundException) { return JSONObject() }
         require(bytes.size in 29..(1024 * 1024))
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key(create = false), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+        cipher.init(Cipher.DECRYPT_MODE, key(false), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
         val plain = cipher.doFinal(bytes, 12, bytes.size - 12)
-        return try {
+        val json = try {
             JSONObject(String(plain, Charsets.UTF_8))
         } finally {
             plain.fill(0)
         }
+        // Rewrite legacy files before making them available to readers or writers.
+        // The store lock covers migration, intent changes and all config saves.
+        if (json.has("config")) {
+            val wire = json.getString("config")
+            val bootstrap = AgentConfig.bootstrapWire(wire)
+            if (wire != bootstrap) write(json.put("config", bootstrap))
+        }
+        return json
     }
 
     private fun write(json: JSONObject) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key(create = true))
+        cipher.init(Cipher.ENCRYPT_MODE, key(true))
         check(cipher.iv.size == 12)
         val plain = json.toString().toByteArray(Charsets.UTF_8)
         val bytes = try {
@@ -146,36 +165,40 @@ internal class ProfileStore(context: Context) {
         } finally {
             plain.fill(0)
         }
-        val out = file.startWrite()
-        try {
-            out.write(bytes)
-            out.fd.sync()
-        } catch (e: Exception) {
-            file.failWrite(out)
-            throw e
-        }
-        file.finishWrite(out)
-        // AtomicFile reports a failed rename in the log. Verify the committed
-        // bytes before allowing a request to consume its token.
-        check(file.readFully().contentEquals(bytes))
-    }
-
-    private fun key(create: Boolean): SecretKey {
-        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
-        check(create)
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
-            init(KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                .build())
-            generateKey()
-        }
+        writeBytes(bytes)
     }
 
     companion object {
         private const val KEY_ALIAS = "warren.agent.v1"
         private val lock = Any()
+
+        private fun androidKey(create: Boolean): SecretKey {
+            val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+            check(create)
+            return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
+                init(KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build())
+                generateKey()
+            }
+        }
     }
+}
+
+private fun AtomicFile.writeVerified(bytes: ByteArray) {
+    val out = startWrite()
+    try {
+        out.write(bytes)
+        out.fd.sync()
+    } catch (e: Exception) {
+        failWrite(out)
+        throw e
+    }
+    finishWrite(out)
+    // AtomicFile reports a failed rename in the log. Verify the committed
+    // bytes before allowing a request to consume its token.
+    check(readFully().contentEquals(bytes))
 }

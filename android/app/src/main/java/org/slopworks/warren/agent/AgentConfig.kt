@@ -86,12 +86,30 @@ internal class AgentConfig(
     val routePeers: List<RoutePeer>?,
     val routePage: RoutePage?,
 ) {
+    val isBootstrap get() = version == BOOTSTRAP_VERSION
+
     // A legacy server can omit rows at its count or byte limit. At most
     // 317 bytes per row plus 19 version digits were reserved on that server.
     val legacyRoutesMayBeTruncated = routePeers != null &&
         (routePeers.size == ROUTE_PAGE_ROWS || wire.toByteArray(Charsets.UTF_8).size > MAX_RESPONSE - 317 - 19)
 
     companion object {
+        // Warren's config versions are 63-bit hashes. A saved bootstrap must
+        // force a fresh config response even when the server has not changed.
+        private val BOOTSTRAP_VERSION = ULong.MAX_VALUE
+
+        fun bootstrapWire(wire: String): String {
+            val fields = Pairs.parse(wire)
+            return Pairs.of(
+                "version" to BOOTSTRAP_VERSION.toString(),
+                "device_id" to fields.one("device_id"),
+                "name" to fields.one("name"),
+                "address" to fields.one("address"),
+                "control" to fields.one("control"),
+                "peer" to fields.one("peer"),
+            ).encode()
+        }
+
         fun parse(fields: Pairs): AgentConfig {
             val address = Prefix.parse(fields.one("address"))
             val control = Endpoint.parse(fields.one("control"))
