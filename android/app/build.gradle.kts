@@ -48,9 +48,19 @@ android {
         minSdk = 31
         // API 36 retains the standard INTERNET permission for LAN sockets.
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.3.1"
+        versionCode = providers.gradleProperty("warrenVersionCode").orElse("1").get().toInt()
+        versionName = providers.gradleProperty("warrenVersionName").orElse("0.3.1").get()
         ndk { abiFilters.addAll(selectedAbis) }
+    }
+    providers.environmentVariable("WARREN_KEYSTORE").orNull?.let { keystore ->
+        val releaseSigning = signingConfigs.create("release") {
+            storeFile = file(keystore)
+            storeType = "PKCS12"
+            storePassword = providers.environmentVariable("WARREN_KEYSTORE_PASSWORD").get()
+            keyAlias = providers.environmentVariable("WARREN_KEY_ALIAS").get()
+            keyPassword = storePassword
+        }
+        buildTypes.getByName("release").signingConfig = releaseSigning
     }
     buildFeatures {
         compose = true
