@@ -4,6 +4,13 @@
     <string name="warren_ui_brand" translatable="false">Warren</string>
     <string name="warren_ui_back">Back</string>
     <string name="warren_ui_close">Close</string>
+    <string name="warren_ui_connected">Connected</string>
+    <string name="warren_ui_off">VPN is off</string>
+    <string name="warren_ui_connecting">Connecting</string>
+    <string name="warren_ui_recovering">Reconnecting</string>
+    <string name="warren_ui_disconnecting">Disconnecting</string>
+    <string name="warren_ui_connect">Connect</string>
+    <string name="warren_ui_disconnect">Disconnect</string>
     <string name="warren_ui_routes">Routes</string>
     <string name="warren_ui_routes_loading">Loading routes…</string>
     <string name="warren_ui_routes_unavailable">Routes are unavailable.</string>
@@ -14,6 +21,18 @@
     <string name="warren_ui_path_unavailable">Unavailable</string>
     <string name="warren_ui_expanded">Expanded</string>
     <string name="warren_ui_collapsed">Collapsed</string>
+    <string name="warren_ui_connection">Connection</string>
+    <string name="warren_ui_connection_actions">Connection actions</string>
+    <string name="warren_ui_details">Details</string>
+    <string name="warren_ui_connection_details">About this connection</string>
+    <string name="warren_ui_server">Server</string>
+    <string name="warren_ui_resources">Warren resources</string>
+    <string name="warren_ui_through_vpn">Through the VPN from all apps</string>
+    <string name="warren_ui_other_internet">Other internet traffic</string>
+    <string name="warren_ui_bypasses_vpn">Direct</string>
+    <string name="warren_ui_auto_connect">Automatic reconnection</string>
+    <string name="warren_ui_auto_connect_detail">After a network change or restart</string>
+    <string name="warren_ui_add_tile">Add Quick Settings tile</string>
     <string name="warren_ui_add_phone">Add a phone</string>
     <string name="warren_ui_scan">Scan QR code</string>
     <string name="warren_ui_choose_photo">Choose a photo</string>
@@ -35,6 +54,8 @@
     <string name="warren_ui_error_vpn_failed">Couldn’t start the VPN. Try connecting again.</string>
     <string name="warren_ui_error_tile_failed">Couldn’t add the tile. You can add Warren by editing Quick Settings.</string>
     <string name="warren_ui_replace_profile">Replace profile</string>
+    <string name="warren_ui_replace_profile_detail">Your current profile stays in place until the new code is accepted. You can connect to the new profile after setup.</string>
+    <string name="warren_ui_replace_confirm">Continue</string>
     <string name="warren_ui_retry_enrollment">Retry enrollment</string>
     <string name="warren_ui_cancel">Cancel</string>
     <string name="warren_ui_error_server_upgrade">This server needs an update to support enrollment. Retry after updating the server.</string>
