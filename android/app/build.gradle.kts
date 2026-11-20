@@ -49,7 +49,7 @@ android {
         // API 36 retains the standard INTERNET permission for LAN sockets.
         targetSdk = 36
         versionCode = providers.gradleProperty("warrenVersionCode").orElse("1").get().toInt()
-        versionName = providers.gradleProperty("warrenVersionName").orElse("0.3.1").get()
+        versionName = providers.gradleProperty("warrenVersionName").orElse("0.4.0").get()
         ndk { abiFilters.addAll(selectedAbis) }
     }
     providers.environmentVariable("WARREN_KEYSTORE").orNull?.let { keystore ->
