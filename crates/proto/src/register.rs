@@ -19,6 +19,7 @@ pub const TOKEN_ID_LEN: usize = 6;
 pub const TOKEN_SECRET_LEN: usize = 18;
 
 const REQUEST_LABEL: &[u8] = b"warren-register-request-v1\n";
+const RESUMABLE_REQUEST_LABEL: &[u8] = b"warren-register-resumable-request-v1\n";
 const REPLY_LABEL: &[u8] = b"warren-register-reply-v1\n";
 
 /// A one-time device registration token: a public id plus a secret.
@@ -102,10 +103,22 @@ pub fn sign_request(secret: &[u8], kv: &mut Kv) {
     kv.push("mac", t);
 }
 
+/// Signs an opt-in request in a domain that legacy servers cannot accept.
+pub fn sign_resumable_request(secret: &[u8], kv: &mut Kv) {
+    let t = tag(mac(secret, RESUMABLE_REQUEST_LABEL, &[kv.encode_without("mac").as_bytes()]));
+    kv.push("mac", t);
+}
+
 /// Checks the `mac` field of a registration request.
 #[must_use]
 pub fn verify_request(secret: &[u8], kv: &Kv) -> bool {
     verify(kv, mac(secret, REQUEST_LABEL, &[kv.encode_without("mac").as_bytes()]))
+}
+
+/// Checks the request MAC for resumable registration.
+#[must_use]
+pub fn verify_resumable_request(secret: &[u8], kv: &Kv) -> bool {
+    verify(kv, mac(secret, RESUMABLE_REQUEST_LABEL, &[kv.encode_without("mac").as_bytes()]))
 }
 
 /// Adds the `mac` field to a reply, binding it to the request's nonce.

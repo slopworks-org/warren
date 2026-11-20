@@ -150,7 +150,10 @@ async fn dispatch_http(state: Arc<AppState>, peer: SocketAddr, req: Request<Inco
         };
     }
     if path == warren_proto::REGISTER_PATH {
-        return crate::agent_api::register(state, peer.ip(), req).await;
+        return crate::agent_api::register(state, peer.ip(), req, false).await;
+    }
+    if path == "/agent/v1/register-resumable" && req.method() == http::Method::POST {
+        return crate::agent_api::register(state, peer.ip(), req, true).await;
     }
     match request_host(&req) {
         Some(host) if state.certs.is_known(&host) => {

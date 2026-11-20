@@ -100,6 +100,12 @@ CREATE TABLE IF NOT EXISTS reg_tokens (
     expires_at INTEGER NOT NULL,
     used_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS reg_receipts (
+    token_id TEXT PRIMARY KEY REFERENCES reg_tokens(id) ON DELETE CASCADE,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    request_hash TEXT NOT NULL,
+    reply TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS resources (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -294,6 +300,11 @@ pub struct RegTokenRow {
     pub expires_at: i64,
     /// Set once used.
     pub used_at: Option<i64>,
+}
+
+pub(crate) struct ReceiptSigner<'a> {
+    pub request_hash: &'a str,
+    pub sign: &'a dyn Fn(&Device) -> String,
 }
 
 /// Device-side protocol of a resource.
@@ -1007,24 +1018,68 @@ impl Db {
         public_key: &str,
         address: Ipv4Addr,
     ) -> DbResult<Option<i64>> {
+        self.register_device_inner(token_id, name, public_key, address, None)
+    }
+
+    pub(crate) fn register_device_inner(
+        &self,
+        token_id: &str,
+        name: &str,
+        public_key: &str,
+        address: Ipv4Addr,
+        receipt: Option<ReceiptSigner<'_>>,
+    ) -> DbResult<Option<i64>> {
         let mut c = self.c();
         let tx = c.transaction()?;
+        let time = now();
         let user: Option<i64> = tx
             .query_row(
-                "UPDATE reg_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL AND expires_at > ?1 RETURNING user_id",
-                params![now(), token_id],
+                "UPDATE reg_tokens SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL AND expires_at > ?1
+                 AND (NOT ?3 OR EXISTS (SELECT 1 FROM users WHERE id = user_id AND NOT disabled))
+                 RETURNING user_id",
+                params![time, token_id, receipt.is_some()],
                 |r| r.get(0),
             )
             .optional()?;
         let Some(user) = user else { return Ok(None) };
         tx.execute(
             "INSERT INTO devices (user_id, name, public_key, address, kind, created_at) VALUES (?1, ?2, ?3, ?4, 'agent', ?5)",
-            params![user, name, public_key, address.to_string(), now()],
+            params![user, name, public_key, address.to_string(), time],
         )
         .map_err(conflict)?;
         let id = tx.last_insert_rowid();
+        if let Some(receipt) = receipt {
+            let mut stmt = tx.prepare(&format!("SELECT {DEVICE_COLS} FROM devices WHERE id = ?1"))?;
+            let device =
+                stmt.query_and_then([id], device_row)?.next().ok_or(rusqlite::Error::QueryReturnedNoRows)??;
+            tx.execute(
+                "INSERT INTO reg_receipts (token_id, device_id, request_hash, reply) VALUES (?1, ?2, ?3, ?4)",
+                params![token_id, id, receipt.request_hash, (receipt.sign)(&device)],
+            )?;
+            // The receipt is already signed. Keep only the transcript hash
+            // needed to recognize an exact retransmission.
+            tx.execute("UPDATE reg_tokens SET secret = X'' WHERE id = ?1", [token_id])?;
+        }
         tx.commit()?;
         Ok(Some(id))
+    }
+
+    pub(crate) fn registration_receipt(&self, token_id: &str, request_hash: &str) -> DbResult<Option<(i64, String)>> {
+        let stored: Option<(i64, String, String)> = self
+            .c()
+            .query_row(
+                "SELECT d.id, r.request_hash, r.reply FROM reg_receipts r
+             JOIN reg_tokens t ON t.id = r.token_id
+             JOIN devices d ON d.id = r.device_id
+             JOIN users u ON u.id = d.user_id
+             WHERE t.id = ?1 AND t.expires_at > ?2 AND d.enabled AND NOT u.disabled",
+                params![token_id, now()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(stored.and_then(|(id, stored_hash, reply)| {
+            warren_proto::codec::ct_eq(stored_hash.as_bytes(), request_hash.as_bytes()).then_some((id, reply))
+        }))
     }
 
     /// Deletes expired and used tokens.
@@ -1034,6 +1089,10 @@ impl Db {
     pub fn prune(&self) -> DbResult<()> {
         let c = self.c();
         let t = now();
+        c.execute(
+            "DELETE FROM reg_receipts WHERE token_id IN (SELECT id FROM reg_tokens WHERE expires_at <= ?1)",
+            [t],
+        )?;
         c.execute("DELETE FROM reg_tokens WHERE expires_at < ?1 - 86400", [t])?;
         c.execute("DELETE FROM sessions WHERE expires_at < ?1", [t])?;
         c.execute("DELETE FROM invites WHERE expires_at < ?1 - 86400", [t])?;
@@ -1404,6 +1463,36 @@ mod tests {
         };
         db.create_reg_token(&t).unwrap();
         assert_eq!(db.register_device("old", "x", "k", Ipv4Addr::new(10, 77, 0, 2)).unwrap(), None);
+    }
+
+    #[test]
+    fn receipt_requires_an_active_owner_and_unexpired_token() {
+        let (db, user) = db_with_user();
+        let token = RegTokenRow {
+            id: "receipt".into(),
+            user_id: user.id,
+            secret: vec![1; 18],
+            name: String::new(),
+            expires_at: now() + 60,
+            used_at: None,
+        };
+        db.create_reg_token(&token).unwrap();
+        let id = db
+            .register_device_inner(
+                &token.id,
+                "phone",
+                "key",
+                Ipv4Addr::new(10, 77, 0, 2),
+                Some(ReceiptSigner { request_hash: "hash", sign: &|_| "signed reply".into() }),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.registration_receipt(&token.id, "hash").unwrap(), Some((id, "signed reply".into())));
+        db.update_user(user.id, None, Some(true)).unwrap();
+        assert_eq!(db.registration_receipt(&token.id, "hash").unwrap(), None);
+        db.update_user(user.id, None, Some(false)).unwrap();
+        db.c().execute("UPDATE reg_tokens SET expires_at = ?1 WHERE id = ?2", params![now(), token.id]).unwrap();
+        assert_eq!(db.registration_receipt(&token.id, "hash").unwrap(), None);
     }
 
     #[test]
