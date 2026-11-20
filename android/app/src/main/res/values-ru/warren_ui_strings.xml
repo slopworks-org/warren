@@ -2,6 +2,16 @@
 <resources>
     <string name="warren_ui_back">Назад</string>
     <string name="warren_ui_close">Закрыть</string>
+    <string name="warren_ui_routes">Маршруты</string>
+    <string name="warren_ui_routes_loading">Загружаем маршруты…</string>
+    <string name="warren_ui_routes_unavailable">Маршруты недоступны.</string>
+    <string name="warren_ui_routes_empty">Пока нет маршрутов к устройствам.</string>
+    <string name="warren_ui_direct">Напрямую</string>
+    <string name="warren_ui_direct_wifi">Напрямую по Wi-Fi</string>
+    <string name="warren_ui_relay">Через сервер</string>
+    <string name="warren_ui_path_unavailable">Недоступен</string>
+    <string name="warren_ui_expanded">Развёрнуто</string>
+    <string name="warren_ui_collapsed">Свёрнуто</string>
     <string name="warren_ui_add_phone">Добавить телефон</string>
     <string name="warren_ui_scan">Сканировать QR-код</string>
     <string name="warren_ui_choose_photo">Выбрать из фото</string>
