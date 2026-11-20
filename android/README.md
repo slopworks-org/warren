@@ -26,6 +26,20 @@ The locally signed APK is `app/build/outputs/apk/debug/app-debug.apk`.
 It contains arm64-v8a, armeabi-v7a and x86_64 native libraries. Set
 `-PwarrenAbis=arm64-v8a` to build only for one ABI.
 
+## Release APK
+
+Each `v*` release on GitHub includes a signed universal `warren-android.apk`
+and its checksum in `SHA256SUMS`. The APK uses the tag without the leading
+`v` as its version name and the first-parent commit count as its version code.
+
+The release workflow uses two GitHub Actions secrets. Set
+`ANDROID_KEYSTORE_BASE64` to the base64-encoded release keystore containing a
+single signing key, and `ANDROID_KEYSTORE_PASSWORD` to the password for both
+the keystore and key. Keep a backup of the keystore and password so future
+releases can update installed copies.
+
+## Connection
+
 The native bridge uses the same pinned upstream WireGuard Go revision as
 WireGuard Android 1.0.20260102. The app links that engine against a single
 Android VPN TUN descriptor. Separate hub and LAN WireGuard devices validate
