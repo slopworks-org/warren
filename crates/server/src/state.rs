@@ -55,6 +55,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn active_device(&self, id: i64) -> Option<&Device> {
+        self.devices.get(&id).filter(|d| d.enabled && self.users.get(&d.user_id).is_some_and(|u| !u.disabled))
+    }
+
     /// Permissions of a user's role.
     #[must_use]
     pub fn perms_of(&self, user: &User) -> &[String] {
@@ -296,7 +300,7 @@ impl AppState {
 
     /// The desired tunnel state for one device, as served to its agent.
     #[must_use]
-    pub fn agent_config(&self, d: &Device) -> AgentConfig {
+    pub fn agent_config(&self, snap: &Snapshot, d: &Device) -> AgentConfig {
         let mut cfg = AgentConfig {
             version: 0,
             device_id: u64::try_from(d.id).unwrap_or_default(),
@@ -309,8 +313,8 @@ impl AppState {
                 allowed_ips: vec![self.network.to_string()],
                 keepalive: DEFAULT_KEEPALIVE,
             }],
-            lan_peers: self.lan_peers(d),
-            update: self.snapshot().agent_target.clone(),
+            lan_peers: self.lan_peers(snap, d),
+            update: snap.agent_target.clone(),
         };
         cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;
         cfg
@@ -318,11 +322,10 @@ impl AppState {
 
     /// Agents on the same LAN as `d` that it may exchange any traffic with.
     /// Port rules are enforced only by the hub, so pairs limited by them stay on it.
-    fn lan_peers(&self, d: &Device) -> Vec<PeerConfig> {
+    fn lan_peers(&self, snap: &Snapshot, d: &Device) -> Vec<PeerConfig> {
         if !self.config.wireguard.lan_peers {
             return Vec::new();
         }
-        let snap = self.snapshot();
         let reports = self.lan_reports.read().unwrap_or_else(PoisonError::into_inner);
         let stats = self.stats.read().unwrap_or_else(PoisonError::into_inner);
         let seen = |id: i64| {
@@ -332,8 +335,9 @@ impl AppState {
         let Some(me) = seen(d.id) else { return Vec::new() };
         let mut out: Vec<(Ipv4Addr, PeerConfig)> = snap
             .devices
-            .values()
-            .filter(|o| o.id != d.id && o.enabled && snap.users.get(&o.user_id).is_some_and(|u| !u.disabled))
+            .keys()
+            .filter(|id| **id != d.id)
+            .filter_map(|id| snap.active_device(*id))
             .filter(|o| {
                 snap.acl.all.contains(&(d.address, o.address)) && snap.acl.all.contains(&(o.address, d.address))
             })
