@@ -6,21 +6,17 @@ import android.os.SystemClock
 import android.system.OsConstants
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.slopworks.warren.agent.AgentClient
 import org.slopworks.warren.agent.AgentException
 import org.slopworks.warren.agent.AgentFailure
-import org.slopworks.warren.agent.Endpoint
 import org.slopworks.warren.agent.Ipv4
 import org.slopworks.warren.agent.Peer
 import org.slopworks.warren.agent.Profile
 import org.slopworks.warren.agent.ProfileStore
-import org.slopworks.warren.agent.RoutePeer
 import java.io.IOException
 
 internal enum class Phase { OFF, CONNECTING, CONNECTED, RECOVERING, DISCONNECTING }
@@ -70,58 +66,17 @@ internal class TunnelSession(
             check(WireGuard.setLan(emptyLan, "", 0))
             // Serialize publication with LAN replacement so the ticker cannot
             // publish obsolete proof after an ACL edit or during recovery.
-            withContext(Dispatchers.IO.limitedParallelism(1)) liveSession@ {
-                val publication = RoutePublication(underlay.wifi, { WireGuard.directPaths().lineSequence().toSet() }, publish)
-                var routesJob: Job? = null
-                var routeSource: Pair<String, Endpoint>? = null
-                var routePeers: List<RoutePeer>? = null
-                fun clearRoutes() {
-                    routesJob?.cancel()
-                    routesJob = null
-                    routeSource = null
-                    routePeers = null
-                    publication.clear()
-                }
-                fun updateRoutes(peers: List<Peer>) {
-                    val config = profile.config
-                    val page = config.routePage
-                    val source = page?.let { it.revision to config.control }
-                    if (source != routeSource) {
-                        clearRoutes()
-                        routeSource = source
-                        if (page?.next == null) {
-                            routePeers = page?.peers
-                        } else {
-                            // Route requests run independently of config polling and LAN authorization.
-                            routesJob = launch {
-                                while (routePeers == null) {
-                                    val result = try {
-                                        AgentClient.routePeers(config)
-                                    } catch (_: IOException) {
-                                        null
-                                    }
-                                    ensureActive()
-                                    if (routeSource != source) return@launch
-                                    routePeers = result
-                                    if (result == null) delay(1000)
-                                }
-                                updateRoutes(profile.config.eligibleLan(underlay.lan))
-                            }
-                        }
-                    }
-                    publication.update(config, peers, routePeers)
-                }
-                val ticker = launch {
-                    while (isActive) {
-                        publication.tick()
-                        delay(500)
-                    }
-                }
-                try {
+            withContext(Dispatchers.IO.limitedParallelism(1)) {
+                withLiveRoutes(
+                    underlay.wifi,
+                    { WireGuard.directPaths().lineSequence().toSet() },
+                    publish,
+                    disableForwarding = { WireGuard.setForwarding(false) },
+                ) {
                     var first = true
                     var refresh = false
                     var failures = 0
-                    while (isActive) {
+                    while (currentCoroutineContext().isActive) {
                         val before = SystemClock.elapsedRealtime()
                         val wait = when {
                             first || refresh || failures > 0 -> 0
@@ -133,17 +88,12 @@ internal class TunnelSession(
                         val lanDeadline = if (underlay.lan.isEmpty()) 0L
                             else SystemClock.elapsedRealtimeNanos() + LAN_AUTHORIZATION_NANOS
                         val updated = try {
-                            AgentClient.poll(profile.config, wait, underlay.lan, port) {
-                                WireGuard.setForwarding(false)
-                            }
+                            AgentClient.poll(profile.config, wait, underlay.lan, port, onForbidden = ::revoke)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: IOException) {
-                            clearRoutes()
-                            if (e is AgentException && e.failure == AgentFailure.REVOKED) {
-                                publish(VpnStatus(Phase.RECOVERING, failed = true))
-                                throw e
-                            }
+                            if (e is AgentException && e.failure == AgentFailure.REVOKED) throw e
+                            clear()
                             check(WireGuard.setLan(emptyLan, "", 0))
                             publish(VpnStatus(Phase.RECOVERING, failed = true))
                             // Give a working endpoint time to recover from a transient control failure.
@@ -166,7 +116,7 @@ internal class TunnelSession(
                             ) {
                                 check(WireGuard.setLan(emptyLan, "", 0))
                                 store.saveConfig(profile)
-                                return@liveSession
+                                return@withLiveRoutes
                             }
                         }
                         WireGuard.setForwarding(true)
@@ -180,8 +130,8 @@ internal class TunnelSession(
                         }
                         val addresses = peers.joinToString("\n") { it.allowed.single().ip.toString() }
                         check(WireGuard.setLan(directConfig, addresses, lanDeadline))
-                        if (!publication.ready || updated != null) {
-                            updateRoutes(peers)
+                        if (!ready || updated != null) {
+                            update(profile.config, peers)
                         }
                         if (updated != null) {
                             store.saveConfig(profile)
@@ -196,9 +146,6 @@ internal class TunnelSession(
                         val elapsed = SystemClock.elapsedRealtime() - before
                         if (elapsed < 1000) delay(1000 - elapsed)
                     }
-                } finally {
-                    clearRoutes()
-                    ticker.cancel()
                 }
             }
         } finally {
