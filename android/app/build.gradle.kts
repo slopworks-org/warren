@@ -52,6 +52,16 @@ android {
         versionName = providers.gradleProperty("warrenVersionName").orElse("0.3.1").get()
         ndk { abiFilters.addAll(selectedAbis) }
     }
+    providers.environmentVariable("WARREN_KEYSTORE").orNull?.let { keystore ->
+        val releaseSigning = signingConfigs.create("release") {
+            storeFile = file(keystore)
+            storeType = "PKCS12"
+            storePassword = providers.environmentVariable("WARREN_KEYSTORE_PASSWORD").get()
+            keyAlias = providers.environmentVariable("WARREN_KEY_ALIAS").get()
+            keyPassword = storePassword
+        }
+        buildTypes.getByName("release").signingConfig = releaseSigning
+    }
     buildFeatures {
         compose = true
         buildConfig = true

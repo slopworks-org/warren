@@ -32,11 +32,17 @@ Each `v*` release on GitHub includes a signed universal `warren-android.apk`
 and its checksum in `SHA256SUMS`. The APK uses the tag without the leading
 `v` as its version name and the first-parent commit count as its version code.
 
-The release workflow uses two GitHub Actions secrets. Set
-`ANDROID_KEYSTORE_BASE64` to the base64-encoded release keystore containing a
-single signing key, and `ANDROID_KEYSTORE_PASSWORD` to the password for both
-the keystore and key. Keep a backup of the keystore and password so future
-releases can update installed copies.
+Gradle signs the release APK with Warren's dedicated PKCS12 key. The release
+workflow restores it from three GitHub Actions secrets:
+
+- `WARREN_KEYSTORE_BASE64` holds the base64-encoded keystore.
+- `WARREN_KEYSTORE_PASSWORD` is the password for both the keystore and key.
+- `WARREN_KEY_ALIAS` selects the signing key.
+
+For a local signed build, set `WARREN_KEYSTORE` to the keystore path and
+export `WARREN_KEYSTORE_PASSWORD` and `WARREN_KEY_ALIAS` before running
+`./gradlew :app:assembleRelease`. Keep a backup of the keystore and password
+so future releases can update installed copies.
 
 ## Connection
 

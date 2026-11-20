@@ -89,28 +89,29 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
 
-      - name: Build universal release APK
+      - name: Build and sign universal release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.WARREN_KEYSTORE_BASE64 }}
+          WARREN_KEYSTORE_PASSWORD: ${{ secrets.WARREN_KEYSTORE_PASSWORD }}
+          WARREN_KEY_ALIAS: ${{ secrets.WARREN_KEY_ALIAS }}
         working-directory: android
         run: |
+          set -eu
+          : "${KEYSTORE_BASE64:?Set WARREN_KEYSTORE_BASE64}" "${WARREN_KEYSTORE_PASSWORD:?}" "${WARREN_KEY_ALIAS:?}"
+          umask 077
+          WARREN_KEYSTORE=$(mktemp "$RUNNER_TEMP/warren-keystore.XXXXXX")
+          export WARREN_KEYSTORE
+          trap 'rm -f "$WARREN_KEYSTORE"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$WARREN_KEYSTORE"
+          unset KEYSTORE_BASE64
           ./gradlew :app:assembleRelease \
             -PwarrenVersionName="${GITHUB_REF_NAME#v}" \
             -PwarrenVersionCode="$(git rev-list --first-parent --count HEAD)"
 
-      - name: Sign and verify APK
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      - name: Verify APK signature
         run: |
-          set -eu
-          : "${KEYSTORE_BASE64:?Set ANDROID_KEYSTORE_BASE64}" "${KEYSTORE_PASSWORD:?Set ANDROID_KEYSTORE_PASSWORD}"
-          umask 077
-          keystore=$(mktemp "$RUNNER_TEMP/warren-keystore.XXXXXX")
-          trap 'rm -f "$keystore"' EXIT
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
-          signer="$ANDROID_HOME/build-tools/36.0.0/apksigner"
-          "$signer" sign --ks "$keystore" --ks-pass env:KEYSTORE_PASSWORD \
-            --out warren-android.apk android/app/build/outputs/apk/release/app-release-unsigned.apk
-          "$signer" verify --verbose --print-certs warren-android.apk
+          cp android/app/build/outputs/apk/release/app-release.apk warren-android.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs warren-android.apk
 
       - uses: actions/upload-artifact@v7
         with:
