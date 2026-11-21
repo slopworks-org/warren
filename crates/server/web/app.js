@@ -372,7 +372,9 @@ async function devicesPage(el) {
         : d.remote_updates === null ? 'Updates are managed on the device. Run the installer to upgrade.'
         : ['Managed on the device. Run ', h('code', { text: 'warren update' }), '.']);
     }
-    return h('td', { class: 'device-update' }, h('div', { text: current ? 'v' + current : 'Version unknown' }), summary, detail);
+    const channel = d.update_channel === 'main' ? h('span', { class: 'badge', text: 'main' }) : null;
+    return h('td', { class: 'device-update' },
+      h('div', {}, current ? 'v' + current : 'Version unknown', channel && ' ', channel), summary, detail);
   }
 
   async function load() {
@@ -746,7 +748,7 @@ async function settingsPage(el) {
 
   const acl = h('div', { class: 'panel' });
   const info = server ? h('div', { class: 'panel pad' }, h('dl', { class: 'kv' },
-    [['Version', server.version], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
+    [['Version', server.version], ['Update channel', server.update_channel], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
       ['WireGuard endpoint', server.wg_endpoint], ['Tunnel network', server.network + ' (server ' + server.server_ip + ')'],
       ['Server public key', server.public_key], ['Tunnel backend', server.backend], ['TLS', server.tls_mode]]
       .map(([k, v]) => [h('dt', { text: k }), h('dd', { class: k.includes('key') ? 'mono' : null, text: v })]))) : null;
