@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use warren_proto::{DEFAULT_CTL_PORT, DEFAULT_WG_PORT};
+use warren_proto::{DEFAULT_CTL_PORT, DEFAULT_WG_PORT, UpdateChannel};
 
 /// Why the configuration cannot be used.
 #[derive(Debug, Error)]
@@ -154,19 +154,37 @@ impl Default for LogConfig {
     }
 }
 
+pub(crate) mod channel_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use warren_proto::UpdateChannel;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<UpdateChannel, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        UpdateChannel::parse(&name).ok_or_else(|| serde::de::Error::unknown_variant(&name, &["release", "main"]))
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref, reason = "serde passes the field by reference")]
+    pub fn serialize<S: Serializer>(channel: &UpdateChannel, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(channel.as_str())
+    }
+}
+
 /// `[update]` section.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
-    /// Look for a new release on GitHub once a day.
+    /// Channel used for server updates.
+    #[serde(with = "channel_serde")]
+    pub channel: UpdateChannel,
+    /// Check both channels for device and server updates.
     pub check: bool,
-    /// Install a new release without waiting for an administrator.
+    /// Install a new server release unattended.
     pub auto: bool,
 }
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        UpdateConfig { check: true, auto: false }
+        UpdateConfig { check: true, auto: false, channel: UpdateChannel::Release }
     }
 }
 
@@ -387,6 +405,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_update_channels() {
+        let config = |settings: &str| {
+            Config::from_toml(&format!(
+                "domain = 'example.com'\nacme_email = 'admin@example.com'\n[update]\n{settings}"
+            ))
+        };
+        assert_eq!(config("").unwrap().update.channel, UpdateChannel::Release);
+        for channel in [UpdateChannel::Release, UpdateChannel::Main] {
+            assert_eq!(config(&format!("channel = '{channel}'")).unwrap().update.channel, channel);
+        }
+        assert!(config("channel = 'nightly'").is_err());
+    }
 
     #[test]
     fn minimal_config() {

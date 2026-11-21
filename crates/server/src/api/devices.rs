@@ -4,7 +4,7 @@ use super::profile::qr_svg;
 use super::{ApiError, ApiResult, Auth, Ip, rebuild};
 use crate::agent_api::clean_name;
 use crate::auth::Perm;
-use crate::db::{Device, DeviceKind, RegTokenRow};
+use crate::db::{Device, DeviceKind, RegTokenRow, UpdateRequest};
 use crate::state::AppState;
 use crate::util::{now, random};
 use axum::Json;
@@ -59,6 +59,40 @@ pub async fn list(State(state): State<Arc<AppState>>, auth: Auth) -> ApiResult<J
 pub async fn get_one(State(state): State<Arc<AppState>>, auth: Auth, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
     let d = visible(&state, &auth, id)?;
     Ok(Json(json!(state.device_view(&state.snapshot(), &d))))
+}
+
+/// `POST /api/v1/devices/{id}/update`: requests the current release for an opted-in device.
+pub async fn request_update(
+    State(state): State<Arc<AppState>>,
+    ip: Ip,
+    auth: Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Value>> {
+    let device = visible(&state, &auth, id)?;
+    if device.kind != DeviceKind::Agent || !device.enabled || device.remote_updates != Some(true) {
+        return Err(ApiError::Conflict("This device must be enabled and allow updates locally.".into()));
+    }
+    let target = state
+        .latest_agent_version(device.update_channel)
+        .filter(|version| warren_proto::is_update_available(device.update_channel, version, &device.agent_version))
+        .ok_or_else(|| ApiError::Conflict("No newer agent release is available.".into()))?;
+    match state.db.request_agent_update(&device, &target)? {
+        UpdateRequest::Queued => {
+            state.notify_agents();
+            state.audit(
+                Some(&auth.user),
+                &ip,
+                "device.update.request",
+                &format!("device:{id} {}", device.name),
+                &target,
+            );
+        }
+        UpdateRequest::AlreadyQueued => {}
+        UpdateRequest::DeviceChanged => {
+            return Err(ApiError::Conflict("The device changed. Refresh its state and try again.".into()));
+        }
+    }
+    Ok(Json(json!({ "version": target })))
 }
 
 #[derive(Deserialize)]

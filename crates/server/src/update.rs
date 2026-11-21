@@ -1,4 +1,4 @@
-//! New releases: a daily look at the latest GitHub release, and installing it.
+//! New releases: check the release and main channels and install the configured build.
 //!
 //! The sandboxed server cannot write its own binary. It downloads the new
 //! binary to `<data_dir>/update/warren-server` and exits with
@@ -22,10 +22,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
-pub use warren_proto::{is_newer, parse_version};
+use warren_proto::{
+    MAIN_CHANNEL_MANIFEST, MAIN_CHANNEL_TAG, RELEASE_REPO, UpdateChannel, asset_checksum, asset_sha256,
+    is_update_available, parse_version,
+};
 
-/// The GitHub repository releases come from.
-pub const REPO: &str = "slopworks-org/warren";
 const CHECK_INTERVAL: Duration = Duration::from_hours(24);
 const RETRY_INTERVAL: Duration = Duration::from_hours(1);
 const MAX_REDIRECTS: usize = 5;
@@ -83,6 +84,17 @@ pub struct Release {
     pub url: String,
 }
 
+impl Release {
+    fn from_main_manifest(bytes: &[u8]) -> Result<Self, UpdateError> {
+        let manifest = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(warren_proto::parse_main_manifest)
+            .ok_or_else(|| UpdateError::Release("invalid main channel manifest".into()))?;
+        let url = format!("https://github.com/{RELEASE_REPO}/releases/tag/{}", manifest.tag);
+        Ok(Self { version: manifest.version, tag: manifest.tag, url })
+    }
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -125,7 +137,7 @@ impl Fetcher {
         let mut uri: Uri = url.parse().map_err(|e| format!("{e}"))?;
         for _ in 0..=MAX_REDIRECTS {
             let req = Request::get(uri.clone())
-                .header(USER_AGENT, concat!("warren-server/", env!("CARGO_PKG_VERSION")))
+                .header(USER_AGENT, format!("warren-server/{}", warren_proto::VERSION))
                 .header(ACCEPT, "application/vnd.github+json, */*")
                 .body(Empty::new())
                 .map_err(|e| e.to_string())?;
@@ -149,12 +161,32 @@ impl Fetcher {
         Err("too many redirects".into())
     }
 
-    /// The latest release of [`REPO`].
+    /// Fetches the rolling manifest identifying the latest main build.
+    ///
+    /// # Errors
+    /// When the download fails or the manifest is malformed.
+    pub async fn latest_main(&self) -> Result<Release, UpdateError> {
+        let body = self.get(&asset_url(MAIN_CHANNEL_TAG, MAIN_CHANNEL_MANIFEST), 4096, Duration::from_secs(30)).await?;
+        Release::from_main_manifest(&body)
+    }
+
+    /// Finds the latest published build on the selected channel.
+    ///
+    /// # Errors
+    /// When GitHub is unreachable or returns invalid release information.
+    pub async fn latest_for(&self, channel: UpdateChannel) -> Result<Release, UpdateError> {
+        match channel {
+            UpdateChannel::Release => self.latest().await,
+            UpdateChannel::Main => self.latest_main().await,
+        }
+    }
+
+    /// The latest release of [`RELEASE_REPO`].
     ///
     /// # Errors
     /// When GitHub cannot be reached or answers with something else.
     pub async fn latest(&self) -> Result<Release, UpdateError> {
-        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let url = format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest");
         let body = self.get(&url, 1 << 20, Duration::from_secs(30)).await?;
         let r: GithubRelease = serde_json::from_slice(&body).map_err(|e| UpdateError::Release(e.to_string()))?;
         if parse_version(&r.tag_name).is_none() {
@@ -206,17 +238,7 @@ fn server_asset() -> Option<&'static str> {
 /// The download URL of a release file.
 #[must_use]
 pub fn asset_url(tag: &str, file: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/{tag}/{file}")
-}
-
-/// The SHA-256 of `file` in a `SHA256SUMS` listing.
-#[must_use]
-pub fn checksum<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
-    sums.lines().find_map(|l| {
-        let (hash, name) = l.split_once(char::is_whitespace)?;
-        let name = name.trim_start();
-        (name.strip_prefix('*').unwrap_or(name) == file).then_some(hash)
-    })
+    format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{file}")
 }
 
 /// Where the downloaded binary waits for `apply-update`.
@@ -233,9 +255,10 @@ impl Fetcher {
     pub async fn release_file(&self, tag: &str, file: &str) -> Result<Bytes, UpdateError> {
         let sums = self.get(&asset_url(tag, "SHA256SUMS"), 64 * 1024, Duration::from_secs(30)).await?;
         let sums = String::from_utf8_lossy(&sums);
-        let want = checksum(&sums, file).ok_or_else(|| UpdateError::Release(format!("SHA256SUMS lists no {file}")))?;
+        let want =
+            asset_checksum(&sums, file).ok_or_else(|| UpdateError::Release(format!("SHA256SUMS lists no {file}")))?;
         let data = self.get(&asset_url(tag, file), 64 << 20, Duration::from_mins(5)).await?;
-        if !crate::util::sha256_hex(&data).eq_ignore_ascii_case(want) {
+        if !asset_sha256(&data).eq_ignore_ascii_case(want) {
             return Err(UpdateError::Checksum(file.into()));
         }
         Ok(data)
@@ -255,28 +278,6 @@ fn store_executable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// An agent build of `version`, from `<data_dir>/agents` or else from GitHub.
-///
-/// # Errors
-/// When the file is not cached and cannot be downloaded.
-pub async fn agent_binary(state: &AppState, version: &str, file: &str) -> Result<Bytes, UpdateError> {
-    let root = state.config.data_dir.join("agents");
-    let path = root.join(version).join(file);
-    let _guard = state.agent_download.lock().await;
-    if let Ok(data) = std::fs::read(&path) {
-        return Ok(data.into());
-    }
-    let data = Fetcher::new()?.release_file(&format!("v{version}"), file).await?;
-    if let Ok(dirs) = std::fs::read_dir(&root) {
-        for d in dirs.flatten().filter(|d| d.file_name() != version) {
-            let _ = std::fs::remove_dir_all(d.path());
-        }
-    }
-    store_executable(&path, &data).map_err(UpdateError::Store)?;
-    tracing::info!(version, file, "downloaded agent build");
-    Ok(data)
-}
-
 static UPDATING: AtomicBool = AtomicBool::new(false);
 
 /// Downloads the latest release, stages it and asks the server to restart.
@@ -289,12 +290,10 @@ pub async fn install(state: &AppState, fetcher: &Fetcher) -> Result<Release, Upd
         return Err(UpdateError::Unsupported(why.into()));
     }
     let asset = server_asset().ok_or_else(|| UpdateError::Unsupported("no server build".into()))?;
+    let channel = state.config.update.channel;
     let release = state
-        .latest_release
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-        .filter(|r| is_newer(&r.version, warren_proto::VERSION))
+        .latest_for(channel)
+        .filter(|r| is_update_available(channel, &r.version, warren_proto::VERSION))
         .ok_or(UpdateError::UpToDate)?;
     if UPDATING.swap(true, Ordering::SeqCst) {
         return Err(UpdateError::Busy);
@@ -343,7 +342,7 @@ fn replace_exe(staged: &Path) -> std::io::Result<String> {
     Ok(version)
 }
 
-/// Looks for a new release once a day while `[update] check` is on, and
+/// Checks both update channels while `[update] check` is on, and
 /// installs it when `[update] auto` is on too.
 pub async fn task(state: Arc<AppState>) {
     let fetcher = match Fetcher::new() {
@@ -353,28 +352,37 @@ pub async fn task(state: Arc<AppState>) {
             return;
         }
     };
+    tokio::join!(track(&state, &fetcher, UpdateChannel::Release), track(&state, &fetcher, UpdateChannel::Main));
+}
+
+async fn track(state: &AppState, fetcher: &Fetcher, channel: UpdateChannel) {
+    let interval = match channel {
+        UpdateChannel::Release => CHECK_INTERVAL,
+        UpdateChannel::Main => Duration::from_hours(1),
+    };
     loop {
-        let wait = match fetcher.latest().await {
+        let wait = match fetcher.latest_for(channel).await {
             Ok(release) => {
-                let newer = is_newer(&release.version, warren_proto::VERSION);
+                let newer = channel == state.config.update.channel
+                    && is_update_available(channel, &release.version, warren_proto::VERSION);
                 if newer {
                     tracing::info!(version = %release.version, url = %release.url, "a new release is available");
                 }
-                *state.latest_release.write().unwrap_or_else(PoisonError::into_inner) = Some(release);
+                *state.channel_cache(channel).write().unwrap_or_else(PoisonError::into_inner) = Some(release);
                 if newer && state.config.update.auto {
-                    match install(&state, &fetcher).await {
+                    match install(state, fetcher).await {
                         Ok(r) => state.audit(None, &"", "server.update", "server", &format!("to {}", r.version)),
                         Err(e) => tracing::warn!(error = %e, "installing the new release"),
                     }
                 }
-                CHECK_INTERVAL
+                interval
             }
             Err(UpdateError::NotFound(_)) => {
-                tracing::debug!("no release published yet");
-                CHECK_INTERVAL
+                tracing::debug!(%channel, "no release published yet");
+                RETRY_INTERVAL
             }
             Err(e) => {
-                tracing::warn!(error = %e, "checking for a new release");
+                tracing::warn!(%channel, error = %e, "checking for a new release");
                 RETRY_INTERVAL
             }
         };
@@ -387,11 +395,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn main_manifest_links_to_the_immutable_release() {
+        let r = Release::from_main_manifest(b"version=1.2.3-main.7.g0012345\ntag=main-7-g0012345\n").unwrap();
+        assert_eq!(r.url, format!("https://github.com/{RELEASE_REPO}/releases/tag/main-7-g0012345"));
+        assert_eq!(r.version, "1.2.3-main.7.g0012345");
+        assert!(Release::from_main_manifest(b"version=1.2.3-main.7.g0012345\ntag=channel-main").is_err());
+    }
+
+    #[test]
     fn checksums() {
         let sums = "aa11  warren-server-linux-amd64\nbb22 *warren-linux-armv7\n";
-        assert_eq!(checksum(sums, "warren-server-linux-amd64"), Some("aa11"));
-        assert_eq!(checksum(sums, "warren-linux-armv7"), Some("bb22"));
-        assert_eq!(checksum(sums, "warren-server"), None);
+        assert_eq!(asset_checksum(sums, "warren-server-linux-amd64"), Some("aa11"));
+        assert_eq!(asset_checksum(sums, "warren-linux-armv7"), Some("bb22"));
+        assert_eq!(asset_checksum(sums, "warren-server"), None);
     }
 
     #[test]

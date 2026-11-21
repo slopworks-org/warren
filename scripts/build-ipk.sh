@@ -5,7 +5,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 pkg_arch="${1:-aarch64_cortex-a53}"
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+version="${WARREN_BUILD_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
 scripts/build-agent.sh aarch64 >/dev/null
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -17,7 +17,7 @@ size=$(du -sk "$work/data" | cut -f1)
 cat > "$work/control/control" <<CTRL
 Package: warren
 Version: $version
-Depends: kmod-wireguard
+Depends: kmod-wireguard, curl, ca-bundle
 Architecture: $pkg_arch
 Installed-Size: $((size * 1024))
 Maintainer: Warren

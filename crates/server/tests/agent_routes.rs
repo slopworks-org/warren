@@ -5,6 +5,7 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
+use http::header::AUTHORIZATION;
 use http::{Request, Response, StatusCode};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -15,8 +16,11 @@ use warren_server::acl::{PortSpec, Subject};
 use warren_server::agent_api::control_router;
 use warren_server::config::{Config, TlsMode};
 use warren_server::db::{Db, DeviceKind};
+use warren_server::http::ClientIp;
 use warren_server::state::AppState;
 use warren_server::tls::CertStore;
+use warren_server::update::Release;
+use warren_server::util::sha256_hex;
 use warren_server::wg::Backend;
 
 fn state() -> Arc<AppState> {
@@ -53,6 +57,129 @@ async fn response(router: &Router, host: u16, path: &str) -> Response<Body> {
     let req =
         Request::get(path).extension(ConnectInfo(SocketAddr::from((ip(host), 50505)))).body(Body::empty()).unwrap();
     router.clone().oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn update_requests_are_per_device_and_require_current_local_consent() {
+    let state = state();
+    let owner = state.db.create_user("owner", "unused", "user").unwrap().id;
+    let other = state.db.create_user("other", "unused", "user").unwrap().id;
+    for (user, secret) in [(owner, "owner-secret"), (other, "other-secret")] {
+        state.db.create_api_token(user, "test", &sha256_hex(secret.as_bytes())).unwrap();
+    }
+    let add =
+        |host: u16| state.db.create_device(owner, "router", &host.to_string(), ip(host), DeviceKind::Agent).unwrap();
+    let first = add(2);
+    let second = add(3);
+    state.rebuild().unwrap();
+    *state.latest_release.write().unwrap() =
+        Some(Release { version: "9.0.0".into(), tag: "v9.0.0".into(), url: String::new() });
+    let admin = warren_server::api::router(state.clone());
+    let control = control_router(state.clone());
+    let request_update = |device_id, secret| {
+        let req = Request::post(format!("/api/v1/devices/{device_id}/update"))
+            .header(AUTHORIZATION, format!("Bearer {secret}"))
+            .extension(ClientIp(Ipv4Addr::LOCALHOST.into()))
+            .body(Body::empty())
+            .unwrap();
+        admin.clone().oneshot(req)
+    };
+    let legacy = "agent=0.4.0";
+    let off = "agent=0.4.0&remote_updates=0";
+    let on = "agent=0.4.0&remote_updates=1";
+    for query in [legacy, off] {
+        assert!(poll(&control, 2, query, StatusCode::OK).await.get("update").is_none());
+        assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::CONFLICT);
+    }
+    let cfg = poll(&control, 2, on, StatusCode::OK).await;
+    poll(&control, 3, on, StatusCode::OK).await;
+    assert_eq!(request_update(first, "other-secret").await.unwrap().status(), StatusCode::NOT_FOUND);
+    let query = format!("{on}&v={}&wait=30", cfg.req("version").unwrap());
+    let waiting = poll(&control, 2, &query, StatusCode::OK);
+    tokio::pin!(waiting);
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("unchanged poll returned before the update request"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::OK);
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap();
+    assert_eq!(reply.get("update"), Some("9.0.0"));
+    assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::OK);
+    let audit = state.db.audit_page(Some(owner), None, 50).unwrap();
+    assert_eq!(audit.iter().filter(|entry| entry.action == "device.update.request").count(), 1);
+    assert!(poll(&control, 3, on, StatusCode::OK).await.get("update").is_none());
+    assert!(state.db.device(second).unwrap().unwrap().update_target.is_none());
+
+    // A device that revokes consent drops its queued update on its next poll.
+    assert!(poll(&control, 2, off, StatusCode::OK).await.get("update").is_none());
+    let device = state.db.device(first).unwrap().unwrap();
+    assert_eq!((device.remote_updates, device.update_target), (Some(false), None));
+    assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::CONFLICT);
+    poll(&control, 2, on, StatusCode::OK).await;
+    assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::OK);
+    let updated = poll(&control, 2, "agent=9.0.0&remote_updates=1", StatusCode::OK).await;
+    assert!(updated.get("update").is_none());
+    assert!(state.db.device(first).unwrap().unwrap().update_target.is_none());
+
+    // Re-enabling locally before the next poll must also clear a queued request.
+    let epoch = "0123456789abcdef0123456789abcdef";
+    let query = |generation| format!("{on}&update_generation={epoch}%3A{generation}");
+    poll(&control, 2, &query(1), StatusCode::OK).await;
+    assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::OK);
+    let first_hint = poll(&control, 2, &query(1), StatusCode::OK).await;
+    assert_eq!(first_hint.get("update"), Some("9.0.0"));
+    assert_eq!(first_hint.get("update_generation"), Some(format!("{epoch}:1").as_str()));
+    let reenabled = poll(&control, 2, &query(3), StatusCode::OK).await;
+    assert!(reenabled.get("update").is_none());
+    assert!(state.db.device(first).unwrap().unwrap().update_target.is_none());
+    assert_eq!(request_update(first, "owner-secret").await.unwrap().status(), StatusCode::OK);
+    let fresh = poll(&control, 2, &query(3), StatusCode::OK).await;
+    assert_eq!(fresh.get("update"), Some("9.0.0"));
+    assert_eq!(fresh.get("update_generation"), Some(format!("{epoch}:3").as_str()));
+}
+
+#[tokio::test]
+async fn changing_the_channel_clears_queued_targets_and_uses_the_new_catalog() {
+    let state = state();
+    let owner = state.db.create_user("owner", "unused", "user").unwrap().id;
+    state.db.create_api_token(owner, "test", &sha256_hex(b"secret")).unwrap();
+    let id = state.db.create_device(owner, "router", "key", ip(2), DeviceKind::Agent).unwrap();
+    state.rebuild().unwrap();
+    let main = "0.4.0-main.65.g0012345";
+    *state.latest_main.write().unwrap() =
+        Some(Release { version: main.into(), tag: "main-65-g0012345".into(), url: String::new() });
+    *state.latest_release.write().unwrap() =
+        Some(Release { version: "0.4.0".into(), tag: "v0.4.0".into(), url: String::new() });
+    let admin = warren_server::api::router(state.clone());
+    let control = control_router(state.clone());
+    let queue = || {
+        admin.clone().oneshot(
+            Request::post(format!("/api/v1/devices/{id}/update"))
+                .header(AUTHORIZATION, "Bearer secret")
+                .extension(ClientIp(Ipv4Addr::LOCALHOST.into()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let report = |version, channel| format!("agent={version}&remote_updates=1&update_channel={channel}");
+    let on_main = report("0.4.0", "main");
+    poll(&control, 2, &on_main, StatusCode::OK).await;
+    let device = state.db.device(id).unwrap().unwrap();
+    let view = serde_json::to_value(state.device_view(&state.snapshot(), &device)).unwrap();
+    assert_eq!(view["update_channel"], "main");
+    assert_eq!(view["agent_outdated"], true);
+    assert_eq!(view["agent_latest_version"], main);
+    assert_eq!(queue().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(poll(&control, 2, &on_main, StatusCode::OK).await.get("update"), Some(main));
+    let release = report(main, "release");
+    assert!(poll(&control, 2, &release, StatusCode::OK).await.get("update").is_none());
+    assert!(state.db.device(id).unwrap().unwrap().update_target.is_none());
+    assert_eq!(queue().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(poll(&control, 2, &release, StatusCode::OK).await.get("update"), Some("0.4.0"));
+    // Both 0.4.0 targets would advance 0.3.0. The channel change alone invalidates the queue.
+    assert!(poll(&control, 2, &report("0.3.0", "main"), StatusCode::OK).await.get("update").is_none());
+    assert!(state.db.device(id).unwrap().unwrap().update_target.is_none());
 }
 
 fn rows(reply: &Kv) -> Vec<(&str, &str, &str)> {

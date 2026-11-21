@@ -18,6 +18,8 @@ mod state;
 mod status;
 mod tunnel;
 mod up;
+mod update_files;
+mod update_service;
 
 use cli::{Args, Command};
 use std::process::ExitCode;
@@ -30,8 +32,12 @@ pub fn stopping() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
-extern "C" fn on_signal(_: libc::c_int) {
+fn request_stop() {
     STOP.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn on_signal(_: libc::c_int) {
+    request_stop();
 }
 
 /// Installs SIGTERM/SIGINT handlers without `SA_RESTART`. Blocking reads
@@ -77,8 +83,12 @@ fn main() -> ExitCode {
         Command::Up => up::run(&args),
         Command::Run => install_signal_handlers()
             .map_err(error::Error::io("installing signal handlers"))
-            .and_then(|()| daemon::run(&args)),
-        Command::Status => status::status(&args),
+            .and_then(|()| update_service::run(&args)),
+        Command::Status => {
+            status::status(&args);
+            Ok(())
+        }
+        Command::Update { check, remote, channel } => selfupdate::run(&args.paths, check, remote, channel),
         Command::Down => status::down(&args),
         Command::Version => {
             println!("warren {}", warren_proto::VERSION);

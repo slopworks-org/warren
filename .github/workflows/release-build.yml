@@ -1,0 +1,226 @@
+name: Build and publish Warren
+
+on:
+  workflow_call:
+    secrets:
+      WARREN_KEYSTORE_BASE64:
+        required: true
+      WARREN_KEYSTORE_PASSWORD:
+        required: true
+      WARREN_KEY_ALIAS:
+        required: true
+    inputs:
+      channel:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      build_version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  BUILD_VERSION: ${{ inputs.build_version }}
+  WARREN_BUILD_VERSION: ${{ inputs.build_version }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+
+jobs:
+  agent:
+    name: Agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+          rustup toolchain install "$version" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          scripts/build-agent.sh aarch64 armv7 x86_64
+          scripts/build-ipk.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent
+          path: dist/out/
+          if-no-files-found: error
+
+  agent-macos:
+    name: Agent (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
+          rustup toolchain install "$version" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: scripts/build-agent.sh macos-aarch64 macos-x86_64
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent-macos
+          path: dist/out/
+          if-no-files-found: error
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: android/native/go.sum
+
+      - name: Install Android SDK packages
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+
+      - name: Build and sign universal release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.WARREN_KEYSTORE_BASE64 }}
+          WARREN_KEYSTORE_PASSWORD: ${{ secrets.WARREN_KEYSTORE_PASSWORD }}
+          WARREN_KEY_ALIAS: ${{ secrets.WARREN_KEY_ALIAS }}
+        working-directory: android
+        run: |
+          set -eu
+          : "${KEYSTORE_BASE64:?Set WARREN_KEYSTORE_BASE64}" "${WARREN_KEYSTORE_PASSWORD:?}" "${WARREN_KEY_ALIAS:?}"
+          umask 077
+          WARREN_KEYSTORE=$(mktemp "$RUNNER_TEMP/warren-keystore.XXXXXX")
+          export WARREN_KEYSTORE
+          trap 'rm -f "$WARREN_KEYSTORE"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$WARREN_KEYSTORE"
+          unset KEYSTORE_BASE64
+          ./gradlew :app:assembleRelease \
+            -PwarrenVersionName="$BUILD_VERSION" \
+            -PwarrenVersionCode="$(git rev-list --first-parent --count HEAD)"
+
+      - name: Verify APK signature
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk warren-android.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs warren-android.apk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: warren-android.apk
+          if-no-files-found: error
+
+  server:
+    name: Server (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Native runners for both, so neither build runs emulated.
+      - name: Build
+        run: scripts/build-server.sh ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.arch }}
+          path: dist/out/warren-server-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: [agent, agent-macos, android, server]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Collect files
+        run: |
+          cp dist/install.sh dist/systemd/warren-server.service dist/systemd/warren.service out/
+          cp dist/openwrt/warren.init dist/openwrt/warren.uci-defaults out/
+          cp dist/macos/org.slopworks.warren.plist out/
+          cd out && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish tagged release
+        if: inputs.channel == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=
+          case "$RELEASE_TAG" in *-*) flags=--prerelease ;; esac
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes $flags out/*
+
+      - name: Publish main build
+        if: inputs.channel == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Retain the git tag when replacing the assets on a rerun.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --yes
+          fi
+          gh release create "$RELEASE_TAG" --draft --prerelease --target "$GITHUB_SHA" \
+            --title "$BUILD_VERSION" --notes "Build of main at $GITHUB_SHA."
+          gh release upload "$RELEASE_TAG" out/*
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
+
+      - name: Promote main build and prune old builds
+        if: inputs.channel == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A rerun for an older commit must not roll the pointer back.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          [ "$head" = "$GITHUB_SHA" ] || exit 0
+          printf 'version=%s\ntag=%s\ncommit=%s\n' "$BUILD_VERSION" "$RELEASE_TAG" "$GITHUB_SHA" > channel.kv
+          notes="The main channel currently points to $RELEASE_TAG ($GITHUB_SHA)."
+          if gh release view channel-main >/dev/null 2>&1; then
+            gh release upload channel-main --clobber dist/install.sh
+            gh release upload channel-main --clobber channel.kv
+            gh release edit channel-main --notes "$notes"
+          else
+            gh release create channel-main --prerelease --target "$GITHUB_SHA" --title "Main channel" \
+              --notes "$notes" dist/install.sh channel.kv
+          fi
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.draft | not)) | .tag_name' > releases.txt
+          awk '/^main-[0-9]+-g[0-9a-f]+$/' releases.txt | sort -t- -k2,2nr | tail -n +6 > obsolete.txt
+          while IFS= read -r old_tag; do
+            if [ "$old_tag" != "$RELEASE_TAG" ]; then
+              gh release delete "$old_tag" --yes --cleanup-tag
+            fi
+          done < obsolete.txt

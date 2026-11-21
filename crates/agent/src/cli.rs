@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 use crate::state::{DEFAULT_CONFIG_DIR, DEFAULT_INTERFACE, DEFAULT_RUN_DIR, Paths};
 use std::path::PathBuf;
+use warren_proto::UpdateChannel;
 
 pub const HELP: &str = "\
 warren — Warren agent
@@ -10,21 +11,29 @@ warren — Warren agent
 USAGE:
     warren up --server <URL> --token <TOKEN> [--name <NAME>] [--interface <IFACE>] [--force]
     warren run                 keep the tunnel up (run this as a service)
-    warren status              show tunnel and server connection state
+    warren status              show the agent version and connection state
+    warren update              install the latest build on the configured channel
+    warren update --check [--channel <release|main>]
+                               check a channel without changing settings
+    warren update --channel <release|main> [--remote <on|off>]
+                               select the update channel (default release)
+    warren update --remote <on|off>
+                               allow automatic and dashboard-requested updates (default off)
     warren down [--forget]     remove the interface; --forget also deletes the registration
     warren version
 
 COMMON OPTIONS:
     --config-dir <DIR>    config and key directory (default /etc/warren)
-    --run-dir <DIR>       runtime status directory (default /var/run/warren)
+    --run-dir <DIR>       runtime status directory (/var/run/warren on Linux,
+                          /var/db/warren/run on macOS)
     --log-level <LEVEL>   error, warn, info or debug (default info; env WARREN_LOG)
 
 `--server` is the server's address, e.g. https://vpn.example.com. Registration
 talks plain HTTP on port 80 (or the port of an http:// URL) and is authenticated
 with the token, so the agent needs no TLS stack.
 
-up, run, status and down automatically request administrator privileges through
-sudo when needed. On systems without sudo, run these commands as root.
+Operational commands request administrator privileges through sudo when needed.
+On systems without sudo, run them as root. Update checks use system curl and CA certificates.
 ";
 
 /// Which subcommand to run.
@@ -33,6 +42,7 @@ pub enum Command {
     Up,
     Run,
     Status,
+    Update { check: bool, remote: Option<bool>, channel: Option<UpdateChannel> },
     Down,
     Version,
     Help,
@@ -59,6 +69,7 @@ impl Args {
             Some("up") => Command::Up,
             Some("run") => Command::Run,
             Some("status") => Command::Status,
+            Some("update") => Command::Update { check: false, remote: None, channel: None },
             Some("down") => Command::Down,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") | None => Command::Help,
@@ -93,6 +104,29 @@ impl Args {
                 "--force" | "--forget" if inline.is_some() => {
                     return Err(Error::Usage(format!("{flag} takes no value")));
                 }
+                "--check" if inline.is_none() => match &mut args.command {
+                    Command::Update { check, remote: None, .. } => *check = true,
+                    _ => return Err(Error::Usage("--check is only for `warren update` without --remote".into())),
+                },
+                "--channel" => match &mut args.command {
+                    Command::Update { channel, .. } => {
+                        *channel = Some(
+                            UpdateChannel::parse(&value()?)
+                                .ok_or_else(|| Error::Usage("--channel needs release or main".into()))?,
+                        );
+                    }
+                    _ => return Err(Error::Usage("--channel is only for `warren update`".into())),
+                },
+                "--remote" => match &mut args.command {
+                    Command::Update { check: false, remote, .. } => {
+                        *remote = Some(match value()?.as_str() {
+                            "on" => true,
+                            "off" => false,
+                            _ => return Err(Error::Usage("--remote needs on or off".into())),
+                        });
+                    }
+                    _ => return Err(Error::Usage("--remote is only for `warren update` without --check".into())),
+                },
                 "--force" => args.force = true,
                 "--forget" => args.forget = true,
                 "--help" | "-h" => args.command = Command::Help,
@@ -126,6 +160,27 @@ mod tests {
         assert_eq!(a.name.as_deref(), Some("box"));
         assert_eq!(a.paths.config_dir, PathBuf::from("/tmp/w"));
         assert_eq!(a.interface, "warren0");
+    }
+
+    #[test]
+    fn parses_update_channels() {
+        assert_eq!(
+            parse("update --check --channel main").unwrap().command,
+            Command::Update { check: true, remote: None, channel: Some(UpdateChannel::Main) }
+        );
+        assert_eq!(
+            parse("update --remote off --channel=release").unwrap().command,
+            Command::Update { check: false, remote: Some(false), channel: Some(UpdateChannel::Release) }
+        );
+        for invalid in [
+            "update --channel",
+            "update --channel nightly",
+            "status --channel main",
+            "update --check --remote on",
+            "update --remote off --check",
+        ] {
+            assert!(parse(invalid).is_err());
+        }
     }
 
     #[test]

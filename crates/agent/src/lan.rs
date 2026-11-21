@@ -223,7 +223,14 @@ mod tests {
         links.listen_with(|| UdpSocket::bind(address));
         assert!(links.socket.is_none() && links.bind_failed);
         drop(blocker);
-        links.listen_with(|| UdpSocket::bind(address));
+        // A concurrent process spawn can inherit the socket until exec.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while links.socket.is_none() && Instant::now() < deadline {
+            links.listen_with(|| UdpSocket::bind(address));
+            if links.socket.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         assert!(links.socket.is_some() && !links.bind_failed);
     }
 
