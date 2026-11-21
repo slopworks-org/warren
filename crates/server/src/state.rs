@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, watch};
-use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, LAN_KEEPALIVE, PeerConfig, codec};
+use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, LAN_KEEPALIVE, PeerConfig, UpdateChannel, codec};
 
 /// A device counts as online if it completed a handshake this recently.
 /// Agents send a keepalive every 25 s, and WireGuard re-handshakes on the
@@ -134,6 +134,8 @@ pub struct AppState {
     pub totp_used: Mutex<HashMap<i64, u64>>,
     /// The latest release on GitHub, once checked.
     pub latest_release: RwLock<Option<crate::update::Release>>,
+    /// The latest published main build, once checked.
+    pub latest_main: RwLock<Option<crate::update::Release>>,
     /// Stops the server so that systemd restarts it into a staged update.
     pub restart: Notify,
     alloc: Mutex<()>,
@@ -206,6 +208,7 @@ impl AppState {
             basic_cache: Mutex::new(HashMap::new()),
             totp_used: Mutex::new(HashMap::new()),
             latest_release: RwLock::new(None),
+            latest_main: RwLock::new(None),
             restart: Notify::new(),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
@@ -407,8 +410,9 @@ impl AppState {
         os: &str,
         version: &str,
         remote_updates: Option<(bool, Option<&str>)>,
+        update_channel: Option<UpdateChannel>,
     ) {
-        let update_fields = format!("\n{version}\n{remote_updates:?}");
+        let update_fields = format!("\n{version}\n{remote_updates:?}\n{update_channel:?}");
         let fingerprint = format!("{hostname}\n{os}{update_fields}");
         let t = now();
         let mut reports = lock(&self.agent_reports);
@@ -418,7 +422,7 @@ impl AppState {
         {
             return;
         }
-        match self.db.device_report(device, hostname, os, version, remote_updates) {
+        match self.db.device_report(device, hostname, os, version, remote_updates, update_channel) {
             Ok(()) => {
                 reports.insert(device, (t, fingerprint));
             }
@@ -426,9 +430,21 @@ impl AppState {
         }
     }
 
-    /// The latest stable release, independent of the server's running version.
-    pub fn latest_agent_version(&self) -> Option<String> {
-        self.latest_release.read().unwrap_or_else(PoisonError::into_inner).as_ref().map(|r| r.version.clone())
+    pub(crate) fn channel_cache(&self, channel: UpdateChannel) -> &RwLock<Option<crate::update::Release>> {
+        match channel {
+            UpdateChannel::Release => &self.latest_release,
+            UpdateChannel::Main => &self.latest_main,
+        }
+    }
+
+    /// The most recently observed build on this channel.
+    pub fn latest_for(&self, channel: UpdateChannel) -> Option<crate::update::Release> {
+        self.channel_cache(channel).read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Latest version for devices following this channel.
+    pub fn latest_agent_version(&self, channel: UpdateChannel) -> Option<String> {
+        self.latest_for(channel).map(|r| r.version)
     }
 
     /// API view of a device.
@@ -436,10 +452,11 @@ impl AppState {
         let s = self.peer_stats(d.id);
         let agent_latest_version = (d.kind == crate::db::DeviceKind::Agent
             && warren_proto::valid_version(&d.agent_version))
-        .then(|| self.latest_agent_version())
+        .then(|| self.latest_agent_version(d.update_channel))
         .flatten();
-        let agent_outdated =
-            agent_latest_version.as_ref().is_some_and(|version| warren_proto::is_newer(version, &d.agent_version));
+        let agent_outdated = agent_latest_version
+            .as_ref()
+            .is_some_and(|version| warren_proto::is_update_available(d.update_channel, version, &d.agent_version));
         DeviceView {
             owner: snap.users.get(&d.user_id).map(|u| u.username.clone()).unwrap_or_default(),
             online: d.enabled && Self::recent(s),

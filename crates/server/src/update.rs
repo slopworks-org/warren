@@ -1,4 +1,4 @@
-//! New releases: a daily look at the latest GitHub release, and installing it.
+//! New releases: check the release and main channels and install the configured build.
 //!
 //! The sandboxed server cannot write its own binary. It downloads the new
 //! binary to `<data_dir>/update/warren-server` and exits with
@@ -22,7 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
-use warren_proto::{RELEASE_REPO, asset_checksum, asset_sha256, is_newer, parse_version};
+use warren_proto::{
+    MAIN_CHANNEL_MANIFEST, MAIN_CHANNEL_TAG, RELEASE_REPO, UpdateChannel, asset_checksum, asset_sha256,
+    is_update_available, parse_version,
+};
 
 const CHECK_INTERVAL: Duration = Duration::from_hours(24);
 const RETRY_INTERVAL: Duration = Duration::from_hours(1);
@@ -81,6 +84,17 @@ pub struct Release {
     pub url: String,
 }
 
+impl Release {
+    fn from_main_manifest(bytes: &[u8]) -> Result<Self, UpdateError> {
+        let manifest = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(warren_proto::parse_main_manifest)
+            .ok_or_else(|| UpdateError::Release("invalid main channel manifest".into()))?;
+        let url = format!("https://github.com/{RELEASE_REPO}/releases/tag/{}", manifest.tag);
+        Ok(Self { version: manifest.version, tag: manifest.tag, url })
+    }
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -123,7 +137,7 @@ impl Fetcher {
         let mut uri: Uri = url.parse().map_err(|e| format!("{e}"))?;
         for _ in 0..=MAX_REDIRECTS {
             let req = Request::get(uri.clone())
-                .header(USER_AGENT, concat!("warren-server/", env!("CARGO_PKG_VERSION")))
+                .header(USER_AGENT, format!("warren-server/{}", warren_proto::VERSION))
                 .header(ACCEPT, "application/vnd.github+json, */*")
                 .body(Empty::new())
                 .map_err(|e| e.to_string())?;
@@ -145,6 +159,26 @@ impl Fetcher {
             return Ok(body.to_bytes());
         }
         Err("too many redirects".into())
+    }
+
+    /// Fetches the rolling manifest identifying the latest main build.
+    ///
+    /// # Errors
+    /// When the download fails or the manifest is malformed.
+    pub async fn latest_main(&self) -> Result<Release, UpdateError> {
+        let body = self.get(&asset_url(MAIN_CHANNEL_TAG, MAIN_CHANNEL_MANIFEST), 4096, Duration::from_secs(30)).await?;
+        Release::from_main_manifest(&body)
+    }
+
+    /// Finds the latest published build on the selected channel.
+    ///
+    /// # Errors
+    /// When GitHub is unreachable or returns invalid release information.
+    pub async fn latest_for(&self, channel: UpdateChannel) -> Result<Release, UpdateError> {
+        match channel {
+            UpdateChannel::Release => self.latest().await,
+            UpdateChannel::Main => self.latest_main().await,
+        }
     }
 
     /// The latest release of [`RELEASE_REPO`].
@@ -256,12 +290,10 @@ pub async fn install(state: &AppState, fetcher: &Fetcher) -> Result<Release, Upd
         return Err(UpdateError::Unsupported(why.into()));
     }
     let asset = server_asset().ok_or_else(|| UpdateError::Unsupported("no server build".into()))?;
+    let channel = state.config.update.channel;
     let release = state
-        .latest_release
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-        .filter(|r| is_newer(&r.version, warren_proto::VERSION))
+        .latest_for(channel)
+        .filter(|r| is_update_available(channel, &r.version, warren_proto::VERSION))
         .ok_or(UpdateError::UpToDate)?;
     if UPDATING.swap(true, Ordering::SeqCst) {
         return Err(UpdateError::Busy);
@@ -310,7 +342,7 @@ fn replace_exe(staged: &Path) -> std::io::Result<String> {
     Ok(version)
 }
 
-/// Looks for a new release once a day while `[update] check` is on, and
+/// Checks both update channels while `[update] check` is on, and
 /// installs it when `[update] auto` is on too.
 pub async fn task(state: Arc<AppState>) {
     let fetcher = match Fetcher::new() {
@@ -320,28 +352,37 @@ pub async fn task(state: Arc<AppState>) {
             return;
         }
     };
+    tokio::join!(track(&state, &fetcher, UpdateChannel::Release), track(&state, &fetcher, UpdateChannel::Main));
+}
+
+async fn track(state: &AppState, fetcher: &Fetcher, channel: UpdateChannel) {
+    let interval = match channel {
+        UpdateChannel::Release => CHECK_INTERVAL,
+        UpdateChannel::Main => Duration::from_hours(1),
+    };
     loop {
-        let wait = match fetcher.latest().await {
+        let wait = match fetcher.latest_for(channel).await {
             Ok(release) => {
-                let newer = is_newer(&release.version, warren_proto::VERSION);
+                let newer = channel == state.config.update.channel
+                    && is_update_available(channel, &release.version, warren_proto::VERSION);
                 if newer {
                     tracing::info!(version = %release.version, url = %release.url, "a new release is available");
                 }
-                *state.latest_release.write().unwrap_or_else(PoisonError::into_inner) = Some(release);
+                *state.channel_cache(channel).write().unwrap_or_else(PoisonError::into_inner) = Some(release);
                 if newer && state.config.update.auto {
-                    match install(&state, &fetcher).await {
+                    match install(state, fetcher).await {
                         Ok(r) => state.audit(None, &"", "server.update", "server", &format!("to {}", r.version)),
                         Err(e) => tracing::warn!(error = %e, "installing the new release"),
                     }
                 }
-                CHECK_INTERVAL
+                interval
             }
             Err(UpdateError::NotFound(_)) => {
-                tracing::debug!("no release published yet");
-                CHECK_INTERVAL
+                tracing::debug!(%channel, "no release published yet");
+                RETRY_INTERVAL
             }
             Err(e) => {
-                tracing::warn!(error = %e, "checking for a new release");
+                tracing::warn!(%channel, error = %e, "checking for a new release");
                 RETRY_INTERVAL
             }
         };
@@ -352,6 +393,14 @@ pub async fn task(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_manifest_links_to_the_immutable_release() {
+        let r = Release::from_main_manifest(b"version=1.2.3-main.7.g0012345\ntag=main-7-g0012345\n").unwrap();
+        assert_eq!(r.url, format!("https://github.com/{RELEASE_REPO}/releases/tag/main-7-g0012345"));
+        assert_eq!(r.version, "1.2.3-main.7.g0012345");
+        assert!(Release::from_main_manifest(b"version=1.2.3-main.7.g0012345\ntag=channel-main").is_err());
+    }
 
     #[test]
     fn checksums() {

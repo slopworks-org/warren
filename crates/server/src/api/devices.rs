@@ -73,8 +73,8 @@ pub async fn request_update(
         return Err(ApiError::Conflict("This device must be enabled and allow updates locally.".into()));
     }
     let target = state
-        .latest_agent_version()
-        .filter(|version| warren_proto::is_newer(version, &device.agent_version))
+        .latest_agent_version(device.update_channel)
+        .filter(|version| warren_proto::is_update_available(device.update_channel, version, &device.agent_version))
         .ok_or_else(|| ApiError::Conflict("No newer agent release is available.".into()))?;
     match state.db.request_agent_update(&device, &target)? {
         UpdateRequest::Queued => {
