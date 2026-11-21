@@ -91,17 +91,38 @@ just ipk               # OpenWrt package
 
 ## Updates
 
+The default `release` channel follows stable tagged releases. The `main`
+channel follows successful builds of commits to the main branch. A version
+such as `0.4.0-main.65.g0012345` identifies the base version, first-parent
+commit count, and abbreviated commit hash. Each build has its own prerelease
+tag and checksums. The rolling `channel-main` prerelease points to the
+current build. The five most recent main builds are retained.
+
 ### Devices
 
 Updates are managed on the device by default. On Linux, OpenWrt and macOS:
 
 ```sh
 warren status                    # Show the installed version and any available release
-warren update --check            # Check without installing
-warren update                    # Verify and stage the latest stable release for activation
+warren update --check            # Check the configured channel without installing
+warren update --check --channel main  # Check main once, keeping the current setting
+warren update --channel main     # Follow main builds
+warren update --channel release  # Return to stable releases
+warren update                    # Verify and stage the available update
 warren update --remote on        # Allow automatic and dashboard-requested updates
 warren update --remote off       # Return to local updates only
 ```
+
+To install a device directly from main, use the rolling installer:
+
+```sh
+curl -fsSL https://github.com/slopworks-org/warren/releases/download/channel-main/install.sh \
+  | sudo sh -s -- agent --channel main
+```
+
+Selecting a channel persists the choice. Run `warren update` to install
+an available build. Switching channels can install the same base version.
+An installed higher base version is kept until the chosen channel catches up.
 
 The agent downloads builds and SHA256SUMS from the official GitHub release
 over HTTPS. In-place updates require system `curl` and trusted CA
@@ -124,7 +145,7 @@ the installer to get the update commands.
 The Devices page shows the installed and available versions. For an opted-in
 device, **Update** requests a check. Agents wait at least an hour between
 checks prompted by the dashboard, and offline devices check after reconnecting.
-Opted-in agents also check daily. Android app updates
+Opted-in agents also check daily on release or hourly on main. Android app updates
 are installed on the phone.
 
 ### Server
@@ -133,7 +154,16 @@ The server checks GitHub for release metadata independently of its own
 version. Upgrade it by rerunning the server installer or pulling a new
 container image. Operators using the packaged systemd unit can also set
 `[update]` → `auto = true` in `server.toml` for unattended server updates.
-That setting applies only to the server.
+Set `channel = "main"` in the same section to follow commit builds, or
+`channel = "release"` for stable releases. These settings apply to the server.
+For a fresh server on main, use the rolling installer:
+
+```sh
+curl -fsSL https://github.com/slopworks-org/warren/releases/download/channel-main/install.sh \
+  | sudo sh -s -- server --channel main --domain warren.example.com --email you@example.com
+```
+
+Rerunning the installer preserves an existing server configuration.
 
 ## Devices on one LAN
 
