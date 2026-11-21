@@ -1,0 +1,43 @@
+name: Main build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: main-build
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.build_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: version
+        run: |
+          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          rev=$(git rev-list --first-parent --count HEAD)
+          sha=$(git rev-parse --short=7 HEAD)
+          echo "build_version=${base}-main.${rev}.g${sha}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=main-${rev}-g${sha}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-build.yml
+    secrets: inherit
+    with:
+      channel: main
+      release_tag: ${{ needs.version.outputs.release_tag }}
+      build_version: ${{ needs.version.outputs.build_version }}

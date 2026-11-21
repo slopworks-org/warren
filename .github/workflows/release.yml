@@ -1,7 +1,3 @@
-# A GitHub release for each v* tag: the static agents, the macOS agents, the
-# OpenWrt package, the Android APK, the static servers, the service files and dist/install.sh,
-# with SHA256SUMS.
-# Release: bump `version` in Cargo.toml, merge, then tag main as v<version>.
 name: Release
 
 on:
@@ -12,164 +8,28 @@ permissions:
   contents: read
 
 jobs:
-  agent:
-    name: Agent
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Check the tag
+      - uses: actions/checkout@v7
+      - id: version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ "$GITHUB_REF_NAME" = "v$version" ] || {
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust
-        run: |
-          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
-          rustup toolchain install "$version" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: |
-          scripts/build-agent.sh aarch64 armv7 x86_64
-          scripts/build-ipk.sh
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: agent
-          path: dist/out/
-          if-no-files-found: error
-
-  agent-macos:
-    name: Agent (macOS)
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Rust
-        run: |
-          version=$(awk '$1 == "rust" { print $2 }' .tool-versions)
-          rustup toolchain install "$version" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: scripts/build-agent.sh macos-aarch64 macos-x86_64
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: agent-macos
-          path: dist/out/
-          if-no-files-found: error
-
-  android:
-    name: Android APK
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.27.3'
-          cache-dependency-path: android/native/go.sum
-
-      - name: Install Android SDK packages
-        run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            'platforms;android-37.0' 'build-tools;36.0.0' 'ndk;28.2.13676358'
-
-      - name: Build and sign universal release APK
-        env:
-          KEYSTORE_BASE64: ${{ secrets.WARREN_KEYSTORE_BASE64 }}
-          WARREN_KEYSTORE_PASSWORD: ${{ secrets.WARREN_KEYSTORE_PASSWORD }}
-          WARREN_KEY_ALIAS: ${{ secrets.WARREN_KEY_ALIAS }}
-        working-directory: android
-        run: |
-          set -eu
-          : "${KEYSTORE_BASE64:?Set WARREN_KEYSTORE_BASE64}" "${WARREN_KEYSTORE_PASSWORD:?}" "${WARREN_KEY_ALIAS:?}"
-          umask 077
-          WARREN_KEYSTORE=$(mktemp "$RUNNER_TEMP/warren-keystore.XXXXXX")
-          export WARREN_KEYSTORE
-          trap 'rm -f "$WARREN_KEYSTORE"' EXIT
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$WARREN_KEYSTORE"
-          unset KEYSTORE_BASE64
-          ./gradlew :app:assembleRelease \
-            -PwarrenVersionName="${GITHUB_REF_NAME#v}" \
-            -PwarrenVersionCode="$(git rev-list --first-parent --count HEAD)"
-
-      - name: Verify APK signature
-        run: |
-          cp android/app/build/outputs/apk/release/app-release.apk warren-android.apk
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs warren-android.apk
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: android
-          path: warren-android.apk
-          if-no-files-found: error
-
-  server:
-    name: Server (${{ matrix.arch }})
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # Native runners for both, so neither build runs emulated.
-      - name: Build
-        run: scripts/build-server.sh ${{ matrix.arch }}
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: server-${{ matrix.arch }}
-          path: dist/out/warren-server-linux-${{ matrix.arch }}
-          if-no-files-found: error
-
-  release:
-    name: Publish
-    needs: [agent, agent-macos, android, server]
-    runs-on: ubuntu-latest
+  build:
+    needs: version
     permissions:
       contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
-        with:
-          path: out
-          merge-multiple: true
-
-      - name: Collect files
-        run: |
-          cp dist/install.sh dist/systemd/warren-server.service dist/systemd/warren.service out/
-          cp dist/openwrt/warren.init dist/openwrt/warren.uci-defaults out/
-          cp dist/macos/org.slopworks.warren.plist out/
-          cd out && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # A tag like v0.2.0-rc.1 is a prerelease, which releases/latest skips.
-        run: |
-          flags=
-          case "$GITHUB_REF_NAME" in *-*) flags=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes $flags out/*
+    uses: ./.github/workflows/release-build.yml
+    secrets: inherit
+    with:
+      channel: release
+      release_tag: ${{ github.ref_name }}
+      build_version: ${{ needs.version.outputs.build_version }}
