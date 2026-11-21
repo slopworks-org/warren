@@ -8,7 +8,7 @@ use warren_server::config::{Config, LogFormat};
 use warren_server::server::{self, Stop};
 
 #[derive(Parser)]
-#[command(name = "warren-server", version, about = "Warren server: WireGuard hub, reverse proxy and web admin")]
+#[command(name = "warren-server", version = warren_proto::VERSION, about = "Warren server: WireGuard hub, reverse proxy and web admin")]
 struct Cli {
     /// Configuration file.
     #[arg(short, long, env = "WARREN_CONFIG", default_value_os_t = server::default_config_path())]

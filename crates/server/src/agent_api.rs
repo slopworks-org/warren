@@ -138,8 +138,16 @@ fn register_request(state: &AppState, ip: IpAddr, kv: &Kv, resumable: bool) -> R
             return error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string());
         }
     };
-    let field = |k| kv.get(k).unwrap_or_default().chars().take(64).collect::<String>();
-    if let Err(e) = state.db.device_report(id, &field("hostname"), &field("os"), &field("version"), None) {
+    let field = |k| kv.get(k).unwrap_or_default();
+    let os = clip(field("os"), 64);
+    if let Err(e) = state.db.device_report(
+        id,
+        &clip(field("hostname"), 64),
+        &os,
+        &clip(field("version"), MAX_VERSION_LEN),
+        None,
+        None,
+    ) {
         tracing::warn!(error = %e, "recording agent details");
     }
     if let Err(e) = state.rebuild() {
@@ -150,7 +158,7 @@ fn register_request(state: &AppState, ip: IpAddr, kv: &Kv, resumable: bool) -> R
     };
     let snap = state.snapshot();
     let owner = snap.users.get(&device.user_id);
-    state.audit(owner, &ip.to_string(), "device.register", &format!("device:{id} {name}"), &field("os"));
+    state.audit(owner, &ip.to_string(), "device.register", &format!("device:{id} {name}"), &os);
 
     if resumable {
         return recover().unwrap_or_else(denied);
@@ -158,6 +166,13 @@ fn register_request(state: &AppState, ip: IpAddr, kv: &Kv, resumable: bool) -> R
     let mut reply = state.agent_config(&snap, &device).to_kv();
     register::sign_reply(&token.secret, nonce, &mut reply);
     text(StatusCode::OK, reply.encode())
+}
+
+// Includes room for four u64 numbers and a full commit hash in a main version.
+const MAX_VERSION_LEN: usize = 160;
+
+fn clip(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
 }
 
 #[derive(Deserialize)]
@@ -169,6 +184,7 @@ struct PollQuery {
     #[serde(default)]
     agent: String,
     remote_updates: Option<u8>,
+    update_channel: Option<String>,
     update_generation: Option<String>,
     #[serde(default)]
     os: String,
@@ -187,6 +203,10 @@ struct PollQuery {
 }
 
 impl PollQuery {
+    fn channel(&self) -> Option<warren_proto::UpdateChannel> {
+        self.update_channel.as_deref().and_then(warren_proto::UpdateChannel::parse)
+    }
+
     fn update_consent(&self) -> Option<(bool, Option<&str>)> {
         let enabled = self.remote_updates? == 1;
         match self.update_generation.as_deref() {
@@ -237,7 +257,9 @@ fn config_body(
     let mut cfg = state.agent_config(snap, device);
     if let Some((true, generation)) = q.update_consent() {
         match state.db.agent_update_target(device.id, generation) {
-            Ok(Some(target)) if warren_proto::is_newer(&target, &q.agent) => {
+            Ok(Some(target))
+                if warren_proto::is_update_available(q.channel().unwrap_or_default(), &target, &q.agent) =>
+            {
                 cfg.update = target;
                 cfg.update_generation = generation.map(str::to_string);
                 cfg.version = 0;
@@ -287,8 +309,14 @@ async fn config(
     let (id, key) = (device.id, device.public_key.clone());
     drop(snap);
     if !q.agent.is_empty() {
-        let clip = |s: &str| s.chars().take(64).collect::<String>();
-        state.record_agent_report(id, &clip(&q.hostname), &clip(&q.os), &clip(&q.agent), q.update_consent());
+        state.record_agent_report(
+            id,
+            &clip(&q.hostname, 64),
+            &clip(&q.os, 64),
+            &clip(&q.agent, MAX_VERSION_LEN),
+            q.update_consent(),
+            q.channel(),
+        );
         // Legacy single-interface agents cannot safely accept asymmetric paths.
         state.record_lan(id, if q.mesh == 2 { LanReport::parse(&q.lan, q.port) } else { None });
     }

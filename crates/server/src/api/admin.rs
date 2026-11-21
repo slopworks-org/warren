@@ -19,6 +19,7 @@ pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth)
     let c = &state.config;
     Json(json!({
         "version": warren_proto::VERSION,
+        "update_channel": c.update.channel.as_str(),
         "domain": c.domain,
         "admin_host": c.admin_host(),
         "admin_url": c.https_origin(c.admin_host()),
