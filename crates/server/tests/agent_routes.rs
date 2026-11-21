@@ -139,6 +139,49 @@ async fn update_requests_are_per_device_and_require_current_local_consent() {
     assert_eq!(fresh.get("update_generation"), Some(format!("{epoch}:3").as_str()));
 }
 
+#[tokio::test]
+async fn changing_the_channel_clears_queued_targets_and_uses_the_new_catalog() {
+    let state = state();
+    let owner = state.db.create_user("owner", "unused", "user").unwrap().id;
+    state.db.create_api_token(owner, "test", &sha256_hex(b"secret")).unwrap();
+    let id = state.db.create_device(owner, "router", "key", ip(2), DeviceKind::Agent).unwrap();
+    state.rebuild().unwrap();
+    let main = "0.4.0-main.65.g0012345";
+    *state.latest_main.write().unwrap() =
+        Some(Release { version: main.into(), tag: "main-65-g0012345".into(), url: String::new() });
+    *state.latest_release.write().unwrap() =
+        Some(Release { version: "0.4.0".into(), tag: "v0.4.0".into(), url: String::new() });
+    let admin = warren_server::api::router(state.clone());
+    let control = control_router(state.clone());
+    let queue = || {
+        admin.clone().oneshot(
+            Request::post(format!("/api/v1/devices/{id}/update"))
+                .header(AUTHORIZATION, "Bearer secret")
+                .extension(ClientIp(Ipv4Addr::LOCALHOST.into()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let report = |version, channel| format!("agent={version}&remote_updates=1&update_channel={channel}");
+    let on_main = report("0.4.0", "main");
+    poll(&control, 2, &on_main, StatusCode::OK).await;
+    let device = state.db.device(id).unwrap().unwrap();
+    let view = serde_json::to_value(state.device_view(&state.snapshot(), &device)).unwrap();
+    assert_eq!(view["update_channel"], "main");
+    assert_eq!(view["agent_outdated"], true);
+    assert_eq!(view["agent_latest_version"], main);
+    assert_eq!(queue().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(poll(&control, 2, &on_main, StatusCode::OK).await.get("update"), Some(main));
+    let release = report(main, "release");
+    assert!(poll(&control, 2, &release, StatusCode::OK).await.get("update").is_none());
+    assert!(state.db.device(id).unwrap().unwrap().update_target.is_none());
+    assert_eq!(queue().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(poll(&control, 2, &release, StatusCode::OK).await.get("update"), Some("0.4.0"));
+    // Both 0.4.0 targets would advance 0.3.0. The channel change alone invalidates the queue.
+    assert!(poll(&control, 2, &report("0.3.0", "main"), StatusCode::OK).await.get("update").is_none());
+    assert!(state.db.device(id).unwrap().unwrap().update_target.is_none());
+}
+
 fn rows(reply: &Kv) -> Vec<(&str, &str, &str)> {
     assert!(matches!(reply.get("route_peers"), Some("1" | "2")));
     reply
