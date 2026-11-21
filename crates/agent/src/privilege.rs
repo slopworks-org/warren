@@ -4,7 +4,10 @@ use crate::cli::{Args, Command};
 use std::os::unix::process::CommandExt;
 
 fn needs_root(command: &Command) -> bool {
-    !matches!(command, Command::Help | Command::Version | Command::Status | Command::Update { check: true, .. })
+    !matches!(
+        command,
+        Command::Help | Command::Version | Command::Status | Command::Update { check: true, remote: None, .. }
+    )
 }
 
 pub fn elevate(args: &Args) -> std::io::Result<()> {
@@ -32,11 +35,20 @@ mod tests {
 
     #[test]
     fn only_operational_commands_require_root() {
-        for command in [Command::Up, Command::Run, Command::Down, Command::Update { check: false, remote: None }] {
+        for command in [
+            Command::Up,
+            Command::Run,
+            Command::Down,
+            Command::Update { check: false, remote: None, channel: Some(warren_proto::UpdateChannel::Main) },
+        ] {
             assert!(needs_root(&command));
         }
-        for command in [Command::Help, Command::Version, Command::Status, Command::Update { check: true, remote: None }]
-        {
+        for command in [
+            Command::Help,
+            Command::Version,
+            Command::Status,
+            Command::Update { check: true, remote: None, channel: Some(warren_proto::UpdateChannel::Main) },
+        ] {
             assert!(!needs_root(&command));
         }
     }

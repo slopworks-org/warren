@@ -11,7 +11,7 @@ use crate::update_service::{self, Installation};
 use crate::{http, lan, log, selfupdate, stopping, tunnel};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
-use warren_proto::{AgentConfig, CONFIG_PATH, Kv, LONG_POLL_SECS};
+use warren_proto::{AgentConfig, CONFIG_PATH, Kv, LONG_POLL_SECS, UpdateChannel};
 use warren_wgctl as wg;
 
 /// After this long without a handshake the server's address is re-resolved.
@@ -21,6 +21,7 @@ const MAX_BACKOFF: u64 = 60;
 /// (e.g. a misbehaving proxy); pausing keeps the loop from spinning.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AUTO_CHECK_INTERVAL: Duration = Duration::from_hours(24);
+const MAIN_AUTO_CHECK_INTERVAL: Duration = Duration::from_hours(1);
 const UPDATE_RETRY: Duration = Duration::from_hours(1);
 
 /// Sleeps in one-second steps so a stop signal is noticed promptly.
@@ -60,10 +61,10 @@ fn lan_query(saved: &Saved) -> String {
     format!("&lan={}&port={port}&mesh=2", percent_encode(&addrs.join(",")))
 }
 
-fn poll(saved: &Saved, wait: u64, generation: Option<&str>) -> Result<Poll> {
+fn poll(saved: &Saved, wait: u64, channel: UpdateChannel, generation: Option<&str>) -> Result<Poll> {
     let consent = generation.map_or_else(String::new, |g| format!("&update_generation={}", percent_encode(g)));
     let path = format!(
-        "{CONFIG_PATH}?v={}&wait={wait}&agent={}&os={}&hostname={}&remote_updates={}{consent}{}",
+        "{CONFIG_PATH}?v={}&wait={wait}&agent={}&os={}&hostname={}&update_channel={channel}&remote_updates={}{consent}{}",
         saved.tunnel.version,
         warren_proto::VERSION,
         percent_encode(&os_tag()),
@@ -144,15 +145,27 @@ impl UpdateSchedule {
         }
     }
 
-    fn due(&self, target: &str, now: Instant) -> bool {
-        let requested = target != self.last_request && warren_proto::is_newer(target, warren_proto::VERSION);
-        self.last_check
-            .is_none_or(|(at, interval)| now.duration_since(at) >= if requested { UPDATE_RETRY } else { interval })
+    fn due(&self, channel: UpdateChannel, target: &str, now: Instant) -> bool {
+        let requested =
+            target != self.last_request && warren_proto::is_update_available(channel, target, warren_proto::VERSION);
+        let interval = match channel {
+            UpdateChannel::Release => AUTO_CHECK_INTERVAL,
+            UpdateChannel::Main => MAIN_AUTO_CHECK_INTERVAL,
+        };
+        let interval = if requested { UPDATE_RETRY } else { interval };
+        self.last_check.is_none_or(|(at, limit)| now.duration_since(at) >= interval.min(limit))
     }
 
-    fn check(&mut self, install: &Installation, paths: &Paths, generation: &str, config: &AgentConfig) -> Result<()> {
+    fn check(
+        &mut self,
+        install: &Installation,
+        paths: &Paths,
+        channel: UpdateChannel,
+        generation: &str,
+        config: &AgentConfig,
+    ) -> Result<()> {
         let target = update_hint(config, generation);
-        if !self.due(target, Instant::now()) {
+        if !self.due(channel, target, Instant::now()) {
             return Ok(());
         }
         self.last_request = target.to_string();
@@ -226,7 +239,8 @@ pub fn run(args: &Args, install: Option<&Installation>, mut trial: bool, cooldow
         first = false;
         let started = Instant::now();
         let generation = install.and_then(|_| selfupdate::remote_generation(&args.paths));
-        match poll(&saved, wait, generation.as_deref()) {
+        let channel = selfupdate::update_channel(&args.paths);
+        match poll(&saved, wait, channel, generation.as_deref()) {
             Ok(result) => {
                 backoff = 0;
                 st.state = "connected";
@@ -250,7 +264,7 @@ pub fn run(args: &Args, install: Option<&Installation>, mut trial: bool, cooldow
         if let Some(install) = install
             && !stopping()
             && let Some(generation) = generation.as_deref()
-            && let Err(e) = updates.check(install, &args.paths, generation, &saved.tunnel)
+            && let Err(e) = updates.check(install, &args.paths, channel, generation, &saved.tunnel)
         {
             log!(Warn, "cannot update the agent", error = e);
             st.last_error = format!("cannot update the agent: {e}");
@@ -279,6 +293,8 @@ pub fn run(args: &Args, install: Option<&Installation>, mut trial: bool, cooldow
 
 #[cfg(test)]
 mod tests {
+    use super::UpdateChannel::{Main, Release};
+
     #[test]
     fn dashboard_hints_require_the_current_consent_generation() {
         let mut config = super::AgentConfig { update: "9.0.0".into(), ..Default::default() };
@@ -299,11 +315,13 @@ mod tests {
 
         let last = Instant::now();
         let schedule = UpdateSchedule { last_check: Some((last, AUTO_CHECK_INTERVAL)), last_request: "9.0.0".into() };
-        assert!(!schedule.due("9.0.1", last + Duration::from_secs(1)));
-        assert!(!schedule.due("9.0.2", last + Duration::from_secs(UPDATE_RETRY.as_secs() - 1)));
-        assert!(schedule.due("9.0.2", last + UPDATE_RETRY));
-        assert!(!schedule.due("9.0.0", last + UPDATE_RETRY));
-        assert!(schedule.due("9.0.0", last + AUTO_CHECK_INTERVAL));
+        assert!(!schedule.due(Release, "9.0.1", last + Duration::from_secs(1)));
+        assert!(!schedule.due(Release, "9.0.2", last + Duration::from_secs(UPDATE_RETRY.as_secs() - 1)));
+        assert!(schedule.due(Release, "9.0.2", last + UPDATE_RETRY));
+        assert!(!schedule.due(Release, "9.0.0", last + UPDATE_RETRY));
+        assert!(schedule.due(Release, "9.0.0", last + AUTO_CHECK_INTERVAL));
+        assert!(!schedule.due(Main, "", last + Duration::from_secs(3599)));
+        assert!(schedule.due(Main, "", last + Duration::from_hours(1)));
     }
 
     #[test]
@@ -314,8 +332,8 @@ mod tests {
         let (last, _) = schedule.last_check.unwrap();
         assert_eq!(schedule.last_request, "9.0.0");
         for target in ["", "9.0.0", "9.0.1"] {
-            assert!(!schedule.due(target, last + Duration::from_secs(UPDATE_RETRY.as_secs() - 1)));
-            assert!(schedule.due(target, last + UPDATE_RETRY));
+            assert!(!schedule.due(Release, target, last + Duration::from_secs(UPDATE_RETRY.as_secs() - 1)));
+            assert!(schedule.due(Release, target, last + UPDATE_RETRY));
         }
     }
 }

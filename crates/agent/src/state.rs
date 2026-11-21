@@ -311,11 +311,16 @@ fn create_public_dir_at(parent: &fs::File, name: &CStr) -> io::Result<fs::File> 
     Ok(dir)
 }
 
-pub fn write_private_at(dir: &fs::File, name: &CStr, data: &[u8]) -> Result<()> {
+pub fn write_at(dir: &fs::File, name: &CStr, data: &[u8], mode: u32) -> Result<()> {
     let failed = || Error::io(format!("writing {}", name.to_string_lossy()));
     let temporary = format!(".warren-{}", codec::hex_encode(&random_bytes::<8>()?));
     let temporary = CString::new(temporary).map_err(|e| failed()(e.into()))?;
-    replace_at(dir, name, &temporary, data, fs::File::sync_all).and_then(|()| dir.sync_all()).map_err(failed())
+    replace_at(dir, name, &temporary, data, |file| {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()
+    })
+    .and_then(|()| dir.sync_all())
+    .map_err(failed())
 }
 
 fn replace_at(
