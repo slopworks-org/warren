@@ -27,7 +27,6 @@ use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, LAN_KEEPALIVE, PeerConfig, co
 /// first packet after a session turns 2 minutes old, so a connected device
 /// handshakes at least every ~145 s.
 pub const ONLINE_WINDOW: i64 = 210;
-const AGENT_TARGET: &str = "agent_target";
 
 /// What the proxy and the tunnel need, read without locking the database.
 #[derive(Default)]
@@ -52,8 +51,6 @@ pub struct Snapshot {
     pub(crate) route_revisions: Mutex<HashMap<Ipv4Addr, String>>,
     /// Admin-editable settings.
     pub settings: Settings,
-    /// The version agents update to; empty until an administrator asks.
-    pub agent_target: String,
 }
 
 impl Snapshot {
@@ -139,8 +136,6 @@ pub struct AppState {
     pub latest_release: RwLock<Option<crate::update::Release>>,
     /// Stops the server so that systemd restarts it into a staged update.
     pub restart: Notify,
-    /// Held while an agent binary downloads from GitHub.
-    pub agent_download: tokio::sync::Mutex<()>,
     alloc: Mutex<()>,
     agent_reports: Mutex<HashMap<i64, (i64, String)>>,
     lan_reports: RwLock<HashMap<i64, LanReport>>,
@@ -152,6 +147,10 @@ pub struct DeviceView {
     /// Stored fields.
     #[serde(flatten)]
     pub device: Device,
+    /// Latest stable release for a device running the agent.
+    pub agent_latest_version: Option<String>,
+    /// Whether a newer release exists for the reported version.
+    pub agent_outdated: bool,
     /// Owner's user name.
     pub owner: String,
     /// Handshake within [`ONLINE_WINDOW`].
@@ -208,7 +207,6 @@ impl AppState {
             totp_used: Mutex::new(HashMap::new()),
             latest_release: RwLock::new(None),
             restart: Notify::new(),
-            agent_download: tokio::sync::Mutex::new(()),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
             lan_reports: RwLock::new(HashMap::new()),
@@ -266,7 +264,6 @@ impl AppState {
             acl: Acl::compile(&nodes, &acl_rules),
             route_revisions: Mutex::default(),
             settings: self.db.settings()?,
-            agent_target: self.db.value(AGENT_TARGET)?.unwrap_or_default(),
         };
         *self.snapshot.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(snap);
         self.generation.send_modify(|g| *g += 1);
@@ -276,17 +273,8 @@ impl AppState {
 
     /// Wakes long-polling agents to recompute their configs, for changes
     /// that live outside the snapshot.
-    fn notify_agents(&self) {
+    pub(crate) fn notify_agents(&self) {
         self.generation.send_modify(|g| *g += 1);
-    }
-
-    /// Tells every agent to update to this server's version.
-    ///
-    /// # Errors
-    /// On database failure.
-    pub fn update_agents(&self) -> Result<(), DbError> {
-        self.db.set_value(AGENT_TARGET, warren_proto::VERSION)?;
-        self.rebuild()
     }
 
     /// Picks a free tunnel address and stores a device with it, serialized
@@ -304,15 +292,15 @@ impl AppState {
     /// The desired tunnel state for one device, as served to its agent.
     #[must_use]
     pub fn agent_config(&self, snap: &Snapshot, d: &Device) -> AgentConfig {
-        self.build_agent_config(snap, d, self.lan_peers(snap, d))
+        self.build_agent_config(d, self.lan_peers(snap, d))
     }
 
     // The signed enrollment receipt only bootstraps the hub connection.
     pub(crate) fn enrollment_config(&self, d: &Device) -> AgentConfig {
-        self.build_agent_config(&self.snapshot(), d, Vec::new())
+        self.build_agent_config(d, Vec::new())
     }
 
-    fn build_agent_config(&self, snap: &Snapshot, d: &Device, lan_peers: Vec<PeerConfig>) -> AgentConfig {
+    fn build_agent_config(&self, d: &Device, lan_peers: Vec<PeerConfig>) -> AgentConfig {
         let mut cfg = AgentConfig {
             version: 0,
             device_id: u64::try_from(d.id).unwrap_or_default(),
@@ -326,7 +314,8 @@ impl AppState {
                 keepalive: DEFAULT_KEEPALIVE,
             }],
             lan_peers,
-            update: snap.agent_target.clone(),
+            update: String::new(),
+            update_generation: None,
         };
         cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;
         cfg
@@ -410,30 +399,47 @@ impl AppState {
         s.last_handshake.is_some_and(|t| now() - t <= ONLINE_WINDOW)
     }
 
-    /// Records what an agent reports about itself when it changed, at most
-    /// every 10 minutes per device. Only the database is updated: these
-    /// fields do not affect routing, so no snapshot rebuild is needed.
-    pub fn record_agent_report(&self, device: i64, hostname: &str, os: &str, version: &str) {
-        let fingerprint = format!("{hostname}\n{os}\n{version}");
+    /// Records changed metadata. Version and consent changes take effect immediately.
+    pub fn record_agent_report(
+        &self,
+        device: i64,
+        hostname: &str,
+        os: &str,
+        version: &str,
+        remote_updates: Option<(bool, Option<&str>)>,
+    ) {
+        let update_fields = format!("\n{version}\n{remote_updates:?}");
+        let fingerprint = format!("{hostname}\n{os}{update_fields}");
         let t = now();
+        let mut reports = lock(&self.agent_reports);
+        if reports
+            .get(&device)
+            .is_some_and(|(last, fp)| fp == &fingerprint || (t - last < 600 && fp.ends_with(&update_fields)))
         {
-            let mut reports = lock(&self.agent_reports);
-            match reports.get(&device) {
-                // A new version is recorded at once, so the admin sees an update land.
-                Some((last, fp)) if *fp == fingerprint || (t - last < 600 && fp.ends_with(&format!("\n{version}"))) => {
-                    return;
-                }
-                _ => reports.insert(device, (t, fingerprint)),
-            };
+            return;
         }
-        if let Err(e) = self.db.device_report(device, hostname, os, version) {
-            tracing::warn!(error = %e, "recording agent details");
+        match self.db.device_report(device, hostname, os, version, remote_updates) {
+            Ok(()) => {
+                reports.insert(device, (t, fingerprint));
+            }
+            Err(e) => tracing::warn!(error = %e, "recording agent details"),
         }
+    }
+
+    /// The latest stable release, independent of the server's running version.
+    pub fn latest_agent_version(&self) -> Option<String> {
+        self.latest_release.read().unwrap_or_else(PoisonError::into_inner).as_ref().map(|r| r.version.clone())
     }
 
     /// API view of a device.
     pub fn device_view(&self, snap: &Snapshot, d: &Device) -> DeviceView {
         let s = self.peer_stats(d.id);
+        let agent_latest_version = (d.kind == crate::db::DeviceKind::Agent
+            && warren_proto::valid_version(&d.agent_version))
+        .then(|| self.latest_agent_version())
+        .flatten();
+        let agent_outdated =
+            agent_latest_version.as_ref().is_some_and(|version| warren_proto::is_newer(version, &d.agent_version));
         DeviceView {
             owner: snap.users.get(&d.user_id).map(|u| u.username.clone()).unwrap_or_default(),
             online: d.enabled && Self::recent(s),
@@ -442,6 +448,8 @@ impl AppState {
             tx_bytes: s.tx_bytes,
             endpoint: s.endpoint.map(|e| e.to_string()),
             device: d.clone(),
+            agent_latest_version,
+            agent_outdated,
         }
     }
 

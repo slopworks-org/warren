@@ -91,21 +91,49 @@ just ipk               # OpenWrt package
 
 ## Updates
 
-The server checks GitHub for a new release once a day. When one is out,
-administrators see a notice in the admin. Click **Update now** to install it:
-the server downloads the release, checks it against `SHA256SUMS` and
-restarts. To install new releases without the button, set `auto = true` in
-the `[update]` section of `server.toml`.
+### Devices
 
-Agents update from the server, inside the tunnel. When an agent runs an
-older version than the server, Devices shows **Update agents**. Each agent
-then downloads its build from the server, checks that the new binary runs,
-replaces itself and restarts. With `auto = true`, agents follow the server
-version without the button.
+Updates are managed on the device by default. On Linux, OpenWrt and macOS:
 
-Servers and agents installed before this feature need one upgrade with
-`install.sh`. On the server, it also installs the new systemd unit. The
-container image does not update itself; pull a new image instead.
+```sh
+warren status                    # Show the installed version and any available release
+warren update --check            # Check without installing
+warren update                    # Verify and stage the latest stable release for activation
+warren update --remote on        # Allow automatic and dashboard-requested updates
+warren update --remote off       # Return to local updates only
+```
+
+The agent downloads builds and SHA256SUMS from the official GitHub release
+over HTTPS. In-place updates require system `curl` and trusted CA
+certificates. The installation and configuration paths must be root-owned
+and writable only by root. Use separate executable paths for registrations
+that run concurrently. The service starts the candidate from its staged path
+and replaces the installed binary only after the candidate's supervisor
+confirms that its worker has configured the local tunnel. If the service is
+stopped, `warren update` reports the release as staged and the trial runs on
+the next service start. A failed or interrupted trial leaves the previous
+binary installed.
+
+On OpenWrt, the IPK installs `curl` and `ca-bundle`. The shell installer
+installs them when called with `agent --remote on`. For manual updates on
+an existing shell installation, install those packages with `opkg` or `apk`.
+Enabling remote updates checks that the agent can reach the official release
+over certificate-validated HTTPS. Devices running an older agent can rerun
+the installer to get the update commands.
+
+The Devices page shows the installed and available versions. For an opted-in
+device, **Update** requests a check. Agents wait at least an hour between
+checks prompted by the dashboard, and offline devices check after reconnecting.
+Opted-in agents also check daily. Android app updates
+are installed on the phone.
+
+### Server
+
+The server checks GitHub for release metadata independently of its own
+version. Upgrade it by rerunning the server installer or pulling a new
+container image. Operators using the packaged systemd unit can also set
+`[update]` → `auto = true` in `server.toml` for unattended server updates.
+That setting applies only to the server.
 
 ## Devices on one LAN
 

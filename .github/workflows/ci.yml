@@ -40,3 +40,8 @@ jobs:
 
       - name: Run tests
         run: scripts/check.sh test
+
+      - name: Run root-only agent tests
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -n --
+        run: scripts/check.sh test_root

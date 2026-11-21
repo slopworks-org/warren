@@ -33,8 +33,23 @@ fn bytes(n: u64) -> String {
     if unit == 0 { format!("{n} B") } else { format!("{whole}.{tenths} {}", UNITS[unit]) }
 }
 
-pub fn status(args: &Args) -> Result<()> {
-    let saved = Saved::load(&args.paths.config())?;
+pub fn status(args: &Args) {
+    let available = crate::selfupdate::latest(Duration::from_secs(3))
+        .ok()
+        .filter(|version| warren_proto::is_newer(version, warren_proto::VERSION))
+        .map_or_else(String::new, |version| format!(" (v{version} available)"));
+    println!("Version:    v{}{available}", warren_proto::VERSION);
+    if let Ok(saved) = Saved::load(&args.paths.config()) {
+        println!(
+            "Automatic and dashboard updates: {}",
+            if crate::selfupdate::remote_enabled(&args.paths) { "on" } else { "off" }
+        );
+        tunnel_status(&saved);
+    }
+    control_status(&args.paths.status());
+}
+
+fn tunnel_status(saved: &Saved) {
     let t = &saved.tunnel;
     println!("Device:     {} (#{})", t.name, t.device_id);
     println!("Address:    {}", t.address);
@@ -60,25 +75,54 @@ pub fn status(args: &Args) -> Result<()> {
         Err(e) if wg::link_index(&saved.interface).is_none() => println!("Tunnel:     down ({e})"),
         Err(e) => println!("Tunnel:     unknown ({e}; run as root for details)"),
     }
-    match std::fs::read_to_string(args.paths.status()).ok().and_then(|s| Kv::parse(&s).ok()) {
-        Some(kv) => {
-            let state = kv.get("state").unwrap_or("unknown");
-            let contact = kv.get("last_contact").and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).map_or_else(
-                || "never".to_string(),
-                |v| format!("{} ago", ago(Duration::from_secs(log::now().saturating_sub(v)))),
-            );
-            println!("Control:    {state}, last contact {contact} (config v{})", t.version);
-            if let Some(err) = kv.get("last_error").filter(|e| !e.is_empty()) {
-                println!("Last error: {err}");
-            }
+}
+
+fn control_status(path: &std::path::Path) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("Control:    agent is not running");
+            return;
         }
-        None => println!("Control:    agent is not running"),
+        Err(e) => {
+            println!("Control:    status unavailable ({e})");
+            return;
+        }
+    };
+    let Ok(kv) = Kv::parse(&text) else {
+        println!("Control:    status unavailable");
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    if !status_is_current(&kv) {
+        println!("Control:    agent is not running");
+        return;
     }
-    Ok(())
+    let state = kv.get("state").unwrap_or("unknown");
+    let contact = kv.get("last_contact").and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).map_or_else(
+        || "never".to_string(),
+        |v| format!("{} ago", ago(Duration::from_secs(log::now().saturating_sub(v)))),
+    );
+    let version = kv.get("config_version").map_or_else(String::new, |v| format!(" (config v{v})"));
+    println!("Control:    {state}, last contact {contact}{version}");
+    if let Some(err) = kv.get("last_error").filter(|e| !e.is_empty()) {
+        println!("Last error: {err}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn status_is_current(kv: &Kv) -> bool {
+    crate::state::boot_id().is_ok_and(|boot_id| kv.get("boot_id") == Some(boot_id.as_str()))
 }
 
 pub fn down(args: &Args) -> Result<()> {
-    let iface = Saved::load(&args.paths.config()).map_or_else(|_| args.interface.clone(), |s| s.interface);
+    let registration = if args.forget { crate::selfupdate::Forget::open(&args.paths)? } else { None };
+    let saved = if args.forget {
+        registration.as_ref().and_then(|registration| registration.load_config().ok())
+    } else {
+        Saved::load(&args.paths.config()).ok()
+    };
+    let iface = saved.map_or_else(|| args.interface.clone(), |s| s.interface);
     if wg::link_index(&iface).is_some() {
         wg::delete_link(&iface)?;
         println!("Removed interface {iface}.");
@@ -86,22 +130,27 @@ pub fn down(args: &Args) -> Result<()> {
         println!("Interface {iface} is not present.");
     }
     crate::tunnel::remove_direct(&iface)?;
-    if args.forget {
-        for path in [args.paths.config(), args.paths.key()] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => println!("Deleted {}.", path.display()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(crate::error::Error::Io { what: format!("deleting {}", path.display()), source: e });
-                }
-            }
-        }
+    if let Some(registration) = registration {
+        registration.revoke()?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_from_another_boot_is_stale() {
+        let mut kv = Kv::new();
+        kv.push("state", "connected");
+        assert!(!status_is_current(&kv));
+        let mut stale = kv.clone();
+        stale.push("boot_id", "00000000-0000-0000-0000-000000000000");
+        assert!(!status_is_current(&stale));
+        kv.push("boot_id", crate::state::boot_id().unwrap());
+        assert!(status_is_current(&kv));
+    }
+
     use super::*;
 
     #[test]
@@ -112,5 +161,84 @@ mod tests {
         assert_eq!(bytes(512), "512 B");
         assert_eq!(bytes(1536), "1.5 KiB");
         assert_eq!(bytes(3 * 1024 * 1024), "3.0 MiB");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the privileged runtime lock directory"]
+    fn forget_removes_credentials_from_a_custom_config_directory() {
+        let suffix = warren_proto::codec::hex_encode(&crate::state::random_bytes::<4>().unwrap());
+        let dir = std::env::temp_dir().join(format!("warren-forget-{suffix}"));
+        let args = Args::parse(
+            ["down", "--forget", "--interface", &format!("wf{suffix}"), "--config-dir", dir.to_str().unwrap()]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(args.paths.config(), "test config").unwrap();
+        std::fs::write(args.paths.key(), "test key").unwrap();
+        std::fs::write(args.paths.update_policy(), "on\n").unwrap();
+
+        let result = down(&args);
+        let forgotten =
+            !args.paths.config().exists() && !args.paths.key().exists() && !args.paths.update_policy().exists();
+        std::fs::remove_dir_all(dir).unwrap();
+        result.unwrap();
+        assert!(forgotten);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root-owned update fixtures"]
+    fn forget_uses_the_policy_lock_and_unlinks_entries_through_a_directory_alias() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = crate::update_service::tests::Fixture::new();
+        let alias = fixture.dir.join("alias");
+        symlink(&fixture.dir, &alias).unwrap();
+        let args = Args::parse(
+            ["down", "--forget", "--interface", "wf-forget-alias", "--config-dir", alias.to_str().unwrap()]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+
+        let paths = fixture.paths();
+        let dir = std::fs::File::open(&fixture.dir).unwrap();
+        let lock_path = crate::selfupdate::policy_lock_path(&dir).unwrap();
+        let lock = crate::update_files::open_lock(&lock_path).unwrap();
+        std::fs::write(paths.config(), "test config").unwrap();
+        std::fs::write(paths.update_policy(), "on\n").unwrap();
+        let target_key = fixture.dir.join("untouched");
+        std::fs::write(&target_key, "test key").unwrap();
+        std::fs::remove_file(paths.key()).unwrap();
+        symlink(&target_key, paths.key()).unwrap();
+
+        // A reused directory inode can already have a policy lock file.
+        let permissions = lock.metadata().unwrap().permissions();
+        lock.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o020)).unwrap();
+        let result = down(&args);
+        lock.set_permissions(permissions).unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::Io { what, source })
+                if what == format!("opening lock {}", lock_path.display())
+                    && source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(paths.config().exists() && paths.key().exists());
+        assert_eq!(std::fs::read_to_string(paths.update_policy()).unwrap(), "on\n");
+
+        // A revocation failure must also leave the credentials alone.
+        std::fs::remove_file(paths.update_policy()).unwrap();
+        std::fs::create_dir(paths.update_policy()).unwrap();
+        assert!(down(&args).is_err());
+        assert!(paths.config().exists() && paths.key().exists());
+        std::fs::remove_dir(paths.update_policy()).unwrap();
+        std::fs::write(paths.update_policy(), "on\n").unwrap();
+
+        down(&args).unwrap();
+        assert!(!paths.update_policy().exists() && !paths.config().exists());
+        assert!(std::fs::symlink_metadata(paths.key()).is_err());
+        assert_eq!(std::fs::read_to_string(&target_key).unwrap(), "test key");
     }
 }

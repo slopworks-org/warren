@@ -11,19 +11,14 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use warren_proto::codec::b64url_encode;
 
 /// `GET /api/v1/server`: facts about this server.
 pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth) -> Json<Value> {
     let c = &state.config;
-    let latest = state.latest_release.read().unwrap_or_else(PoisonError::into_inner).clone();
-    let update = latest.filter(|r| crate::update::is_newer(&r.version, warren_proto::VERSION));
     Json(json!({
         "version": warren_proto::VERSION,
-        "update": update,
-        "self_update": crate::update::self_update_blocker().is_none(),
-        "agent_target": state.snapshot().agent_target,
         "domain": c.domain,
         "admin_host": c.admin_host(),
         "admin_url": c.https_origin(c.admin_host()),
@@ -34,30 +29,6 @@ pub async fn server_info(State(state): State<Arc<AppState>>, _auth: PendingAuth)
         "backend": state.backend.name(),
         "tls_mode": format!("{:?}", c.tls.mode).to_lowercase(),
     }))
-}
-
-/// `POST /api/v1/server/update`: downloads the latest release and restarts into it.
-pub async fn update_server(State(state): State<Arc<AppState>>, ip: Ip, auth: Auth) -> ApiResult<Json<Value>> {
-    use crate::update::{Fetcher, UpdateError, install};
-    auth.require(Perm::ManageSettings)?;
-    let fetcher = Fetcher::new().map_err(ApiError::internal)?;
-    let release = install(&state, &fetcher).await.map_err(|e| match e {
-        UpdateError::Unsupported(_) | UpdateError::UpToDate | UpdateError::Busy => ApiError::Conflict(e.to_string()),
-        other => {
-            tracing::warn!(error = %other, "installing the new release");
-            ApiError::Conflict(format!("cannot install the update: {other}"))
-        }
-    })?;
-    state.audit(Some(&auth.user), &ip, "server.update", "server", &format!("to {}", release.version));
-    Ok(Json(json!({ "version": release.version })))
-}
-
-/// `POST /api/v1/agents/update`: agents update to this server's version.
-pub async fn update_agents(State(state): State<Arc<AppState>>, ip: Ip, auth: Auth) -> ApiResult<Json<Value>> {
-    auth.require(Perm::ManageSettings)?;
-    state.update_agents()?;
-    state.audit(Some(&auth.user), &ip, "agents.update", "agents", &format!("to {}", warren_proto::VERSION));
-    Ok(Json(json!({ "version": warren_proto::VERSION })))
 }
 
 /// `GET /api/v1/users`.

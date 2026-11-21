@@ -15,6 +15,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -424,11 +425,15 @@ fn scenario(s: &Scenario) {
     let server_bin = PathBuf::from(env!("CARGO_BIN_EXE_warren-server"));
     let agent_bin = server_bin.with_file_name("warren");
     assert!(agent_bin.exists(), "build the agent first (cargo build --workspace)");
-    let (server_bin, agent_bin) = (server_bin.to_str().unwrap(), agent_bin.to_str().unwrap());
+    let server_bin = server_bin.to_str().unwrap();
 
-    let dir = std::env::temp_dir().join(format!("warren-e2e-{}", s.tag));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    // /run can be mounted noexec and paths under /tmp are not protected.
+    let dir = PathBuf::from(must(&["mktemp", "-d", &format!("/var/lib/warren-e2e-{}-XXXXXX", s.tag)]).trim());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    // Each container owns its service locks even when Cargo artifacts are shared.
+    let test_agent_bin = dir.join("warren");
+    fs::copy(agent_bin, &test_agent_bin).unwrap();
+    let agent_bin = test_agent_bin.to_str().unwrap();
     let dev = Netns::new(&format!("wd{}", s.tag), s.subnet);
     let hub_ip = format!("{}.1", s.subnet);
     let server_iface = format!("wrs{}", s.tag);
@@ -489,6 +494,7 @@ fn scenario(s: &Scenario) {
     // A clean shutdown removes the hub interface.
     server.terminate();
     assert!(warren_wgctl::link_index(&server_iface).is_none(), "hub interface left behind");
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// The agent under test: its daemon process and how to restart it.
@@ -534,7 +540,7 @@ fn register_agent(s: &Scenario, dir: &Path, dev: &Netns, admin: &Client, agent_b
         "--config-dir",
         cfg_dir.to_str().unwrap(),
         "--run-dir",
-        agent_dir.join("run").to_str().unwrap(),
+        agent_dir.join("runtime/run").to_str().unwrap(),
         "--interface",
         &iface,
     ]
@@ -548,21 +554,164 @@ fn register_agent(s: &Scenario, dir: &Path, dev: &Netns, admin: &Client, agent_b
     assert!(out.status.success(), "warren up: {output}");
     assert!(!dev.exec(&up).status.success(), "a second `up` without --force must fail");
     let key_mode = fs::metadata(cfg_dir.join("private.key")).unwrap();
-    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&key_mode.permissions()) & 0o777, 0o600);
+    assert_eq!(key_mode.permissions().mode() & 0o777, 0o600);
 
-    let run_args: Vec<String> = agent_args(&common, &[agent_bin, "run"]).into_iter().map(ToString::to_string).collect();
-    let daemon = dev.spawn(&run_args.iter().map(String::as_str).collect::<Vec<_>>(), &dir.join("agent.log"));
+    let installed = agent_dir.join("warren");
+    fs::copy(agent_bin, &installed).unwrap();
+    let previous = fs::metadata(&installed).unwrap().ino();
+    let (failed_trial, _) = stage_agent_update(&installed, &cfg_dir, "9.0.0", |candidate| {
+        fs::write(candidate, "#!/bin/sh\nif [ \"$1\" = version ]; then echo warren 9.0.0; else exit 77; fi\n").unwrap();
+    });
+    let run_args: Vec<String> =
+        agent_args(&common, &[installed.to_str().unwrap(), "run"]).into_iter().map(ToString::to_string).collect();
+    let log = dir.join("agent.log");
+    let mut restrictive = vec!["sh", "-c", r#"umask 077; exec "$@""#, "sh"];
+    restrictive.extend(run_args.iter().map(String::as_str));
+    let daemon = dev.spawn(&restrictive, &log);
     dev.serve(8000);
 
     let device = || admin.ok("GET", "/devices", None)[0].clone();
     wait_for("the device to come online", Duration::from_secs(30), || device()["online"] == json!(true));
+    assert!(!failed_trial.exists());
+    assert_eq!(fs::metadata(&installed).unwrap().ino(), previous);
+    assert!(fs::read_to_string(&log).unwrap().contains("exit status: 77"));
     let (id, addr) = (device()["id"].as_i64().unwrap(), device()["address"].as_str().unwrap().to_string());
     assert_eq!(device()["name"], "router");
     let status = dev.exec(&agent_args(&common, &[agent_bin, "status"]));
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(status.contains(&addr) && status.contains("Handshake:"), "status output: {status}");
     assert!(status.contains("Control:    connected"), "first poll is immediate: {status}");
+    assert_eq!(fs::metadata(agent_dir.join("runtime")).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_status_permissions(&agent_dir.join("runtime/run"), 0o755);
+    let unprivileged = ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", agent_bin, "status"];
+    let status = dev.exec(&agent_args(&common, &unprivileged));
+    assert!(status.status.success(), "unprivileged status: {}", String::from_utf8_lossy(&status.stderr));
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("Version:    v") && status.contains("Control:    connected, last contact"), "{status}");
+    assert!(status.contains("(config v") && !status.contains("Handshake:"), "{status}");
+    check_live_updates(dev, agent_bin, &installed, &cfg_dir, &daemon, &log);
     Agent { daemon, run_args, iface, id, addr }
+}
+
+/// Publishes the verified-download handoff without depending on GitHub in e2e.
+fn stage_agent_update(
+    installed: &Path,
+    config: &Path,
+    version: &str,
+    write_candidate: impl FnOnce(&Path),
+) -> (PathBuf, u64) {
+    publish_agent_update(installed, config, version, None, write_candidate)
+}
+
+fn publish_agent_update(
+    installed: &Path,
+    config: &Path,
+    version: &str,
+    consent: Option<&str>,
+    write_candidate: impl FnOnce(&Path),
+) -> (PathBuf, u64) {
+    let lock_path = executable_lock(installed, "update");
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(lock_path.parent().unwrap()).unwrap();
+    let update_lock =
+        fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path).unwrap();
+    update_lock.lock().unwrap();
+    let key = fs::read_to_string(config.join("private.key")).unwrap();
+    let tag = warren_proto::asset_sha256(&warren_proto::codec::decode_key(key.trim()).unwrap());
+    let candidate = installed.with_extension(format!("{tag}.update-candidate"));
+    let request = installed.with_extension(format!("{tag}.update-request"));
+    let tmp = request.with_extension("tmp");
+    write_candidate(&candidate);
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    let (old, new) = (fs::metadata(installed).unwrap(), fs::metadata(&candidate).unwrap());
+    let mut kv = warren_proto::Kv::new();
+    kv.push("installed_dev", old.dev().to_string());
+    kv.push("installed_ino", old.ino().to_string());
+    kv.push("installed_sha256", warren_proto::asset_sha256(&fs::read(installed).unwrap()));
+    kv.push("candidate_dev", new.dev().to_string());
+    kv.push("candidate_ino", new.ino().to_string());
+    kv.push("candidate_sha256", warren_proto::asset_sha256(&fs::read(&candidate).unwrap()));
+    kv.push("version", version);
+    kv.push("remote", if consent.is_some() { "on" } else { "off" });
+    if let Some(consent) = consent {
+        kv.push("consent", consent);
+    }
+    kv.push("registration", &tag);
+    fs::write(&tmp, kv.encode()).unwrap();
+    fs::rename(tmp, &request).unwrap();
+    (request, new.ino())
+}
+
+fn executable_lock(installed: &Path, role: &str) -> PathBuf {
+    let directory = fs::metadata(installed.parent().unwrap()).unwrap();
+    let name = warren_proto::asset_sha256(installed.file_name().unwrap().as_encoded_bytes());
+    Path::new("/run/warren-locks").join(format!("{}-{}-{name}.{role}", directory.dev(), directory.ino()))
+}
+
+fn assert_status_permissions(run: &Path, expected_dir: u32) {
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(run), expected_dir);
+    assert_eq!(mode(&run.join("status")), 0o644);
+}
+
+fn service_child(pid: u32) -> Option<u32> {
+    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?.trim().parse().ok()
+}
+
+fn check_live_updates(dev: &Netns, agent_bin: &str, installed: &Path, config: &Path, daemon: &Guard, log: &Path) {
+    let pid = daemon.0.as_ref().unwrap().id();
+    let status = config.with_file_name("runtime").join("run/status");
+    let activation = installed.with_extension("update-activation");
+    let connected = || fs::read_to_string(&status).is_ok_and(|state| state.contains("state=connected"));
+    let other_config = config.with_file_name("second");
+    fs::create_dir(&other_config).unwrap();
+    let other = dev.exec(&[installed.to_str().unwrap(), "run", "--config-dir", other_config.to_str().unwrap()]);
+    assert!(!other.status.success());
+    assert!(String::from_utf8_lossy(&other.stderr).contains("another Warren service is using this executable"));
+
+    let previous = fs::metadata(installed).unwrap().ino();
+    let previous_worker = service_child(pid).unwrap();
+    let (failed, _) = stage_agent_update(installed, config, "9.0.0", |path| {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = version ]; then echo warren 9.0.0
+elif [ -n "${{WARREN_DAEMON_BINARY:-}}${{WARREN_SUPERVISED_EXECUTABLE:-}}" ]; then exec '{agent_bin}' "$@"
+else exit 77
+fi
+"#
+            ),
+        )
+        .unwrap();
+    });
+    wait_for("the previous worker to recover after a failed supervisor trial", Duration::from_secs(20), || {
+        !failed.exists() && connected() && service_child(pid).is_some_and(|worker| worker != previous_worker)
+    });
+    assert_eq!(fs::metadata(installed).unwrap().ino(), previous);
+    let log = fs::read_to_string(log).unwrap();
+    assert!(log.contains("confirm supervisor activation (exit status: 77)"), "{log}");
+
+    let staged_from = config.with_file_name("staging-alias");
+    fs::create_dir(&staged_from).unwrap();
+    let _binding = BindMount::new(config, &staged_from);
+    for _ in 0..2 {
+        let previous = fs::metadata(installed).unwrap().ino();
+        let (request, candidate) = stage_agent_update(installed, &staged_from, warren_proto::VERSION, |path| {
+            fs::copy(agent_bin, path).unwrap();
+        });
+        assert_ne!(candidate, previous);
+        wait_for("the updated supervisor to acknowledge activation", Duration::from_secs(20), || {
+            !request.exists()
+                && !activation.exists()
+                && fs::metadata(installed).is_ok_and(|meta| meta.ino() == candidate)
+                && fs::metadata(format!("/proc/{pid}/exe")).is_ok_and(|meta| meta.ino() == candidate)
+                && service_child(pid).is_some_and(|worker| {
+                    fs::metadata(format!("/proc/{worker}/exe")).is_ok_and(|meta| meta.ino() == candidate)
+                })
+                && connected()
+        });
+        assert_eq!(fs::metadata(installed).unwrap().ino(), candidate);
+    }
 }
 
 /// A public resource: HTTP and WebSocket through the tunnel, redirects, and
@@ -896,11 +1045,63 @@ fn check_failures_restart_revoke(
     // The daemon stops (removing its interface) and starts again.
     agent.daemon.terminate();
     assert!(!dev.exec(&["ip", "link", "show", &agent.iface]).status.success(), "agent removes its interface on stop");
-    let args: Vec<&str> = agent.run_args.iter().map(String::as_str).collect();
+    let mut args: Vec<&str> = agent.run_args.iter().map(String::as_str).collect();
+    let installed = Path::new(args[0]);
+    let config = dir.join("agent/etc");
+    // Interrupt A's activation on disk before starting registration B.
+    let previous = interrupt_activation(installed, &config);
+    let second = config.with_file_name("second");
+    for file in ["agent.conf", "private.key"] {
+        fs::copy(config.join(file), second.join(file)).unwrap();
+    }
+    let config_index = args.iter().position(|&arg| arg == "--config-dir").unwrap() + 1;
+    args[config_index] = second.to_str().unwrap();
+    let run = dir.join("agent/runtime/run");
+    fs::write(run.join("status"), "state=stale\n").unwrap();
+    fs::set_permissions(run.join("status"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
     agent.daemon = dev.spawn(&args, &dir.join("agent2.log"));
-    wait_for("the published service after an agent restart", Duration::from_secs(30), || {
-        visitor.try_request("GET", &format!("{app}/again"), None, &[]).is_some_and(|r| r.status == 200)
+    let reachable = || visitor.try_request("GET", &format!("{app}/again"), None, &[]).is_some_and(|r| r.status == 200);
+    wait_for("the published service after a different registration starts", Duration::from_secs(30), || {
+        !installed.with_extension("update-activation").exists() && reachable()
     });
+    let pid = agent.daemon.0.as_ref().unwrap().id();
+    let worker = service_child(pid).unwrap();
+    assert_eq!(fs::metadata(format!("/proc/{pid}/exe")).unwrap().ino(), previous);
+    assert_eq!(fs::metadata(format!("/proc/{worker}/exe")).unwrap().ino(), previous);
+    assert_eq!(fs::metadata(installed).unwrap().ino(), previous);
+    assert!(!installed.with_extension("update-backup").exists());
+    assert_status_permissions(&run, 0o700);
+
+    let run_index = args.iter().position(|&arg| arg == "--run-dir").unwrap() + 1;
+    let next_run = dir.join("agent/next-run");
+    args[config_index] = config.to_str().unwrap();
+    args[run_index] = next_run.to_str().unwrap();
+    check_orphaned_worker(dev, &mut agent.daemon, &args, &next_run, &dir.join("agent2.log"));
+    wait_for("the service after orphan teardown", Duration::from_secs(30), reachable);
+
+    agent.daemon.terminate();
+    for phase in ["version", "run"] {
+        check_trial_interruption(dev, &args, installed, &config, reachable, phase).terminate();
+    }
+    check_competing_alias_during_exec(dev, dir, installed, &second);
+    check_read_only_lock_storage(dev, dir, installed, &config, reachable);
+    check_read_only_startup(dev, dir, installed, &config, &second, reachable);
+    check_revoked_read_only_startup(dev, dir, installed, &config, reachable);
+
+    let previous = interrupt_activation(installed, &config);
+    let direct = Path::new("/tmp").join(dir.file_name().unwrap());
+    std::os::unix::fs::symlink(&config, &direct).unwrap();
+    args[config_index] = direct.to_str().unwrap();
+    agent.daemon = dev.spawn(&args, &dir.join("agent2.log"));
+    wait_for("the restored agent running without supervision", Duration::from_secs(30), || {
+        !installed.with_extension("update-activation").exists() && reachable()
+    });
+    let pid = agent.daemon.0.as_ref().unwrap().id();
+    assert_eq!(fs::metadata(format!("/proc/{pid}/exe")).unwrap().ino(), previous);
+    assert!(service_child(pid).is_none());
+    assert!(!installed.with_extension("update-backup").exists());
+    fs::remove_file(direct).unwrap();
 
     // Revoking removes the device and its resources.
     admin.ok("DELETE", &format!("/devices/{}", agent.id), None);
@@ -908,6 +1109,353 @@ fn check_failures_restart_revoke(
     assert!(resources.as_array().unwrap().iter().all(|r| r["device_id"] != json!(agent.id)));
     assert!(visitor.try_request("GET", &format!("{app}/"), None, &[]).is_none(), "its hosts are no longer served");
     agent.daemon.terminate();
+}
+
+fn check_trial_interruption(
+    dev: &Netns,
+    args: &[&str],
+    installed: &Path,
+    config: &Path,
+    reachable: impl Fn() -> bool,
+    phase: &str,
+) -> Guard {
+    let previous = fs::metadata(installed).unwrap().ino();
+    let invocations = config.join(format!("{phase}-invocations"));
+    let processes = config.join(format!("{phase}-processes"));
+    let (_, candidate) = stage_agent_update(installed, config, "9.0.0", |path| {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+echo "$1" >> '{}'
+if [ "$1" = '{}' ]; then
+    trap '' TERM
+    sleep 300 &
+    echo "$$ $!" > '{}'
+    wait
+elif [ "$1" = version ]; then
+    echo warren 9.0.0
+fi
+"#,
+                invocations.display(),
+                phase,
+                processes.display()
+            ),
+        )
+        .unwrap();
+    });
+    let log = config.join(format!("crash-{phase}.log"));
+    let mut trial = dev.spawn(args, &log);
+    wait_for("the candidate to stall", Duration::from_secs(10), || {
+        fs::read_to_string(&processes).is_ok_and(|pids| pids.split_whitespace().count() == 2)
+    });
+    let pids = fs::read_to_string(&processes).unwrap();
+    let candidate_pid = pids.split_whitespace().next().unwrap();
+    let lock = executable_lock(installed, "update");
+    assert!(
+        fs::read_dir(format!("/proc/{candidate_pid}/fd"))
+            .unwrap()
+            .flatten()
+            .all(|fd| { fs::read_link(fd.path()).is_ok_and(|path| path != lock) })
+    );
+    let activation = installed.with_extension("update-activation");
+    assert!(activation.exists(), "the marker must be durable before {phase}");
+    let installed_during_trial = fs::metadata(installed).unwrap().ino();
+    let mut coordinator = trial.0.take().unwrap();
+    coordinator.kill().unwrap();
+    coordinator.wait().unwrap();
+    assert_eq!(installed_during_trial, previous);
+
+    let daemon = dev.spawn(args, &config.join(format!("recovery-{phase}.log")));
+    wait_for("the previous agent to start after coordinator death", Duration::from_secs(25), reachable);
+    assert_recovered_worker(&daemon, previous);
+    assert_ne!(fs::metadata(installed).unwrap().ino(), candidate);
+    assert!(!activation.exists());
+    assert_eq!(
+        fs::read_to_string(invocations).unwrap(),
+        if phase == "version" { "version\n" } else { "version\nrun\n" }
+    );
+    wait_for("the stalled candidate and its descendant to exit", Duration::from_secs(5), || {
+        pids.split_whitespace().all(|pid| {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
+            stat.is_err()
+                || stat.is_ok_and(|stat| stat.rsplit_once(") ").is_some_and(|(_, fields)| fields.starts_with('Z')))
+        })
+    });
+    daemon
+}
+
+fn assert_recovered_worker(daemon: &Guard, previous: u64) {
+    let pid = daemon.0.as_ref().unwrap().id();
+    let worker = service_child(pid).unwrap();
+    assert_eq!(fs::metadata(format!("/proc/{pid}/exe")).unwrap().ino(), previous);
+    assert_eq!(fs::metadata(format!("/proc/{worker}/exe")).unwrap().ino(), previous);
+    let env = fs::read(format!("/proc/{worker}/environ")).unwrap();
+    assert!(env.split(|&byte| byte == 0).any(|entry| entry == b"WARREN_DAEMON_UPDATE_COOLDOWN=9.0.0"));
+}
+
+struct BindMount<'a>(&'a str);
+
+impl<'a> BindMount<'a> {
+    fn new(source: &Path, target: &'a Path) -> Self {
+        let target = target.to_str().unwrap();
+        must(&["mount", "--bind", source.to_str().unwrap(), target]);
+        Self(target)
+    }
+
+    fn read_only(dir: &'a Path) -> Self {
+        let mount = Self::new(dir, dir);
+        must(&["mount", "-o", "remount,bind,ro", mount.0]);
+        mount
+    }
+}
+
+impl Drop for BindMount<'_> {
+    fn drop(&mut self) {
+        must(&["umount", self.0]);
+    }
+}
+
+fn check_competing_alias_during_exec(dev: &Netns, dir: &Path, installed: &Path, other_config: &Path) {
+    let unprotected = dir.join("unprotected");
+    fs::create_dir(&unprotected).unwrap();
+    fs::set_permissions(&unprotected, fs::Permissions::from_mode(0o777)).unwrap();
+    let alias = unprotected.join("alias");
+    fs::create_dir(&alias).unwrap();
+    let _mount = BindMount::new(installed.parent().unwrap(), &alias);
+    let exe = alias.join(installed.file_name().unwrap());
+    let update = fs::File::open(executable_lock(installed, "update")).unwrap();
+    update.lock().unwrap();
+    let log = dir.join("competing-alias.log");
+    let mut competitor =
+        dev.spawn(&[exe.to_str().unwrap(), "run", "--config-dir", other_config.to_str().unwrap()], &log);
+    let child = competitor.0.as_mut().unwrap();
+    let wait_channel = format!("/proc/{}/wchan", child.id());
+    wait_for("the aliased startup to wait for the update lock", Duration::from_secs(10), || {
+        assert!(child.try_wait().unwrap().is_none());
+        fs::read_to_string(&wait_channel).is_ok_and(|channel| channel.contains("lock_inode_wait"))
+    });
+    // The update lock is inherited across exec. The replacement must be able
+    // to reclaim the service lock before releasing the update lock.
+    let service = fs::File::open(executable_lock(installed, "service")).unwrap();
+    service.try_lock().unwrap();
+    drop(update);
+    wait_for("the aliased startup to reject the claimed service", Duration::from_secs(10), || {
+        child.try_wait().unwrap().is_some_and(|status| !status.success())
+    });
+    assert!(fs::read_to_string(log).unwrap().contains("another Warren service is using this executable"));
+}
+
+fn check_read_only_lock_storage(
+    dev: &Netns,
+    dir: &Path,
+    installed: &Path,
+    config: &Path,
+    reachable: impl Fn() -> bool,
+) {
+    let runtime = must(&["mktemp", "-d", "/run/warren-e2e-ro-XXXXXX"]);
+    let runtime = runtime.trim();
+    let mut daemon = dev.spawn(
+        &[
+            "unshare",
+            "--mount",
+            "sh",
+            "-ec",
+            "mount --bind /var/lib /var/lib; mount -o remount,bind,ro /var/lib; exec \"$@\"",
+            "warren-test",
+            installed.to_str().unwrap(),
+            "run",
+            "--config-dir",
+            config.to_str().unwrap(),
+            "--run-dir",
+            runtime,
+        ],
+        &dir.join("read-only-var-lib.log"),
+    );
+    let status = Path::new(runtime).join("status");
+    wait_for("an opt-out tunnel with read-only /var/lib", Duration::from_secs(30), || {
+        fs::read_to_string(&status).is_ok_and(|status| status.contains("state=connected")) && reachable()
+    });
+    daemon.terminate();
+    fs::remove_dir_all(runtime).unwrap();
+}
+
+fn check_read_only_startup(
+    dev: &Netns,
+    dir: &Path,
+    installed: &Path,
+    config: &Path,
+    second: &Path,
+    reachable: impl Fn() -> bool,
+) {
+    let bin_dir = dir.join("read-only-bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let exe = bin_dir.join("warren");
+    fs::copy(installed, &exe).unwrap();
+    let previous = fs::metadata(&exe).unwrap().ino();
+    let (request, _) = stage_agent_update(&exe, config, "9.0.0", |candidate| {
+        fs::write(candidate, "#!/bin/sh\nexit 77\n").unwrap();
+    });
+    let activation = exe.with_extension("update-activation");
+    let candidate = request.with_extension("update-candidate");
+    fs::rename(request, &activation).unwrap();
+    let _bin_mount = BindMount::read_only(&bin_dir);
+    let _config_mount = BindMount::read_only(config);
+    let bin_alias = dir.join("read-only-bin-alias");
+    fs::create_dir(&bin_alias).unwrap();
+    let _alias_mount = BindMount::new(&bin_dir, &bin_alias);
+    let aliased_exe = bin_alias.join("warren");
+    let exe = exe.to_str().unwrap();
+    let private = dir.join("private-runtime");
+    let alias = dir.join("runtime-alias");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&private, &alias).unwrap();
+    let mut daemon = dev.spawn(
+        &[exe, "run", "--config-dir", config.to_str().unwrap(), "--run-dir", alias.to_str().unwrap()],
+        &dir.join("read-only.log"),
+    );
+    wait_for("a tunnel with read-only executable and registration directories", Duration::from_secs(30), || {
+        reachable() && fs::read_to_string(private.join("status")).is_ok_and(|status| status.contains("state=connected"))
+    });
+    assert_status_permissions(&private, 0o700);
+    assert_recovered_worker(&daemon, previous);
+    assert!(activation.exists());
+    assert!(candidate.exists());
+    assert_eq!(executable_lock(Path::new(exe), "worker"), executable_lock(&aliased_exe, "worker"));
+    let worker_lock = fs::File::open(executable_lock(Path::new(exe), "worker")).unwrap();
+    assert!(matches!(worker_lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    let output =
+        dev.exec(&["timeout", "10", aliased_exe.to_str().unwrap(), "run", "--config-dir", second.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("another Warren service is using this executable"));
+    let output =
+        dev.exec(&["timeout", "10", installed.to_str().unwrap(), "run", "--config-dir", config.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("agent already running"));
+    assert!(reachable());
+    let redirected = dir.join("redirected-runtime");
+    fs::create_dir(&redirected).unwrap();
+    fs::write(redirected.join("status"), "unrelated").unwrap();
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&redirected, &alias).unwrap();
+    // ip netns exec gives the agent its own mount namespace.
+    let pid = daemon.0.as_ref().unwrap().id();
+    must(&[
+        "nsenter",
+        &format!("--mount=/proc/{pid}/ns/mnt"),
+        "mount",
+        "-o",
+        "remount,bind,rw",
+        bin_dir.to_str().unwrap(),
+    ]);
+    wait_for("deferred activation cleanup", Duration::from_secs(10), || !activation.exists() && !candidate.exists());
+    daemon.terminate();
+    assert!(!private.join("status").exists());
+    assert_eq!(fs::read_to_string(redirected.join("status")).unwrap(), "unrelated");
+    worker_lock.try_lock().unwrap();
+}
+
+fn check_revoked_read_only_startup(
+    dev: &Netns,
+    dir: &Path,
+    installed: &Path,
+    config: &Path,
+    reachable: impl Fn() -> bool,
+) {
+    let bin_dir = dir.join("revoked-bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let exe = bin_dir.join("warren");
+    fs::copy(installed, &exe).unwrap();
+    let previous = fs::metadata(&exe).unwrap().ino();
+    let invoked = config.join("revoked-invoked");
+    let policy = config.join("remote-updates");
+    let generation = "11111111111111111111111111111111:1";
+    fs::write(&policy, format!("on {generation}\n")).unwrap();
+    let (request, _) = publish_agent_update(&exe, config, "9.0.0", Some(generation), |candidate| {
+        fs::write(candidate, format!("#!/bin/sh\ntouch '{}'\nexit 77\n", invoked.display())).unwrap();
+    });
+    dev.must(&[exe.to_str().unwrap(), "update", "--config-dir", config.to_str().unwrap(), "--remote", "off"]);
+    assert_eq!(fs::read_to_string(&policy).unwrap(), "off 11111111111111111111111111111111:2\n");
+    let candidate = request.with_extension("update-candidate");
+    let mount = BindMount::read_only(&bin_dir);
+    let run = dir.join("revoked-run");
+    let args =
+        [exe.to_str().unwrap(), "run", "--config-dir", config.to_str().unwrap(), "--run-dir", run.to_str().unwrap()];
+    let connected =
+        || fs::read_to_string(run.join("status")).is_ok_and(|status| status.contains("state=connected")) && reachable();
+    let mut daemon = dev.spawn(&args, &dir.join("revoked.log"));
+    wait_for("the installed tunnel with a revoked update on read-only storage", Duration::from_secs(30), connected);
+    let pid = daemon.0.as_ref().unwrap().id();
+    assert_eq!(fs::metadata(format!("/proc/{pid}/exe")).unwrap().ino(), previous);
+    assert!(request.exists() && candidate.exists());
+    assert!(!invoked.exists());
+
+    daemon.terminate();
+    assert!(!run.join("status").exists());
+    drop(mount);
+    // Re-enable with the successor generation without consulting GitHub.
+    fs::write(policy, "on 11111111111111111111111111111111:3\n").unwrap();
+    let mut daemon = dev.spawn(&args, &dir.join("revoked-restart.log"));
+    wait_for("revoked update cleanup after a restart", Duration::from_secs(10), || {
+        !request.exists() && !candidate.exists()
+    });
+    wait_for("the installed tunnel after re-enabling remote updates", Duration::from_secs(30), connected);
+    assert!(!invoked.exists());
+    daemon.terminate();
+    assert!(!run.join("status").exists());
+}
+
+fn interrupt_activation(installed: &Path, config: &Path) -> u64 {
+    let previous = fs::metadata(installed).unwrap().ino();
+    let (request, candidate) = stage_agent_update(installed, config, warren_proto::VERSION, |path| {
+        fs::copy(installed, path).unwrap();
+        fs::OpenOptions::new().append(true).open(path).unwrap().write_all(b"interrupted activation").unwrap();
+    });
+    fs::rename(&request, installed.with_extension("update-activation")).unwrap();
+    fs::hard_link(installed, installed.with_extension("update-backup")).unwrap();
+    fs::rename(request.with_extension("update-candidate"), installed).unwrap();
+    assert_eq!(fs::metadata(installed).unwrap().ino(), candidate);
+    previous
+}
+
+struct FrozenWorker(u32);
+
+impl Drop for FrozenWorker {
+    fn drop(&mut self) {
+        // SAFETY: the worker is stopped and retains its PID.
+        unsafe { libc::kill(i32::try_from(self.0).unwrap(), libc::SIGCONT) };
+    }
+}
+
+fn check_orphaned_worker(dev: &Netns, daemon: &mut Guard, args: &[&str], run: &Path, log: &Path) {
+    let mut supervisor = daemon.0.take().unwrap();
+    let worker = service_child(supervisor.id()).unwrap();
+    must(&["kill", "-STOP", &worker.to_string()]);
+    let frozen = FrozenWorker(worker);
+    wait_for("the worker to stop", Duration::from_secs(5), || {
+        fs::read_to_string(format!("/proc/{worker}/status")).unwrap().contains("State:\tT")
+    });
+    supervisor.kill().unwrap();
+    supervisor.wait().unwrap();
+
+    *daemon = dev.spawn(args, log);
+    let pid = daemon.0.as_ref().unwrap().id();
+    let worker_lock = executable_lock(Path::new(args[0]), "worker");
+    let status = run.join("status");
+    wait_for("the next worker to reach startup", Duration::from_secs(5), || {
+        status.exists()
+            || service_child(pid).is_some_and(|worker| {
+                fs::read_dir(format!("/proc/{worker}/fd")).is_ok_and(|fds| {
+                    fds.flatten().any(|fd| fs::read_link(fd.path()).is_ok_and(|path| path == worker_lock))
+                })
+            })
+    });
+    assert!(!status.exists(), "the second worker started before the orphan could tear down");
+    drop(frozen);
+    wait_for("the next worker to connect after orphan teardown", Duration::from_secs(20), || {
+        fs::read_to_string(&status).is_ok_and(|value| value.contains("state=connected"))
+    });
 }
 
 fn check_audit(admin: &Client, bob: &Client) {

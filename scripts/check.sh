@@ -7,7 +7,13 @@ cd "$(dirname "$0")/.."
 
 step_format() { cargo fmt --all --check; }
 step_clippy() { cargo clippy --workspace --all-targets --locked -- -D warnings; }
-step_test() { cargo test --workspace --locked; }
+step_test() {
+    cargo test --workspace --locked
+    if [[ $(uname -s) == Linux && $EUID == 0 ]]; then
+        step_test_root
+    fi
+}
+step_test_root() { cargo test --locked -p warren-agent -- --ignored; }
 
 steps=("$@")
 [ ${#steps[@]} -eq 0 ] && steps=(format clippy test)

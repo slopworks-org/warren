@@ -27,5 +27,5 @@ acme_email = "admin@example.com"     # Let's Encrypt account contact
 # format = "text"                    # text | json
 
 # [update]
-# check = true                       # look for a new release on GitHub once a day
-# auto = false                       # install it, and update agents, without the buttons
+# check = true                       # check GitHub for release metadata for the Devices page
+# auto = false                       # let the operator enable unattended server updates via systemd

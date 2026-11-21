@@ -139,7 +139,7 @@ fn register_request(state: &AppState, ip: IpAddr, kv: &Kv, resumable: bool) -> R
         }
     };
     let field = |k| kv.get(k).unwrap_or_default().chars().take(64).collect::<String>();
-    if let Err(e) = state.db.device_report(id, &field("hostname"), &field("os"), &field("version")) {
+    if let Err(e) = state.db.device_report(id, &field("hostname"), &field("os"), &field("version"), None) {
         tracing::warn!(error = %e, "recording agent details");
     }
     if let Err(e) = state.rebuild() {
@@ -168,6 +168,8 @@ struct PollQuery {
     wait: u64,
     #[serde(default)]
     agent: String,
+    remote_updates: Option<u8>,
+    update_generation: Option<String>,
     #[serde(default)]
     os: String,
     #[serde(default)]
@@ -182,6 +184,27 @@ struct PollQuery {
     route_peers: u8,
     #[serde(default)]
     route_pages: bool,
+}
+
+impl PollQuery {
+    fn update_consent(&self) -> Option<(bool, Option<&str>)> {
+        let enabled = self.remote_updates? == 1;
+        match self.update_generation.as_deref() {
+            Some(generation) if enabled && valid_update_generation(generation) => Some((true, Some(generation))),
+            Some(_) => Some((false, None)),
+            None => Some((enabled, None)),
+        }
+    }
+}
+
+fn valid_update_generation(generation: &str) -> bool {
+    generation.split_once(':').is_some_and(|(epoch, counter)| {
+        epoch.len() == 32
+            && epoch.bytes().all(|b| b.is_ascii_hexdigit())
+            && counter.len() <= 20
+            && counter.bytes().all(|b| b.is_ascii_digit())
+            && counter.parse::<u64>().is_ok()
+    })
 }
 
 // Read outgoing pairs from the compiled hub ACL. Full-access and port-scoped
@@ -212,6 +235,18 @@ fn config_body(
     q: &PollQuery,
 ) -> (u64, String, Option<HeaderValue>) {
     let mut cfg = state.agent_config(snap, device);
+    if let Some((true, generation)) = q.update_consent() {
+        match state.db.agent_update_target(device.id, generation) {
+            Ok(Some(target)) if warren_proto::is_newer(&target, &q.agent) => {
+                cfg.update = target;
+                cfg.update_generation = generation.map(str::to_string);
+                cfg.version = 0;
+                cfg.version = fnv64(cfg.to_kv().encode().as_bytes()) >> 1;
+            }
+            Err(e) => tracing::warn!(error = %e, "reading agent update request"),
+            _ => {}
+        }
+    }
     let mut body = cfg.to_kv().encode();
     if q.route_pages || q.route_peers == 1 {
         // Reserve room for the new version (a positive 63-bit integer).
@@ -253,7 +288,7 @@ async fn config(
     drop(snap);
     if !q.agent.is_empty() {
         let clip = |s: &str| s.chars().take(64).collect::<String>();
-        state.record_agent_report(id, &clip(&q.hostname), &clip(&q.os), &clip(&q.agent));
+        state.record_agent_report(id, &clip(&q.hostname), &clip(&q.os), &clip(&q.agent), q.update_consent());
         // Legacy single-interface agents cannot safely accept asymmetric paths.
         state.record_lan(id, if q.mesh == 2 { LanReport::parse(&q.lan, q.port) } else { None });
     }
@@ -282,50 +317,11 @@ async fn config(
     text(StatusCode::NOT_MODIFIED, String::new())
 }
 
-#[derive(Deserialize)]
-struct BinaryQuery {
-    file: String,
-}
-
-/// Handles `GET /agent/v1/binary`: the agent build the device should update to.
-async fn binary(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(q): Query<BinaryQuery>,
-) -> Response<Body> {
-    let snap = state.snapshot();
-    let known = match peer.ip() {
-        IpAddr::V4(ip) => snap.device_by_ip.get(&ip).and_then(|id| snap.devices.get(id)).is_some_and(|d| d.enabled),
-        IpAddr::V6(_) => false,
-    };
-    if !known {
-        return error(StatusCode::FORBIDDEN, "unknown device");
-    }
-    if snap.agent_target.is_empty() {
-        return error(StatusCode::NOT_FOUND, "no agent update is scheduled");
-    }
-    let Some(file) = warren_proto::AGENT_ASSETS.iter().find(|a| **a == q.file) else {
-        return error(StatusCode::NOT_FOUND, "no such agent build");
-    };
-    match crate::update::agent_binary(&state, &snap.agent_target, file).await {
-        Ok(data) => {
-            let mut r = Response::new(Body::from(data));
-            r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-            r
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, file, "serving an agent build");
-            error(StatusCode::BAD_GATEWAY, "cannot download the agent build")
-        }
-    }
-}
-
 /// Router for the control listener.
 pub fn control_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route(warren_proto::CONFIG_PATH, get(config))
         .route("/agent/v1/routes", get(routes::continuation))
-        .route(warren_proto::BINARY_PATH, get(binary))
         .with_state(state)
 }
 
