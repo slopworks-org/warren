@@ -13,7 +13,52 @@ pub use error::Error;
 pub use kv::Kv;
 
 /// Version string reported by both binaries.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = match option_env!("WARREN_BUILD_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
+/// Rolling release containing the current main channel manifest.
+pub const MAIN_CHANNEL_TAG: &str = "channel-main";
+/// Manifest asset on the rolling main channel release.
+pub const MAIN_CHANNEL_MANIFEST: &str = "channel.kv";
+
+/// Source of executable updates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UpdateChannel {
+    /// Stable tagged releases.
+    #[default]
+    Release,
+    /// Published builds of commits to main.
+    Main,
+}
+
+impl UpdateChannel {
+    /// Name used in configuration and on the wire.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Main => "main",
+        }
+    }
+
+    /// Parses a channel name.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "release" => Some(Self::Release),
+            "main" => Some(Self::Main),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Plain-HTTP path the agent uses once, to register with a token.
 pub const REGISTER_PATH: &str = "/agent/v1/register";
@@ -87,10 +132,18 @@ fn version_parts(version: &str) -> Option<(VersionNumbers, Option<&str>)> {
         return None;
     }
     let numbers = core.strip_prefix('v').unwrap_or(core);
-    if !numbers.split('.').all(|part| !part.is_empty() && numeric(part) && !leading_zero(part)) {
+    Some((strict_core(numbers)?, pre))
+}
+
+fn decimal(s: &str) -> bool {
+    !s.is_empty() && !leading_zero(s) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn strict_core(s: &str) -> Option<VersionNumbers> {
+    if !s.split('.').all(decimal) {
         return None;
     }
-    Some((parse_version(core)?, pre))
+    parse_version(s)
 }
 
 fn leading_zero(part: &str) -> bool {
@@ -130,6 +183,66 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
                 _ => false,
             })
 }
+
+fn valid_sha(sha: &str) -> bool {
+    (7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Parses the base version, first-parent revision and abbreviated commit of a main build.
+#[must_use]
+pub fn parse_main_version(s: &str) -> Option<(VersionNumbers, u64, &str)> {
+    let (base, suffix) = s.split_once("-main.")?;
+    let (revision, sha) = suffix.split_once(".g")?;
+    if !decimal(revision) || revision == "0" || !valid_sha(sha) {
+        return None;
+    }
+    Some((strict_core(base)?, revision.parse().ok()?, sha))
+}
+
+/// Immutable build advertised by the main channel pointer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MainManifest {
+    /// Version embedded in the executables.
+    pub version: String,
+    /// Immutable release tag derived from the version.
+    pub tag: String,
+    /// Source commit, when supplied.
+    pub commit: Option<String>,
+}
+
+/// Reads a main channel manifest and verifies its release tag and optional commit.
+#[must_use]
+pub fn parse_main_manifest(text: &str) -> Option<MainManifest> {
+    let kv = Kv::parse(text).ok()?;
+    if ["version", "tag", "commit"].iter().any(|key| kv.get_all(key).nth(1).is_some()) {
+        return None;
+    }
+    let version = kv.get("version")?;
+    let (_, rev, sha) = parse_main_version(version)?;
+    let tag = kv.get("tag")?;
+    let commit = kv.get("commit");
+    if tag != format!("main-{rev}-g{sha}") || commit.is_some_and(|s| !valid_sha(s) || !s.starts_with(sha)) {
+        return None;
+    }
+    Some(MainManifest { version: version.into(), tag: tag.into(), commit: commit.map(str::to_string) })
+}
+
+/// Whether a candidate on the selected channel can replace the current version.
+#[must_use]
+pub fn is_update_available(channel: UpdateChannel, candidate: &str, current: &str) -> bool {
+    match channel {
+        UpdateChannel::Release => parse_version(candidate).is_some() && is_newer(candidate, current),
+        UpdateChannel::Main => {
+            let Some((base, rev, _)) = parse_main_version(candidate) else { return false };
+            if let Some((current, revision, _)) = parse_main_version(current) {
+                (base, rev) > (current, revision)
+            } else {
+                parse_version(current).or_else(|| version_parts(current).map(|(v, _)| v)).is_some_and(|v| base >= v)
+            }
+        }
+    }
+}
+
 /// TCP port of the control channel on the server's tunnel address.
 pub const DEFAULT_CTL_PORT: u16 = 7180;
 /// Default UDP port of the WireGuard hub.
@@ -321,6 +434,65 @@ mod tests {
         assert!(is_newer("0.5.0-rc.alpha", "0.5.0-rc.1"));
         assert!(!is_newer("0.5.0+build.2", "0.5.0+build.1"));
         assert!(!valid_version("0.5.0-rc.01"));
+    }
+
+    #[test]
+    fn main_versions_and_channel_transitions() {
+        use UpdateChannel::{Main, Release};
+        let build = "0.4.0-main.65.g0012345";
+        assert_eq!(parse_main_version(build), Some(((0, 4, 0), 65, "0012345")));
+        assert!(valid_version(build));
+        for invalid in ["v0.4.0", "0.04.0", "0.4", "0.4.0.1", "+0.4.0"] {
+            assert!(parse_main_version(&format!("{invalid}-main.65.g0012345")).is_none());
+        }
+        for suffix in [
+            "0.g0012345",
+            "01.g0012345",
+            "+1.g0012345",
+            "18446744073709551616.g0012345",
+            "1.0012345",
+            "1.g123456",
+            "1.g123456A",
+            "1.g123456z",
+            "1.g1234567+meta",
+            "1.g01234567890123456789012345678901234567890",
+        ] {
+            assert!(parse_main_version(&format!("0.4.0-main.{suffix}")).is_none());
+        }
+        for current in ["0.4.0", "0.4.0-rc.5", "0.3.9", "0.3.9-main.100.gabcdefa", "0.4.0-main.64.gabcdefa"] {
+            assert!(is_update_available(Main, build, current), "{current}");
+        }
+        for current in [build, "0.4.0-main.65.gabcdefa", "0.4.0-main.66.gabcdefa", "0.5.0", "0.5.0-rc.1", "bad"] {
+            assert!(!is_update_available(Main, build, current), "{current}");
+        }
+        assert!(is_update_available(Release, "0.4.0", build));
+        assert!(!is_update_available(Release, "0.3.9", build));
+        assert!(!is_update_available(Release, build, "0.3.9"));
+        assert!(!is_update_available(Main, "0.4.0", build));
+        assert!(!is_update_available(Main, "invalid", "0.3.9"));
+    }
+
+    #[test]
+    fn manifest_fields_identify_the_same_build() {
+        let manifest = "version=0.4.0-main.65.g0012345\ntag=main-65-g0012345\n";
+        assert_eq!(parse_main_manifest(manifest).unwrap().commit, None);
+        assert_eq!(
+            parse_main_manifest(&format!("{manifest}commit=0012345abc")).unwrap().commit.as_deref(),
+            Some("0012345abc")
+        );
+        for invalid in [
+            manifest.replace("tag=", "other="),
+            manifest.replace("version=", "other="),
+            manifest.replace("tag=main-65", "tag=main-66"),
+            manifest.replace("tag=main", "tag=../main"),
+            manifest.replace("65.g", "065.g"),
+            format!("{manifest}commit=abc1234"),
+            format!("{manifest}commit=0012345A"),
+            format!("{manifest}tag=main-65-g0012345"),
+            format!("{manifest}bad line"),
+        ] {
+            assert!(parse_main_manifest(&invalid).is_none(), "{invalid}");
+        }
     }
 
     #[test]
