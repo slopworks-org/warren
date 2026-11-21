@@ -6,6 +6,7 @@
   <key>Label</key>
   <string>org.slopworks.warren</string>
   <key>ProgramArguments</key>
+  <!-- Use the binary's default run directory, shared with warren status. -->
   <array>
     <string>/usr/local/bin/warren</string>
     <string>run</string>

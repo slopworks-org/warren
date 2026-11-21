@@ -9,7 +9,6 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE: usize = 256 * 1024;
-const MAX_DOWNLOAD: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reads wake up this often to notice a stop signal promptly.
 const READ_SLICE: Duration = Duration::from_secs(1);
@@ -33,11 +32,6 @@ pub fn request(
 ) -> io::Result<Response> {
     let (status, body) = exchange(addr, host, method, path, body, timeout, MAX_RESPONSE)?;
     Ok(Response { status, body: String::from_utf8_lossy(&body).into_owned() })
-}
-
-/// GETs a binary body of up to 16 MiB.
-pub fn download(addr: &str, path: &str, timeout: Duration) -> io::Result<(u16, Vec<u8>)> {
-    exchange(addr, addr, "GET", path, None, timeout, MAX_DOWNLOAD)
 }
 
 fn exchange(

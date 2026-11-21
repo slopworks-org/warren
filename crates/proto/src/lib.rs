@@ -19,8 +19,24 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REGISTER_PATH: &str = "/agent/v1/register";
 /// Control-channel path, served only on the server's tunnel address.
 pub const CONFIG_PATH: &str = "/agent/v1/config";
-/// Control-channel path of agent binaries: `?file=<one of AGENT_ASSETS>`.
-pub const BINARY_PATH: &str = "/agent/v1/binary";
+/// Official release repository, where the agent gets executable updates.
+pub const RELEASE_REPO: &str = "slopworks-org/warren";
+
+/// Hex-encoded SHA-256 of a release asset.
+#[must_use]
+pub fn asset_sha256(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    codec::hex_encode(&Sha256::digest(data))
+}
+
+/// The expected SHA-256 of a file named in a release's SHA256SUMS.
+#[must_use]
+pub fn asset_checksum<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
+    sums.lines().find_map(|l| {
+        let (hash, name) = l.split_once(char::is_whitespace)?;
+        (name.trim_start().trim_start_matches('*') == file).then_some(hash)
+    })
+}
 /// Release file names of the agent builds.
 pub const AGENT_ASSETS: &[&str] = &[
     "warren-linux-aarch64",
@@ -51,13 +67,68 @@ pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(v)
 }
 
-/// Whether `candidate` is a later version than `current`.
+/// Whether this is a valid release or prerelease version.
+#[must_use]
+pub fn valid_version(version: &str) -> bool {
+    version_parts(version).is_some()
+}
+
+type VersionNumbers = (u64, u64, u64);
+
+fn version_parts(version: &str) -> Option<(VersionNumbers, Option<&str>)> {
+    let valid = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let numeric = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    let (version, build) = version.split_once('+').map_or((version, None), |(v, b)| (v, Some(b)));
+    if build.is_some_and(|b| !b.split('.').all(valid)) {
+        return None;
+    }
+    let (core, pre) = version.split_once('-').map_or((version, None), |(v, p)| (v, Some(p)));
+    if pre.is_some_and(|p| !p.split('.').all(|part| valid(part) && !(numeric(part) && leading_zero(part)))) {
+        return None;
+    }
+    let numbers = core.strip_prefix('v').unwrap_or(core);
+    if !numbers.split('.').all(|part| !part.is_empty() && numeric(part) && !leading_zero(part)) {
+        return None;
+    }
+    Some((parse_version(core)?, pre))
+}
+
+fn leading_zero(part: &str) -> bool {
+    part.len() > 1 && part.starts_with('0')
+}
+
+fn compare_prereleases(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut right = right.split('.');
+    for a in left.split('.') {
+        let Some(b) = right.next() else { return Ordering::Greater };
+        let numeric = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        let order = match (numeric(a), numeric(b)) {
+            (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => a.cmp(b),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    if right.next().is_some() { Ordering::Less } else { Ordering::Equal }
+}
+
+/// Whether `candidate` has higher `SemVer` precedence than `current`.
 #[must_use]
 pub fn is_newer(candidate: &str, current: &str) -> bool {
-    match (parse_version(candidate), parse_version(current)) {
-        (Some(c), Some(cur)) => c > cur,
-        _ => false,
-    }
+    let (Some((candidate, a)), Some((current, b))) = (version_parts(candidate), version_parts(current)) else {
+        return false;
+    };
+    candidate > current
+        || (candidate == current
+            && match (a, b) {
+                (None, Some(_)) => true,
+                (Some(a), Some(b)) => compare_prereleases(a, b).is_gt(),
+                _ => false,
+            })
 }
 /// TCP port of the control channel on the server's tunnel address.
 pub const DEFAULT_CTL_PORT: u16 = 7180;
@@ -127,8 +198,11 @@ pub struct AgentConfig {
     /// address to it only while the direct path works, and through the server
     /// otherwise.
     pub lan_peers: Vec<PeerConfig>,
-    /// Agent version to update to from [`BINARY_PATH`]; empty for none.
+    /// Requested agent version, empty when there is no dashboard request.
+    /// This is a hint. The agent's local policy and official release decide what runs.
     pub update: String,
+    /// Consent generation attached to the dashboard request, when supported.
+    pub update_generation: Option<String>,
 }
 
 impl AgentConfig {
@@ -156,6 +230,9 @@ impl AgentConfig {
         }
         if !self.update.is_empty() {
             kv.push("update", &self.update);
+            if let Some(generation) = &self.update_generation {
+                kv.push("update_generation", generation);
+            }
         }
     }
 
@@ -174,6 +251,7 @@ impl AgentConfig {
             peers: peers("peer")?,
             lan_peers: peers("lan_peer_v2")?,
             update: kv.get("update").unwrap_or_default().to_string(),
+            update_generation: kv.get("update_generation").map(str::to_string),
         })
     }
 }
@@ -203,6 +281,7 @@ mod tests {
                 keepalive: LAN_KEEPALIVE,
             }],
             update: String::new(),
+            update_generation: None,
         };
         let text = cfg.to_kv().encode();
         assert!(!text.contains("update"));
@@ -212,6 +291,8 @@ mod tests {
         assert_eq!(AgentConfig::from_kv(&Kv::parse(&legacy).unwrap()).unwrap().lan_peers, []);
         let with_update = AgentConfig { update: "0.2.0".into(), ..cfg.clone() };
         assert_eq!(AgentConfig::from_kv(&with_update.to_kv()).unwrap(), with_update);
+        let numbered = AgentConfig { update_generation: Some("epoch:1".into()), ..with_update };
+        assert_eq!(AgentConfig::from_kv(&numbered.to_kv()).unwrap(), numbered);
         let mut kv = Kv::parse(&text).unwrap();
         kv.push("peer", "notakey - x 1");
         assert_eq!(AgentConfig::from_kv(&kv), Err(Error::BadField("peer")));
@@ -233,6 +314,13 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.0.9", "0.1.0"));
         assert!(!is_newer("garbage", "0.1.0"));
+        assert!(is_newer("0.5.0", "0.5.0-rc.1"));
+        assert!(!is_newer("0.5.0-rc.1", "0.5.0"));
+        assert!(is_newer("0.5.0-rc.10", "0.5.0-rc.2"));
+        assert!(is_newer("0.5.0-rc.1", "0.5.0-rc"));
+        assert!(is_newer("0.5.0-rc.alpha", "0.5.0-rc.1"));
+        assert!(!is_newer("0.5.0+build.2", "0.5.0+build.1"));
+        assert!(!valid_version("0.5.0-rc.01"));
     }
 
     #[test]

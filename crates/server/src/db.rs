@@ -8,7 +8,7 @@
 use crate::access::Grant;
 use crate::acl::{PortSpec, Subject};
 use crate::util::now;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -27,6 +27,13 @@ pub enum DbError {
     /// A stored value could not be decoded.
     #[error("corrupt value in column {0}")]
     Corrupt(&'static str),
+}
+
+/// Outcome of requesting an update for an opted-in device.
+pub(crate) enum UpdateRequest {
+    Queued,
+    AlreadyQueued,
+    DeviceChanged,
 }
 
 /// Result of a storage operation.
@@ -90,6 +97,12 @@ CREATE TABLE IF NOT EXISTS devices (
     os TEXT NOT NULL DEFAULT '',
     agent_version TEXT NOT NULL DEFAULT '',
     last_seen_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS device_updates (
+    device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    allowed INTEGER NOT NULL,
+    target TEXT,
+    generation TEXT
 );
 CREATE TABLE IF NOT EXISTS reg_tokens (
     id TEXT PRIMARY KEY,
@@ -281,6 +294,12 @@ pub struct Device {
     pub os: String,
     /// Reported by the agent.
     pub agent_version: String,
+    /// Reported local update policy. Absent for agents without this feature.
+    pub remote_updates: Option<bool>,
+    /// Requested release, until the agent reports it or disables updates.
+    pub update_target: Option<String>,
+    #[serde(skip)]
+    pub(crate) update_generation: Option<String>,
     /// Last WireGuard handshake or control-channel contact.
     pub last_seen_at: Option<i64>,
 }
@@ -522,7 +541,10 @@ fn session_row(r: &Row<'_>) -> rusqlite::Result<Session> {
 const SESSION_COLS: &str = "id, user_id, csrf, mfa_passed, created_at, expires_at, last_seen_at, ip, user_agent";
 
 const DEVICE_COLS: &str =
-    "id, user_id, name, public_key, address, kind, enabled, created_at, hostname, os, agent_version, last_seen_at";
+    "id, user_id, name, public_key, address, kind, enabled, created_at, hostname, os, agent_version, last_seen_at,
+     (SELECT allowed FROM device_updates WHERE device_id = devices.id),
+     (SELECT target FROM device_updates WHERE device_id = devices.id),
+     (SELECT generation FROM device_updates WHERE device_id = devices.id)";
 
 fn device_row(r: &Row<'_>) -> DbResult<Device> {
     let address: String = r.get(4)?;
@@ -540,6 +562,9 @@ fn device_row(r: &Row<'_>) -> DbResult<Device> {
         os: r.get(9)?,
         agent_version: r.get(10)?,
         last_seen_at: r.get(11)?,
+        remote_updates: r.get(12)?,
+        update_target: r.get(13)?,
+        update_generation: r.get(14)?,
     })
 }
 
@@ -598,14 +623,24 @@ impl Db {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> DbResult<Db> {
+    fn init(mut conn: Connection) -> DbResult<Db> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Keep the page cache small: this runs on 512 MB VPSes.
         conn.pragma_update(None, "cache_size", -2000)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(SCHEMA)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(SCHEMA)?;
+        let has_generation = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('device_updates') WHERE name = 'generation')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_generation {
+            tx.execute("ALTER TABLE device_updates ADD COLUMN generation TEXT", [])?;
+        }
+        tx.commit()?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -940,12 +975,91 @@ impl Db {
     ///
     /// # Errors
     /// On database failure.
-    pub fn device_report(&self, id: i64, hostname: &str, os: &str, version: &str) -> DbResult<()> {
-        self.c().execute(
+    pub fn device_report(
+        &self,
+        id: i64,
+        hostname: &str,
+        os: &str,
+        version: &str,
+        remote_updates: Option<(bool, Option<&str>)>,
+    ) -> DbResult<()> {
+        let mut conn = self.c();
+        let tx = conn.transaction()?;
+        if tx.execute(
             "UPDATE devices SET hostname = ?1, os = ?2, agent_version = ?3, last_seen_at = ?4 WHERE id = ?5",
             params![hostname, os, version, now(), id],
-        )?;
+        )? == 0
+        {
+            return Ok(());
+        }
+        if let Some((allowed, generation)) = remote_updates {
+            // A queued target belongs to this row's consent generation.
+            // SQLite IS treats two missing generations as equal for legacy agents.
+            tx.execute(
+                "INSERT INTO device_updates (device_id, allowed, generation) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(device_id) DO UPDATE SET allowed = ?2, generation = ?3,
+                 target = CASE WHEN ?2 AND generation IS ?3 THEN target ELSE NULL END",
+                params![id, allowed, generation],
+            )?;
+            if let Some(target) = Self::read_update_target(&tx, id, generation)?
+                && warren_proto::valid_version(version)
+                && !warren_proto::is_newer(&target, version)
+            {
+                tx.execute("UPDATE device_updates SET target = NULL WHERE device_id = ?1", [id])?;
+            }
+        } else {
+            tx.execute("DELETE FROM device_updates WHERE device_id = ?1", [id])?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    fn read_update_target(conn: &Connection, id: i64, generation: Option<&str>) -> DbResult<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT target FROM device_updates
+                 WHERE device_id = ?1 AND allowed AND generation IS ?2 AND target IS NOT NULL",
+                params![id, generation],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The release requested for an opted-in device.
+    ///
+    /// # Errors
+    /// On database failure.
+    pub fn agent_update_target(&self, id: i64, generation: Option<&str>) -> DbResult<Option<String>> {
+        Self::read_update_target(&self.c(), id, generation)
+    }
+
+    /// Queues a release if the device still reports the version and consent seen by the caller.
+    ///
+    /// # Errors
+    /// On database failure.
+    pub(crate) fn request_agent_update(&self, device: &Device, target: &str) -> DbResult<UpdateRequest> {
+        let id = device.id;
+        let mut conn = self.c();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let queued = tx
+            .query_row(
+                "SELECT u.target FROM device_updates u JOIN devices d ON d.id = u.device_id
+                 WHERE d.id = ?1 AND d.enabled AND d.kind = 'agent' AND d.agent_version = ?2 AND u.allowed
+                 AND u.generation IS ?3",
+                params![id, device.agent_version, device.update_generation],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let outcome = match queued {
+            Some(existing) if existing.as_deref() == Some(target) => UpdateRequest::AlreadyQueued,
+            Some(_) => {
+                tx.execute("UPDATE device_updates SET target = ?2 WHERE device_id = ?1", params![id, target])?;
+                UpdateRequest::Queued
+            }
+            None => UpdateRequest::DeviceChanged,
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Records a sighting (handshake).
@@ -1376,26 +1490,6 @@ impl Db {
             Some(v) => serde_json::from_str(&v).map_err(|_| DbError::Corrupt("settings")),
             None => Ok(Settings::default()),
         }
-    }
-
-    /// A value stored next to the settings, e.g. `agent_target`.
-    ///
-    /// # Errors
-    /// On database failure.
-    pub fn value(&self, key: &str) -> DbResult<Option<String>> {
-        Ok(self.c().query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?)
-    }
-
-    /// Stores a value next to the settings.
-    ///
-    /// # Errors
-    /// On database failure.
-    pub fn set_value(&self, key: &str, value: &str) -> DbResult<()> {
-        self.c().execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-            [key, value],
-        )?;
-        Ok(())
     }
 
     /// Replaces the settings.
