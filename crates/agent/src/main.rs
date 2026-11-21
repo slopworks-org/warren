@@ -88,7 +88,7 @@ fn main() -> ExitCode {
             status::status(&args);
             Ok(())
         }
-        Command::Update { check, remote } => selfupdate::run(&args.paths, check, remote),
+        Command::Update { check, remote, channel } => selfupdate::run(&args.paths, check, remote, channel),
         Command::Down => status::down(&args),
         Command::Version => {
             println!("warren {}", warren_proto::VERSION);

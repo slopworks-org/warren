@@ -3,6 +3,7 @@
 use crate::error::{Error, Result};
 use crate::state::{DEFAULT_CONFIG_DIR, DEFAULT_INTERFACE, DEFAULT_RUN_DIR, Paths};
 use std::path::PathBuf;
+use warren_proto::UpdateChannel;
 
 pub const HELP: &str = "\
 warren — Warren agent
@@ -11,7 +12,11 @@ USAGE:
     warren up --server <URL> --token <TOKEN> [--name <NAME>] [--interface <IFACE>] [--force]
     warren run                 keep the tunnel up (run this as a service)
     warren status              show the agent version and connection state
-    warren update [--check]    install or check for the latest official release
+    warren update              install the latest build on the configured channel
+    warren update --check [--channel <release|main>]
+                               check a channel without changing settings
+    warren update --channel <release|main> [--remote <on|off>]
+                               select the update channel (default release)
     warren update --remote <on|off>
                                allow automatic and dashboard-requested updates (default off)
     warren down [--forget]     remove the interface; --forget also deletes the registration
@@ -37,7 +42,7 @@ pub enum Command {
     Up,
     Run,
     Status,
-    Update { check: bool, remote: Option<bool> },
+    Update { check: bool, remote: Option<bool>, channel: Option<UpdateChannel> },
     Down,
     Version,
     Help,
@@ -64,7 +69,7 @@ impl Args {
             Some("up") => Command::Up,
             Some("run") => Command::Run,
             Some("status") => Command::Status,
-            Some("update") => Command::Update { check: false, remote: None },
+            Some("update") => Command::Update { check: false, remote: None, channel: None },
             Some("down") => Command::Down,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") | None => Command::Help,
@@ -100,11 +105,20 @@ impl Args {
                     return Err(Error::Usage(format!("{flag} takes no value")));
                 }
                 "--check" if inline.is_none() => match &mut args.command {
-                    Command::Update { check, remote: None } => *check = true,
+                    Command::Update { check, remote: None, .. } => *check = true,
                     _ => return Err(Error::Usage("--check is only for `warren update` without --remote".into())),
                 },
+                "--channel" => match &mut args.command {
+                    Command::Update { channel, .. } => {
+                        *channel = Some(
+                            UpdateChannel::parse(&value()?)
+                                .ok_or_else(|| Error::Usage("--channel needs release or main".into()))?,
+                        );
+                    }
+                    _ => return Err(Error::Usage("--channel is only for `warren update`".into())),
+                },
                 "--remote" => match &mut args.command {
-                    Command::Update { check: false, remote } => {
+                    Command::Update { check: false, remote, .. } => {
                         *remote = Some(match value()?.as_str() {
                             "on" => true,
                             "off" => false,
@@ -146,6 +160,27 @@ mod tests {
         assert_eq!(a.name.as_deref(), Some("box"));
         assert_eq!(a.paths.config_dir, PathBuf::from("/tmp/w"));
         assert_eq!(a.interface, "warren0");
+    }
+
+    #[test]
+    fn parses_update_channels() {
+        assert_eq!(
+            parse("update --check --channel main").unwrap().command,
+            Command::Update { check: true, remote: None, channel: Some(UpdateChannel::Main) }
+        );
+        assert_eq!(
+            parse("update --remote off --channel=release").unwrap().command,
+            Command::Update { check: false, remote: Some(false), channel: Some(UpdateChannel::Release) }
+        );
+        for invalid in [
+            "update --channel",
+            "update --channel nightly",
+            "status --channel main",
+            "update --check --remote on",
+            "update --remote off --check",
+        ] {
+            assert!(parse(invalid).is_err());
+        }
     }
 
     #[test]

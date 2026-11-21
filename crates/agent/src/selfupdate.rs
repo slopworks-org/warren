@@ -16,7 +16,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use warren_proto::{RELEASE_REPO, VERSION, is_newer};
+use warren_proto::{
+    MAIN_CHANNEL_MANIFEST, MAIN_CHANNEL_TAG, RELEASE_REPO, UpdateChannel, VERSION, is_update_available,
+};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTPS_HELP: &str = "install curl and the system CA certificates (OpenWrt packages: curl and ca-bundle), then check HTTPS access to github.com";
@@ -65,40 +67,59 @@ fn release_tag(url: &str) -> Option<String> {
     (version == format!("{major}.{minor}.{patch}")).then(|| version.to_string())
 }
 
-pub fn latest(timeout: Duration) -> Result<String> {
-    release_version(lookup_curl(timeout)?)
+pub struct Release {
+    pub version: String,
+    pub tag: String,
 }
 
-fn trusted_latest() -> Result<String> {
-    release_version(curl(CHECK_TIMEOUT)?)
+pub fn latest(channel: UpdateChannel, timeout: Duration) -> Result<Release> {
+    release_version(channel, lookup_curl(timeout)?)
 }
 
-fn release_version(mut cmd: Command) -> Result<String> {
+fn trusted_latest(channel: UpdateChannel) -> Result<Release> {
+    release_version(channel, curl(CHECK_TIMEOUT)?)
+}
+
+fn release_version(channel: UpdateChannel, mut cmd: Command) -> Result<Release> {
+    if channel == UpdateChannel::Main {
+        let url =
+            format!("https://github.com/{RELEASE_REPO}/releases/download/{MAIN_CHANNEL_TAG}/{MAIN_CHANNEL_MANIFEST}");
+        let body = fetch(
+            cmd.args(["--location", "--max-redirs", "5", "--max-filesize", "4096", &url]),
+            "checking the main channel",
+        )?;
+        let manifest = std::str::from_utf8(&body)
+            .ok()
+            .and_then(warren_proto::parse_main_manifest)
+            .ok_or_else(|| Error::io("checking the main channel")(io::Error::other("invalid main channel manifest")))?;
+        return Ok(Release { version: manifest.version, tag: manifest.tag });
+    }
     let url = format!("https://github.com/{RELEASE_REPO}/releases/latest");
     let output = fetch(
         cmd.args(["--head", "--output", "/dev/null", "--write-out", "%{redirect_url}", &url]),
         "checking for an official release",
     )?;
-    release_tag(&String::from_utf8_lossy(&output)).ok_or_else(|| {
+    let version = release_tag(&String::from_utf8_lossy(&output)).ok_or_else(|| {
         Error::io("checking for an official release")(io::Error::other("GitHub did not return a stable release tag"))
-    })
+    })?;
+    Ok(Release { tag: format!("v{version}"), version })
 }
 
-fn asset(version: &str, file: &str, max_bytes: &str) -> Result<Vec<u8>> {
-    let url = format!("https://github.com/{RELEASE_REPO}/releases/download/v{version}/{file}");
+fn asset(tag: &str, file: &str, max_bytes: &str) -> Result<Vec<u8>> {
+    let url = format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{file}");
     fetch(
         curl(Duration::from_secs(60))?.args(["--location", "--max-redirs", "5", "--max-filesize", max_bytes, &url]),
         &format!("downloading {file}"),
     )
 }
 
-fn verified_binary(version: &str) -> Result<Vec<u8>> {
+fn verified_binary(tag: &str) -> Result<Vec<u8>> {
     let file = warren_proto::agent_asset()
         .ok_or_else(|| Error::io("finding an agent build")(io::Error::other("unsupported platform")))?;
     // Both verification inputs come from trusted system curl running as the
     // updater. A sudo caller's account cannot trace these downloads.
-    let sums = asset(version, "SHA256SUMS", "65536")?;
-    let binary = asset(version, file, "16777216")?;
+    let sums = asset(tag, "SHA256SUMS", "65536")?;
+    let binary = asset(tag, file, "16777216")?;
     let sums = String::from_utf8_lossy(&sums);
     if !warren_proto::asset_checksum(&sums, file)
         .is_some_and(|want| warren_proto::asset_sha256(&binary).eq_ignore_ascii_case(want))
@@ -191,7 +212,7 @@ fn write_consent(dir: &File, enabled: bool) -> Result<String> {
     }
     .encode();
     let mode = if enabled { "on" } else { "off" };
-    state::write_private_at(dir, POLICY_NAME, format!("{mode} {generation}\n").as_bytes())?;
+    state::write_at(dir, POLICY_NAME, format!("{mode} {generation}\n").as_bytes(), 0o600)?;
     Ok(generation)
 }
 
@@ -247,15 +268,40 @@ pub fn policy_lock_path(dir: &File) -> Result<PathBuf> {
     Ok(runtime_dir()?.join(format!("{}-{}.policy", meta.dev(), meta.ino())))
 }
 
+const CHANNEL_NAME: &CStr = c"update-channel";
+
+fn read_channel(dir: &File) -> Option<UpdateChannel> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let file = state::open_at(dir, CHANNEL_NAME, flags, 0).ok()?;
+    check_root_file(&file).ok()?;
+    let mut text = String::new();
+    file.take(9).read_to_string(&mut text).ok()?;
+    UpdateChannel::parse(text.strip_suffix('\n').unwrap_or(&text))
+}
+
+pub fn update_channel(paths: &Paths) -> UpdateChannel {
+    open_policy_dir(paths, false).ok().and_then(|dir| read_channel(&dir)).unwrap_or_default()
+}
+
+pub fn set_channel(paths: &Paths, channel: UpdateChannel) -> Result<()> {
+    let policy = Policy::lock(paths, true)?;
+    // Rotate before publishing the channel so an interrupted write still revokes old requests.
+    if read_consent(&policy.dir).map_err(Error::io("reading remote update consent"))?.is_some_and(|c| c.enabled) {
+        write_consent(&policy.dir, true)?;
+    }
+    state::write_at(&policy.dir, CHANNEL_NAME, format!("{channel}\n").as_bytes(), 0o644)
+}
+
 pub fn set_remote(paths: &Paths, enabled: bool) -> Result<()> {
+    let policy = Policy::lock(paths, true)?;
     if enabled {
         let config_dir = protected_dir(&paths.config_dir, true)?;
         let installation = Installation::current(&config_dir)?;
         drop(try_lock(&installation.update_lock)?);
-        trusted_latest()
+        trusted_latest(read_channel(&policy.dir).unwrap_or_default())
             .map_err(|e| Error::io("enabling remote updates")(io::Error::other(format!("{e}; {HTTPS_HELP}"))))?;
     }
-    Policy::lock(paths, true)?.set_enabled(enabled)
+    policy.set_enabled(enabled)
 }
 
 pub struct Forget<'a> {
@@ -289,7 +335,11 @@ impl<'a> Forget<'a> {
         } else if unlink_entry(&self.dir, POLICY_NAME).map_err(failed)? {
             self.dir.sync_all().map_err(failed)?;
         }
-        for (name, path) in [(c"agent.conf", self.paths.config()), (c"private.key", self.paths.key())] {
+        for (name, path) in [
+            (c"agent.conf", self.paths.config()),
+            (c"private.key", self.paths.key()),
+            (CHANNEL_NAME, self.paths.config_dir.join("update-channel")),
+        ] {
             if unlink_entry(&self.dir, name).map_err(Error::io(format!("deleting {}", path.display())))? {
                 println!("Deleted {}.", path.display());
             }
@@ -323,6 +373,7 @@ enum Install {
 fn install(
     install: &Installation,
     paths: &Paths,
+    channel: UpdateChannel,
     version: &str,
     consent: Option<&str>,
     download: impl FnOnce() -> Result<Vec<u8>>,
@@ -335,7 +386,7 @@ fn install(
         return Err(Error::io("installing the update")(io::Error::other("another update is pending")));
     }
     let current = reported_version(&install.exe)?;
-    if !is_newer(version, &current) {
+    if !is_update_available(channel, version, &current) {
         return Ok(Install::Unchanged);
     }
     if !install.service_state()? && consent.is_some() {
@@ -403,7 +454,7 @@ fn reported_version(bin: &Path) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let mut bytes = [0; 128];
+    let mut bytes = [0; 256];
     let read = output.read(&mut bytes).map_err(failed())?;
     String::from_utf8_lossy(&bytes[..read])
         .trim()
@@ -420,15 +471,23 @@ pub fn check_version(bin: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run(paths: &Paths, check: bool, remote: Option<bool>) -> Result<()> {
+pub fn run(paths: &Paths, check: bool, remote: Option<bool>, channel: Option<UpdateChannel>) -> Result<()> {
+    if !check && let Some(channel) = channel {
+        set_channel(paths, channel)?;
+        println!("Update channel: {channel}");
+        if remote.is_none() {
+            return Ok(());
+        }
+    }
     if let Some(enabled) = remote {
         set_remote(paths, enabled)?;
         println!("Automatic and dashboard updates: {}", if enabled { "on" } else { "off" });
         return Ok(());
     }
-    println!("Checking for Warren updates...");
-    let version = if check { latest(CHECK_TIMEOUT)? } else { trusted_latest()? };
-    if !is_newer(&version, VERSION) {
+    let channel = channel.unwrap_or_else(|| update_channel(paths));
+    println!("Checking for Warren updates (channel: {channel})...");
+    let Release { version, tag } = if check { latest(channel, CHECK_TIMEOUT)? } else { trusted_latest(channel)? };
+    if !is_update_available(channel, &version, VERSION) {
         println!("v{VERSION}, already up to date");
     } else if check {
         println!("v{VERSION} (v{version} available)");
@@ -436,7 +495,7 @@ pub fn run(paths: &Paths, check: bool, remote: Option<bool>) -> Result<()> {
         let config_dir = protected_dir(&paths.config_dir, true)?;
         let installation = Installation::current(&config_dir)?;
         println!("Downloading and verifying Warren v{version}...");
-        match install(&installation, paths, &version, None, || verified_binary(&version))? {
+        match install(&installation, paths, channel, &version, None, || verified_binary(&tag))? {
             Install::Unchanged => {
                 println!("v{}, already up to date", reported_version(&installation.exe)?);
                 return Ok(());
@@ -455,13 +514,17 @@ pub fn run(paths: &Paths, check: bool, remote: Option<bool>) -> Result<()> {
 }
 
 pub fn auto_update(installation: &Installation, paths: &Paths, generation: &str) -> Result<()> {
-    if remote_generation(paths).as_deref() != Some(generation) {
-        return Ok(());
-    }
-    let version = trusted_latest()?;
-    if is_newer(&version, VERSION) {
+    let channel = {
+        let policy = Policy::lock(paths, false)?;
+        if !policy.authorizes(Some(generation)) {
+            return Ok(());
+        }
+        read_channel(&policy.dir).unwrap_or_default()
+    };
+    let Release { version, tag } = trusted_latest(channel)?;
+    if is_update_available(channel, &version, VERSION) {
         crate::log!(Info, "downloading the official agent release", version = version);
-        install(installation, paths, &version, Some(generation), || verified_binary(&version))?;
+        install(installation, paths, channel, &version, Some(generation), || verified_binary(&tag))?;
     }
     Ok(())
 }
@@ -492,7 +555,7 @@ mod tests {
         assert!(remote_enabled(&paths));
 
         let generation = remote_generation(&paths).unwrap();
-        let result = install(installation, &paths, "9.0.0", Some(&generation), || {
+        let result = install(installation, &paths, UpdateChannel::Release, "9.0.0", Some(&generation), || {
             set_remote(&paths, false)?;
             Policy::lock(&paths, false)?.set_enabled(true)?;
             Ok(br#"#!/bin/sh
@@ -505,10 +568,29 @@ echo warren 9.0.0
         assert!(matches!(result, Ok(Install::Unchanged)));
         assert!(!installation.candidate.with_extension("update-candidate.invoked").exists());
         assert!(!installation.request.exists() && !installation.candidate.exists());
-        let result = install(installation, &paths, "9.0.0", Some(&generation), || {
+        let result = install(installation, &paths, UpdateChannel::Release, "9.0.0", Some(&generation), || {
             panic!("a request from a revoked generation cannot download")
         });
         assert!(matches!(result, Ok(Install::Unchanged)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root-owned update fixtures"]
+    fn channel_changes_persist_and_revoke_remote_requests() {
+        let fixture = update_service::tests::Fixture::new();
+        let paths = fixture.paths();
+        let file = paths.config_dir.join("update-channel");
+        assert_eq!(update_channel(&paths), UpdateChannel::Release);
+        let previous = write_consent(&open_policy_dir(&paths, false).unwrap(), true).unwrap();
+        set_channel(&paths, UpdateChannel::Main).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"main\n");
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(update_channel(&paths), UpdateChannel::Main);
+        assert_ne!(remote_generation(&paths).unwrap(), previous);
+        Forget::open(&paths).unwrap().unwrap().revoke().unwrap();
+        assert!(!file.exists());
+        assert_eq!(update_channel(&paths), UpdateChannel::Release);
     }
 
     #[cfg(target_os = "linux")]
@@ -540,7 +622,7 @@ echo warren 9.0.0
         let fixture = Fixture::new();
         let installation = &fixture.install;
         let previous = Binary::record(&installation.exe, None).unwrap();
-        let result = install(installation, &fixture.paths(), "9.0.0", None, || {
+        let result = install(installation, &fixture.paths(), UpdateChannel::Release, "9.0.0", None, || {
             Ok(br#"#!/bin/sh
 case "$1" in
     version) : > "$0.checked"; echo warren 9.0.0 ;;
@@ -564,13 +646,18 @@ esac
         let fixture = update_service::tests::Fixture::new();
         let paths = fixture.paths();
         let installation = &fixture.install;
-        let result = install(installation, &paths, "9.0.0", None, || {
+        let result = install(installation, &paths, UpdateChannel::Release, "9.0.0", None, || {
             state::store_key(&paths.key(), &[0; 32])?;
             Ok(b"candidate".to_vec())
         });
         assert!(result.is_err());
         assert!(!installation.request.exists() && !installation.candidate.exists());
-        assert!(install(installation, &paths, "9.0.0", None, || panic!("an invalid key cannot stage")).is_err());
+        assert!(
+            install(installation, &paths, UpdateChannel::Release, "9.0.0", None, || panic!(
+                "an invalid key cannot stage"
+            ))
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -587,7 +674,9 @@ esac
         let second = Installation::open(&first.exe, &paths.config_dir).unwrap();
         let _service = fixture.claim();
 
-        let result = install(&second, &paths, "9.0.0", None, || panic!("a second registration cannot download"));
+        let result = install(&second, &paths, UpdateChannel::Release, "9.0.0", None, || {
+            panic!("a second registration cannot download")
+        });
         assert!(result.err().unwrap().to_string().contains("in use by another Warren registration"));
         assert!(!second.request.exists() && !second.candidate.exists());
         assert_eq!(reported_version(&first.exe).unwrap(), "1.0.0");

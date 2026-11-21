@@ -34,11 +34,13 @@ fn bytes(n: u64) -> String {
 }
 
 pub fn status(args: &Args) {
-    let available = crate::selfupdate::latest(Duration::from_secs(3))
+    let channel = crate::selfupdate::update_channel(&args.paths);
+    let available = crate::selfupdate::latest(channel, Duration::from_secs(3))
         .ok()
-        .filter(|version| warren_proto::is_newer(version, warren_proto::VERSION))
-        .map_or_else(String::new, |version| format!(" (v{version} available)"));
+        .filter(|release| warren_proto::is_update_available(channel, &release.version, warren_proto::VERSION))
+        .map_or_else(String::new, |release| format!(" (v{} available)", release.version));
     println!("Version:    v{}{available}", warren_proto::VERSION);
+    println!("Channel:    {channel}");
     if let Ok(saved) = Saved::load(&args.paths.config()) {
         println!(
             "Automatic and dashboard updates: {}",
