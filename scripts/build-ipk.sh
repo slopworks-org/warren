@@ -5,7 +5,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 pkg_arch="${1:-aarch64_cortex-a53}"
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+version="${WARREN_BUILD_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
 scripts/build-agent.sh aarch64 >/dev/null
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
