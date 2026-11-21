@@ -22,10 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
-pub use warren_proto::{is_newer, parse_version};
+use warren_proto::{RELEASE_REPO, asset_checksum, asset_sha256, is_newer, parse_version};
 
-/// The GitHub repository releases come from.
-pub const REPO: &str = "slopworks-org/warren";
 const CHECK_INTERVAL: Duration = Duration::from_hours(24);
 const RETRY_INTERVAL: Duration = Duration::from_hours(1);
 const MAX_REDIRECTS: usize = 5;
@@ -149,12 +147,12 @@ impl Fetcher {
         Err("too many redirects".into())
     }
 
-    /// The latest release of [`REPO`].
+    /// The latest release of [`RELEASE_REPO`].
     ///
     /// # Errors
     /// When GitHub cannot be reached or answers with something else.
     pub async fn latest(&self) -> Result<Release, UpdateError> {
-        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let url = format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest");
         let body = self.get(&url, 1 << 20, Duration::from_secs(30)).await?;
         let r: GithubRelease = serde_json::from_slice(&body).map_err(|e| UpdateError::Release(e.to_string()))?;
         if parse_version(&r.tag_name).is_none() {
@@ -206,17 +204,7 @@ fn server_asset() -> Option<&'static str> {
 /// The download URL of a release file.
 #[must_use]
 pub fn asset_url(tag: &str, file: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/{tag}/{file}")
-}
-
-/// The SHA-256 of `file` in a `SHA256SUMS` listing.
-#[must_use]
-pub fn checksum<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
-    sums.lines().find_map(|l| {
-        let (hash, name) = l.split_once(char::is_whitespace)?;
-        let name = name.trim_start();
-        (name.strip_prefix('*').unwrap_or(name) == file).then_some(hash)
-    })
+    format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{file}")
 }
 
 /// Where the downloaded binary waits for `apply-update`.
@@ -233,9 +221,10 @@ impl Fetcher {
     pub async fn release_file(&self, tag: &str, file: &str) -> Result<Bytes, UpdateError> {
         let sums = self.get(&asset_url(tag, "SHA256SUMS"), 64 * 1024, Duration::from_secs(30)).await?;
         let sums = String::from_utf8_lossy(&sums);
-        let want = checksum(&sums, file).ok_or_else(|| UpdateError::Release(format!("SHA256SUMS lists no {file}")))?;
+        let want =
+            asset_checksum(&sums, file).ok_or_else(|| UpdateError::Release(format!("SHA256SUMS lists no {file}")))?;
         let data = self.get(&asset_url(tag, file), 64 << 20, Duration::from_mins(5)).await?;
-        if !crate::util::sha256_hex(&data).eq_ignore_ascii_case(want) {
+        if !asset_sha256(&data).eq_ignore_ascii_case(want) {
             return Err(UpdateError::Checksum(file.into()));
         }
         Ok(data)
@@ -253,28 +242,6 @@ fn store_executable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)
-}
-
-/// An agent build of `version`, from `<data_dir>/agents` or else from GitHub.
-///
-/// # Errors
-/// When the file is not cached and cannot be downloaded.
-pub async fn agent_binary(state: &AppState, version: &str, file: &str) -> Result<Bytes, UpdateError> {
-    let root = state.config.data_dir.join("agents");
-    let path = root.join(version).join(file);
-    let _guard = state.agent_download.lock().await;
-    if let Ok(data) = std::fs::read(&path) {
-        return Ok(data.into());
-    }
-    let data = Fetcher::new()?.release_file(&format!("v{version}"), file).await?;
-    if let Ok(dirs) = std::fs::read_dir(&root) {
-        for d in dirs.flatten().filter(|d| d.file_name() != version) {
-            let _ = std::fs::remove_dir_all(d.path());
-        }
-    }
-    store_executable(&path, &data).map_err(UpdateError::Store)?;
-    tracing::info!(version, file, "downloaded agent build");
-    Ok(data)
 }
 
 static UPDATING: AtomicBool = AtomicBool::new(false);
@@ -389,9 +356,9 @@ mod tests {
     #[test]
     fn checksums() {
         let sums = "aa11  warren-server-linux-amd64\nbb22 *warren-linux-armv7\n";
-        assert_eq!(checksum(sums, "warren-server-linux-amd64"), Some("aa11"));
-        assert_eq!(checksum(sums, "warren-linux-armv7"), Some("bb22"));
-        assert_eq!(checksum(sums, "warren-server"), None);
+        assert_eq!(asset_checksum(sums, "warren-server-linux-amd64"), Some("aa11"));
+        assert_eq!(asset_checksum(sums, "warren-linux-armv7"), Some("bb22"));
+        assert_eq!(asset_checksum(sums, "warren-server"), None);
     }
 
     #[test]

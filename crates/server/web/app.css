@@ -99,6 +99,8 @@ th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--li
 th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
 tr:last-child td { border-bottom: 0; }
 td .sub { color: var(--muted); font-size: 13px; }
+.device-update { min-width: 8.5rem; }
+.device-update > :not(:first-child) { margin-top: 4px; }
 .table-wrap { overflow-x: auto; }
 
 .actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }

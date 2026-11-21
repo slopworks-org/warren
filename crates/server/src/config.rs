@@ -160,7 +160,7 @@ impl Default for LogConfig {
 pub struct UpdateConfig {
     /// Look for a new release on GitHub once a day.
     pub check: bool,
-    /// Install a new release without waiting for an administrator.
+    /// Install a new server release unattended.
     pub auto: bool,
 }
 

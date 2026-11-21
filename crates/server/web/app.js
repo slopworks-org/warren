@@ -200,44 +200,7 @@ function shell(active, content) {
   const banner = me.must_setup_2fa
     ? h('div', { class: 'notice warn', text: 'The administrator requires two-factor authentication. Set it up below to use Warren.' })
     : null;
-  root.replaceChildren(top, h('div', { class: 'layout' }, nav, h('main', {}, banner, updateNotice(), content)));
-}
-
-function olderThan(a, b) {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] < pb[i];
-  return false;
-}
-
-function updateNotice() {
-  if (!server || !server.update || !can('settings.manage')) return null;
-  const action = server.self_update
-    ? h('button', { class: 'small primary', text: 'Update now', onclick: (ev) => updateServer(ev.target) })
-    : h('span', { text: ' To upgrade, run install.sh on the server again.' });
-  return h('div', { class: 'notice' }, 'Warren ' + server.update.version + ' is available; this server runs ' + server.version + '. ',
-    h('a', { href: server.update.url, target: '_blank', rel: 'noopener', text: 'Release notes' }), ' ', action);
-}
-
-async function updateServer(button) {
-  button.disabled = true;
-  button.textContent = 'Downloading…';
-  const r = await attempt(() => api('POST', '/server/update'));
-  if (!r) {
-    button.disabled = false;
-    button.textContent = 'Update now';
-    return;
-  }
-  button.textContent = 'Restarting…';
-  for (let i = 0; i < 60; i++) {
-    await new Promise((done) => setTimeout(done, 2000));
-    const s = await api('GET', '/server').catch(() => null);
-    if (s && s.version === r.version) {
-      location.reload();
-      return;
-    }
-  }
-  button.textContent = 'The server did not come back; check journalctl -u warren-server';
+  root.replaceChildren(top, h('div', { class: 'layout' }, nav, h('main', {}, banner, content)));
 }
 
 async function loadMe() {
@@ -381,41 +344,52 @@ function ownerSelect(users) {
 
 async function devicesPage(el) {
   const list = h('div', { class: 'panel' });
-  const agents = h('div');
   el.append(h('div', { class: 'head' },
     h('div', {}, h('h1', { text: 'Devices' }), h('p', { class: 'lead', text: 'Machines connected to your Warren network.' })),
-    h('button', { class: 'primary', text: 'Add device', onclick: () => addDeviceDialog(load) })), agents, list);
+    h('button', { class: 'primary', text: 'Add device', onclick: () => addDeviceDialog(load) })), list);
 
-  function agentNotice(devices) {
-    const old = devices.filter((d) => d.kind === 'agent' && d.agent_version && olderThan(d.agent_version, server.version));
-    if (!old.length || !can('settings.manage')) return null;
-    const pending = server.agent_target === server.version;
-    return h('div', { class: 'notice' },
-      old.length + (old.length === 1 ? ' agent runs' : ' agents run') + ' an older version than the server (' + server.version + '). ',
-      pending ? 'They update when they next connect.' : h('button', { class: 'small primary', text: 'Update agents', onclick: async () => {
-        if (await attempt(() => api('POST', '/agents/update'))) {
-          server.agent_target = server.version;
-          toast('Agents update to ' + server.version);
-          load();
-        }
-      } }));
+  function updates(d) {
+    if (d.kind !== 'agent') return h('td');
+    const current = d.agent_version.replace(/^v/, '');
+    const summary = d.agent_outdated ? h('span', { class: 'badge warn', text: 'v' + d.agent_latest_version + ' available' })
+      : d.agent_latest_version ? h('span', { class: 'sub', text: 'Up to date' }) : null;
+    let detail;
+    if (d.update_target) {
+      const text = !d.enabled ? 'Queued until enabled' : d.online ? 'Update requested' : 'Queued until online';
+      detail = h('div', { class: 'sub', text });
+    } else if (d.agent_outdated && d.remote_updates && d.enabled) {
+      detail = h('button', { class: 'small', text: 'Update', onclick: async (ev) => {
+        const button = ev.currentTarget;
+        button.disabled = true;
+        button.textContent = 'Requesting…';
+        const result = await attempt(() => api('POST', '/devices/' + d.id + '/update'));
+        button.textContent = 'Update';
+        button.disabled = false;
+        if (result) await load();
+      } });
+    } else if (!d.remote_updates) {
+      detail = h('div', { class: 'sub' }, d.os.startsWith('android-') ? 'Update the app on the device.'
+        : d.remote_updates === null ? 'Updates are managed on the device. Run the installer to upgrade.'
+        : ['Managed on the device. Run ', h('code', { text: 'warren update' }), '.']);
+    }
+    return h('td', { class: 'device-update' }, h('div', { text: current ? 'v' + current : 'Version unknown' }), summary, detail);
   }
 
   async function load() {
     const devices = await attempt(() => api('GET', '/devices'));
     if (!devices) return;
-    agents.replaceChildren(server ? agentNotice(devices) || '' : '');
     if (!devices.length) {
       list.replaceChildren(h('div', { class: 'empty', text: 'No devices yet. Add one to get started.' }));
       return;
     }
     const showOwner = can('devices.all');
     list.replaceChildren(h('div', { class: 'table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, h('th', { text: 'Device' }), h('th', { text: 'Status' }), h('th', { text: 'Address' }),
+      h('thead', {}, h('tr', {}, h('th', { text: 'Device' }), h('th', { text: 'Updates' }), h('th', { text: 'Status' }), h('th', { text: 'Address' }),
         h('th', { class: 'hide-sm', text: 'Last handshake' }), h('th', { class: 'hide-sm', text: 'Traffic' }),
         showOwner ? h('th', { class: 'hide-sm', text: 'Owner' }) : null, h('th'))),
       h('tbody', {}, devices.map((d) => h('tr', {},
-        h('td', {}, h('div', { text: d.name }), h('div', { class: 'sub', text: [d.kind === 'agent' ? 'agent' : 'WireGuard config', d.os, d.agent_version && 'v' + d.agent_version].filter(Boolean).join(' · ') })),
+        h('td', {}, h('div', { text: d.name }), h('div', { class: 'sub', text: [d.kind === 'agent' ? 'agent' : 'WireGuard config', d.os].filter(Boolean).join(' · ') })),
+        updates(d),
         h('td', {}, !d.enabled ? h('span', { class: 'badge warn', text: 'Disabled' })
           : d.online ? h('span', { class: 'badge ok', text: 'Online' }) : h('span', { class: 'badge bad', text: 'Offline' })),
         h('td', { class: 'mono', text: d.address }),
@@ -772,7 +746,7 @@ async function settingsPage(el) {
 
   const acl = h('div', { class: 'panel' });
   const info = server ? h('div', { class: 'panel pad' }, h('dl', { class: 'kv' },
-    [['Version', server.version + (server.update ? ' (' + server.update.version + ' is available)' : '')], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
+    [['Version', server.version], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
       ['WireGuard endpoint', server.wg_endpoint], ['Tunnel network', server.network + ' (server ' + server.server_ip + ')'],
       ['Server public key', server.public_key], ['Tunnel backend', server.backend], ['TLS', server.tls_mode]]
       .map(([k, v]) => [h('dt', { text: k }), h('dd', { class: k.includes('key') ? 'mono' : null, text: v })]))) : null;

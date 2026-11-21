@@ -5,8 +5,9 @@
 
 use crate::cli::Args;
 use crate::error::{Error, Result};
-use crate::state::{self, Saved};
+use crate::state::{self, Paths, Saved, StatusFile};
 use crate::up::{hostname, os_tag};
+use crate::update_service::{self, Installation};
 use crate::{http, lan, log, selfupdate, stopping, tunnel};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -19,8 +20,8 @@ const MAX_BACKOFF: u64 = 60;
 /// A long-poll that returns sooner than this was not held by the server
 /// (e.g. a misbehaving proxy); pausing keeps the loop from spinning.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// A failed update to the same version is tried again after this long.
-const UPDATE_RETRY: Duration = Duration::from_secs(3600);
+const AUTO_CHECK_INTERVAL: Duration = Duration::from_hours(24);
+const UPDATE_RETRY: Duration = Duration::from_hours(1);
 
 /// Sleeps in one-second steps so a stop signal is noticed promptly.
 fn sleep(secs: u64) {
@@ -59,13 +60,15 @@ fn lan_query(saved: &Saved) -> String {
     format!("&lan={}&port={port}&mesh=2", percent_encode(&addrs.join(",")))
 }
 
-fn poll(saved: &Saved, wait: u64) -> Result<Poll> {
+fn poll(saved: &Saved, wait: u64, generation: Option<&str>) -> Result<Poll> {
+    let consent = generation.map_or_else(String::new, |g| format!("&update_generation={}", percent_encode(g)));
     let path = format!(
-        "{CONFIG_PATH}?v={}&wait={wait}&agent={}&os={}&hostname={}{}",
+        "{CONFIG_PATH}?v={}&wait={wait}&agent={}&os={}&hostname={}&remote_updates={}{consent}{}",
         saved.tunnel.version,
         warren_proto::VERSION,
         percent_encode(&os_tag()),
         percent_encode(&hostname()),
+        u8::from(generation.is_some()),
         lan_query(saved),
     );
     let control = &saved.tunnel.control;
@@ -88,15 +91,19 @@ struct Status {
     last_error: String,
 }
 
-fn write_status(args: &Args, saved: &Saved, st: &Status) {
+fn write_status(status: Option<&mut StatusFile>, saved: &Saved, st: &Status) {
+    let Some(status) = status else { return };
     let mut kv = Kv::new();
     kv.push("updated", log::now().to_string());
     kv.push("state", st.state);
     kv.push("last_contact", st.last_contact.to_string());
     kv.push("config_version", saved.tunnel.version.to_string());
     kv.push("pid", std::process::id().to_string());
+    kv.push("agent_version", warren_proto::VERSION);
+    #[cfg(target_os = "macos")]
+    kv.push("boot_id", status.boot_id());
     kv.push("last_error", &st.last_error);
-    if let Err(e) = state::write_public(&args.paths.status(), kv.encode().as_bytes()) {
+    if let Err(e) = status.write_public(kv.encode().as_bytes()) {
         log!(Debug, "cannot write status file", error = e);
     }
 }
@@ -124,21 +131,64 @@ fn apply_new_config(args: &Args, saved: &mut Saved, cfg: AgentConfig, key: &[u8;
     }
 }
 
-pub fn run(args: &Args) -> Result<()> {
+struct UpdateSchedule {
+    last_check: Option<(Instant, Duration)>,
+    last_request: String,
+}
+
+impl UpdateSchedule {
+    fn new(cooldown: Option<String>) -> Self {
+        Self {
+            last_check: cooldown.as_ref().map(|_| (Instant::now(), UPDATE_RETRY)),
+            last_request: cooldown.unwrap_or_default(),
+        }
+    }
+
+    fn due(&self, target: &str, now: Instant) -> bool {
+        let requested = target != self.last_request && warren_proto::is_newer(target, warren_proto::VERSION);
+        self.last_check
+            .is_none_or(|(at, interval)| now.duration_since(at) >= if requested { UPDATE_RETRY } else { interval })
+    }
+
+    fn check(&mut self, install: &Installation, paths: &Paths, generation: &str, config: &AgentConfig) -> Result<()> {
+        let target = update_hint(config, generation);
+        if !self.due(target, Instant::now()) {
+            return Ok(());
+        }
+        self.last_request = target.to_string();
+        let result = selfupdate::auto_update(install, paths, generation);
+        let interval = if result.is_ok() { AUTO_CHECK_INTERVAL } else { UPDATE_RETRY };
+        self.last_check = Some((Instant::now(), interval));
+        result
+    }
+}
+
+fn update_hint<'a>(config: &'a AgentConfig, generation: &str) -> &'a str {
+    if config.update_generation.as_deref() == Some(generation) { &config.update } else { "" }
+}
+
+pub fn run(args: &Args, install: Option<&Installation>, mut trial: bool, cooldown: Option<String>) -> Result<()> {
     let mut saved = Saved::load(&args.paths.config())?;
     let key = state::load_key(&args.paths.key())?;
     log!(Info, "starting", version = warren_proto::VERSION, iface = saved.interface, device = saved.tunnel.name);
 
     tunnel::remove_direct(&saved.interface)?;
     lan::spawn_watcher();
+    let mut status = StatusFile::open(&args.paths.run_dir)
+        .inspect_err(|e| log!(Debug, "cannot open the status directory", error = e))
+        .ok();
     let mut st = Status { state: "starting", last_contact: 0, last_error: String::new() };
     let mut applied = false;
     let mut backoff = 0;
     let mut last_refresh: Option<Instant> = None;
-    let mut failed_update: Option<(String, Instant)> = None;
+    let mut updates = UpdateSchedule::new(cooldown);
+    if !trial {
+        write_status(status.as_mut(), &saved, &st);
+    }
     // The first poll returns at once, so `warren status` shows the
     // connection right after start instead of after the first long-poll.
     let mut first = true;
+    let mut trial_result = Ok(());
 
     while !stopping() {
         // (Re)create the interface if it is missing, e.g. after `ifdown`.
@@ -150,12 +200,22 @@ pub fn run(args: &Args) -> Result<()> {
                 Ok(()) => {
                     applied = true;
                     log!(Info, "tunnel configured", address = saved.tunnel.address);
+                    if trial {
+                        trial_result = update_service::acknowledge_ready();
+                        if trial_result.is_err() {
+                            break;
+                        }
+                        trial = false;
+                    }
                 }
                 Err(e) => {
                     log!(Error, "cannot configure tunnel", error = e);
+                    if trial {
+                        return Err(e);
+                    }
                     st.state = "error";
                     st.last_error = e.to_string();
-                    write_status(args, &saved, &st);
+                    write_status(status.as_mut(), &saved, &st);
                     sleep(30);
                     continue;
                 }
@@ -165,7 +225,8 @@ pub fn run(args: &Args) -> Result<()> {
         let wait = if backoff == 0 && !first { LONG_POLL_SECS } else { 0 };
         first = false;
         let started = Instant::now();
-        match poll(&saved, wait) {
+        let generation = install.and_then(|_| selfupdate::remote_generation(&args.paths));
+        match poll(&saved, wait, generation.as_deref()) {
             Ok(result) => {
                 backoff = 0;
                 st.state = "connected";
@@ -176,15 +237,6 @@ pub fn run(args: &Args) -> Result<()> {
                 } else if wait > 0 && started.elapsed() < MIN_POLL_INTERVAL {
                     sleep(MIN_POLL_INTERVAL.as_secs());
                 }
-                let target = &saved.tunnel.update;
-                let retry = failed_update.as_ref().is_none_or(|(v, at)| v != target || at.elapsed() > UPDATE_RETRY);
-                if warren_proto::is_newer(target, warren_proto::VERSION) && retry {
-                    log!(Info, "updating the agent", version = target);
-                    let e = selfupdate::update(&saved.tunnel.control, target);
-                    log!(Error, "cannot update the agent", error = e);
-                    st.last_error = format!("cannot update to {target}: {e}");
-                    failed_update = Some((target.clone(), Instant::now()));
-                }
             }
             Err(_) if stopping() => break,
             Err(e) => {
@@ -193,6 +245,15 @@ pub fn run(args: &Args) -> Result<()> {
                 st.last_error = e.to_string();
                 log!(Warn, "control channel unavailable", error = e, retry_in = backoff);
             }
+        }
+
+        if let Some(install) = install
+            && !stopping()
+            && let Some(generation) = generation.as_deref()
+            && let Err(e) = updates.check(install, &args.paths, generation, &saved.tunnel)
+        {
+            log!(Warn, "cannot update the agent", error = e);
+            st.last_error = format!("cannot update the agent: {e}");
         }
 
         if let Ok(dev) = wg::get_device(&saved.interface) {
@@ -205,7 +266,7 @@ pub fn run(args: &Args) -> Result<()> {
                 }
             }
         }
-        write_status(args, &saved, &st);
+        write_status(status.as_mut(), &saved, &st);
         sleep(backoff);
     }
 
@@ -213,16 +274,48 @@ pub fn run(args: &Args) -> Result<()> {
     if wg::link_index(&saved.interface).is_some() {
         wg::delete_link(&saved.interface)?;
     }
-    tunnel::remove_direct(&saved.interface)?;
-    let _ = std::fs::remove_file(args.paths.status());
-    Ok(())
+    tunnel::remove_direct(&saved.interface).and(trial_result)
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn dashboard_hints_require_the_current_consent_generation() {
+        let mut config = super::AgentConfig { update: "9.0.0".into(), ..Default::default() };
+        assert_eq!(super::update_hint(&config, "epoch:1"), "");
+        config.update_generation = Some("epoch:1".into());
+        assert_eq!(super::update_hint(&config, "epoch:1"), "9.0.0");
+        assert_eq!(super::update_hint(&config, "epoch:3"), "");
+    }
+
+    #[test]
     fn percent_encoding() {
         assert_eq!(super::percent_encode("a b/ü"), "a%20b%2F%C3%BC");
         assert_eq!(super::percent_encode("linux-aarch64"), "linux-aarch64");
+    }
+    #[test]
+    fn changing_server_hints_cannot_skip_the_minimum_update_interval() {
+        use super::{AUTO_CHECK_INTERVAL, Duration, Instant, UPDATE_RETRY, UpdateSchedule};
+
+        let last = Instant::now();
+        let schedule = UpdateSchedule { last_check: Some((last, AUTO_CHECK_INTERVAL)), last_request: "9.0.0".into() };
+        assert!(!schedule.due("9.0.1", last + Duration::from_secs(1)));
+        assert!(!schedule.due("9.0.2", last + Duration::from_secs(UPDATE_RETRY.as_secs() - 1)));
+        assert!(schedule.due("9.0.2", last + UPDATE_RETRY));
+        assert!(!schedule.due("9.0.0", last + UPDATE_RETRY));
+        assert!(schedule.due("9.0.0", last + AUTO_CHECK_INTERVAL));
+    }
+
+    #[test]
+    fn interrupted_release_waits_for_the_retry_interval() {
+        use super::{Duration, UPDATE_RETRY, UpdateSchedule};
+
+        let schedule = UpdateSchedule::new(Some("9.0.0".into()));
+        let (last, _) = schedule.last_check.unwrap();
+        assert_eq!(schedule.last_request, "9.0.0");
+        for target in ["", "9.0.0", "9.0.1"] {
+            assert!(!schedule.due(target, last + Duration::from_secs(UPDATE_RETRY.as_secs() - 1)));
+            assert!(schedule.due(target, last + UPDATE_RETRY));
+        }
     }
 }
