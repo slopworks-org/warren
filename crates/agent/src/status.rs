@@ -191,10 +191,11 @@ mod tests {
     #[test]
     #[ignore = "requires root-owned update fixtures"]
     fn forget_uses_the_policy_lock_and_unlinks_entries_through_a_directory_alias() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
         let fixture = crate::update_service::tests::Fixture::new();
-        let suffix = warren_proto::codec::hex_encode(&crate::state::random_bytes::<8>().unwrap());
-        let alias = std::env::temp_dir().join(format!("warren-forget-{suffix}"));
-        std::os::unix::fs::symlink(&fixture.dir, &alias).unwrap();
+        let alias = fixture.dir.join("alias");
+        symlink(&fixture.dir, &alias).unwrap();
         let args = Args::parse(
             ["down", "--forget", "--interface", "wf-forget-alias", "--config-dir", alias.to_str().unwrap()]
                 .into_iter()
@@ -204,19 +205,28 @@ mod tests {
 
         let paths = fixture.paths();
         let dir = std::fs::File::open(&fixture.dir).unwrap();
-        let lock = crate::selfupdate::policy_lock_path(&dir).unwrap();
-        std::fs::create_dir(&lock).unwrap();
+        let lock_path = crate::selfupdate::policy_lock_path(&dir).unwrap();
+        let lock = crate::update_files::open_lock(&lock_path).unwrap();
         std::fs::write(paths.config(), "test config").unwrap();
         std::fs::write(paths.update_policy(), "on\n").unwrap();
         let target_key = fixture.dir.join("untouched");
         std::fs::write(&target_key, "test key").unwrap();
         std::fs::remove_file(paths.key()).unwrap();
-        std::os::unix::fs::symlink(&target_key, paths.key()).unwrap();
+        symlink(&target_key, paths.key()).unwrap();
 
-        assert!(down(&args).is_err());
+        // A reused directory inode can already have a policy lock file.
+        let permissions = lock.metadata().unwrap().permissions();
+        lock.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o020)).unwrap();
+        let result = down(&args);
+        lock.set_permissions(permissions).unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::Io { what, source })
+                if what == format!("opening lock {}", lock_path.display())
+                    && source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
         assert!(paths.config().exists() && paths.key().exists());
         assert_eq!(std::fs::read_to_string(paths.update_policy()).unwrap(), "on\n");
-        std::fs::remove_dir(lock).unwrap();
 
         // A revocation failure must also leave the credentials alone.
         std::fs::remove_file(paths.update_policy()).unwrap();
@@ -226,9 +236,7 @@ mod tests {
         std::fs::remove_dir(paths.update_policy()).unwrap();
         std::fs::write(paths.update_policy(), "on\n").unwrap();
 
-        let result = down(&args);
-        std::fs::remove_file(alias).unwrap();
-        result.unwrap();
+        down(&args).unwrap();
         assert!(!paths.update_policy().exists() && !paths.config().exists());
         assert!(std::fs::symlink_metadata(paths.key()).is_err());
         assert_eq!(std::fs::read_to_string(&target_key).unwrap(), "test key");
