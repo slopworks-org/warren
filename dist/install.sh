@@ -7,13 +7,15 @@
 # On OpenWrt, which has no curl by default: wget -qO- …/install.sh | sh -s -- agent …
 # Run it again to upgrade a server or an older agent; config and registration are kept.
 # For agents that support it, use warren update. Pass --remote on to opt in locally.
+# Select commit builds with --channel main or WARREN_CHANNEL=main (default: release).
+# The main channel installer is at releases/download/channel-main/install.sh.
 # WARREN_VERSION=v0.2.0 (or --version) pins a release instead of the latest;
 # WARREN_BASE_URL takes the files from elsewhere, e.g. a mirror or a test server.
 set -eu
 
 repo=slopworks-org/warren
-usage="usage: install.sh server --domain <domain> --email <email> [--version <tag>]
-       install.sh agent [--server <url> --token <token> [--name <name>]] [--remote <on|off>] [--version <tag>]"
+usage="usage: install.sh server --domain <domain> --email <email> [--channel <release|main> | --version <tag>]
+       install.sh agent [--server <url> --token <token> [--name <name>]] [--remote <on|off>] [--channel <release|main> | --version <tag>]"
 
 die() { echo "warren install: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
@@ -21,6 +23,9 @@ say() { echo "==> $*"; }
 mode=${1:-}
 [ $# -gt 0 ] && shift
 version=${WARREN_VERSION:-latest}
+version_set=${WARREN_VERSION:+1}
+channel=${WARREN_CHANNEL-release}
+channel_set=${WARREN_CHANNEL+1}
 domain='' email='' server='' token='' name='' remote=''
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || die "$1 needs a value"
@@ -30,7 +35,8 @@ while [ $# -gt 0 ]; do
     --server) server=$2 ;;
     --token) token=$2 ;;
     --name) name=$2 ;;
-    --version) version=$2 ;;
+    --version) version=$2; version_set=1 ;;
+    --channel) channel=$2; channel_set=1 ;;
     --remote)
       [ "$mode" = agent ] || die "--remote is only for agent installs"
       case "$2" in on | off) remote=$2 ;; *) die "--remote needs on or off" ;; esac ;;
@@ -43,6 +49,11 @@ case "$mode" in
   server | agent) ;;
   *) die "$usage" ;;
 esac
+case "$channel" in
+  release | main) ;;
+  *) die "--channel needs release or main" ;;
+esac
+[ -z "$channel_set" ] || [ -z "$version_set" ] || die "--channel and --version cannot be combined"
 os=$(uname -s)
 case "$os-$mode" in
   Linux-* | Darwin-agent) ;;
@@ -50,14 +61,6 @@ case "$os-$mode" in
   *) die "Warren runs on Linux and macOS only" ;;
 esac
 [ "$(id -u)" -eq 0 ] || die "run as root (pipe to 'sudo sh -s -- …')"
-
-if [ -n "${WARREN_BASE_URL:-}" ]; then
-  base=$WARREN_BASE_URL
-elif [ "$version" = latest ]; then
-  base="https://github.com/$repo/releases/latest/download"
-else
-  base="https://github.com/$repo/releases/download/$version"
-fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -71,6 +74,26 @@ fetch() { # <url> <file>
     die "need curl or wget"
   fi
 }
+
+if [ -n "${WARREN_BASE_URL:-}" ]; then
+  base=$WARREN_BASE_URL
+elif [ "$channel" = main ]; then
+  fetch "https://github.com/$repo/releases/download/channel-main/channel.kv" "$work/channel.kv" ||
+    die "cannot fetch the main channel manifest"
+  tag=$(LC_ALL=C awk -F= '
+    /^tag=/ {
+      if (++count != 1 || $0 !~ /^tag=main-[0-9]+-g[0-9a-f]+$/) exit 1
+      tag=$2
+    }
+    END { if (count != 1) exit 1; print tag }
+  ' "$work/channel.kv") || die "invalid main channel tag"
+  version=$tag
+  base="https://github.com/$repo/releases/download/$tag"
+elif [ "$version" = latest ]; then
+  base="https://github.com/$repo/releases/latest/download"
+else
+  base="https://github.com/$repo/releases/download/$version"
+fi
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -118,6 +141,9 @@ install_server() {
   if [ -z "$upgrade" ]; then
     mkdir -p /etc/warren
     printf 'domain = "%s"\nacme_email = "%s"\n' "$domain" "$email" > /etc/warren/server.toml
+    if [ "$channel" = main ]; then
+      printf '\n[update]\nchannel = "main"\n' >> /etc/warren/server.toml
+    fi
     say "Wrote /etc/warren/server.toml; more options: https://github.com/$repo/blob/main/dist/server.toml"
     # Before the start, so that the server never logs a setup link; the
     # log can be unreadable (journald without storage, a changed machine-id).
@@ -216,6 +242,7 @@ install_agent() {
     [ -n "$name" ] && set -- "$@" --name "$name"
     "$bin" "$@"
   fi
+  [ -z "$channel_set" ] || "$bin" update --channel "$channel"
   [ -z "$remote" ] || "$bin" update --remote "$remote"
   if [ ! -f /etc/warren/agent.conf ]; then
     echo "Not registered yet. Create a token in the admin (Devices → Add device), then:"
