@@ -17,6 +17,7 @@ docker run --rm --platform "linux/$arch" \
   -v "$PWD":/src -w /src \
   -v warren-cargo-registry:/usr/local/cargo/registry \
   -v "warren-target-release-$arch":/src/target \
+  -e "WARREN_BUILD_VERSION=${WARREN_BUILD_VERSION:-}" \
   -e "CC_$(echo "$triple" | tr - _)=musl-gcc" \
   "$image" sh -c "cargo build --release --locked -p warren-server --target $triple \
     && cp target/$triple/release/warren-server dist/out/warren-server-linux-$arch"
