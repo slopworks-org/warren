@@ -1,9 +1,6 @@
 //! Reverse proxy from resource hosts to services on devices.
 //!
-//! Bodies stream in both directions without buffering. Plain requests share
-//! a connection pool per device and port; WebSocket (and other `Upgrade`)
-//! requests get a dedicated connection that is spliced to the client after
-//! the 101 response.
+//! Each upstream stream is opened by the agent and authorized for a single service.
 
 use super::gate::{self, Decision};
 use super::{ClientIp, pages};
@@ -14,25 +11,17 @@ use axum::body::Body;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::{Connected, Connection};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::pin::Pin;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time allowed for the device to start answering.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -89,95 +78,9 @@ impl ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-/// A connection to a device: plain TCP or TLS over TCP.
-pub enum Stream {
-    /// `http` target.
-    Plain(TcpStream),
-    /// `https` target.
-    Tls(Box<TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for Stream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for Stream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_flush(cx),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
-impl Connection for Stream {
-    fn connected(&self) -> Connected {
-        Connected::new()
-    }
-}
-
-/// Opens connections to `http://ip:port` and `https://ip:port` URIs.
-#[derive(Clone)]
-pub struct Connector {
-    tls: TlsConnector,
-}
-
-impl Connector {
-    async fn connect(self, uri: Uri) -> io::Result<Stream> {
-        let bad = || io::Error::new(io::ErrorKind::InvalidInput, "upstream URI needs an IP host and a port");
-        let ip: IpAddr = uri.host().ok_or_else(bad)?.trim_matches(['[', ']']).parse().map_err(|_| bad())?;
-        let port = uri.port_u16().ok_or_else(bad)?;
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, port)))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-        tcp.set_nodelay(true)?;
-        if uri.scheme_str() == Some("https") {
-            let tls = self.tls.connect(ServerName::IpAddress(ip.into()), tcp).await?;
-            Ok(Stream::Tls(Box::new(tls)))
-        } else {
-            Ok(Stream::Plain(tcp))
-        }
-    }
-}
-
-impl tower::Service<Uri> for Connector {
-    type Response = TokioIo<Stream>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<TokioIo<Stream>>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let this = self.clone();
-        Box::pin(async move { this.connect(uri).await.map(TokioIo::new) })
-    }
-}
-
-/// Pooled HTTP client towards devices.
+/// TLS settings shared by upstream service connections.
 pub struct Upstream {
-    client: Client<Connector, Body>,
-    connector: Connector,
+    tls: TlsConnector,
 }
 
 impl Upstream {
@@ -191,14 +94,7 @@ impl Upstream {
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let connector = Connector { tls: TlsConnector::from(Arc::new(tls)) };
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(8)
-            .http1_max_buf_size(super::MAX_BUF)
-            .set_host(false)
-            .build(connector.clone());
-        Upstream { client, connector }
+        Upstream { tls: TlsConnector::from(Arc::new(tls)) }
     }
 }
 
@@ -307,27 +203,18 @@ pub async fn handle(
     }
 
     prepare_headers(&mut parts.headers, upgrade, client, &res.host, &res, user.as_ref());
-    let scheme = if res.target_scheme == Scheme::Https { "https" } else { "http" };
-    let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str()).to_string();
-    let Ok(target) = format!("{scheme}://{}:{}{pq}", device.address, res.target_port).parse::<Uri>() else {
-        return pages::simple(StatusCode::BAD_REQUEST, "Bad request", "The request path is not valid.");
-    };
-
-    let result = if let Some(client_upgrade) = client_upgrade {
-        tokio::time::timeout(RESPONSE_TIMEOUT, forward_upgrade(upstream, target, parts, body, client_upgrade))
-            .await
-            .unwrap_or(Err(ProxyError::Timeout))
-    } else {
-        parts.uri = target;
-        let fut = upstream.client.request(Request::from_parts(parts, Body::new(body)));
-        match tokio::time::timeout(RESPONSE_TIMEOUT, fut).await {
-            Ok(Ok(resp)) => Ok(into_body(resp)),
-            Ok(Err(e)) => Err(ProxyError::Client(e)),
-            Err(_) => Err(ProxyError::Timeout),
+    let forward = async {
+        let (stream, scheme) = state.ingress.open(&device.public_key, &res.service).await?;
+        if scheme == Scheme::Https {
+            let tls = upstream.tls.connect(ServerName::IpAddress(device.address.into()), stream).await?;
+            forward_request(tls, parts, body, client_upgrade).await
+        } else {
+            forward_request(stream, parts, body, client_upgrade).await
         }
     };
+    let result = tokio::time::timeout(RESPONSE_TIMEOUT, forward).await.unwrap_or(Err(ProxyError::Timeout));
     result.unwrap_or_else(|e| {
-        tracing::debug!(host = %res.host, device = %device.name, port = res.target_port, error = %e, "upstream request failed");
+        tracing::debug!(host = %res.host, device = %device.name, service = %res.service, error = %e, "upstream request failed");
         pages::service_unreachable()
     })
 }
@@ -338,9 +225,6 @@ enum ProxyError {
     /// Connecting to the device failed.
     #[error("connecting to the device: {0}")]
     Connect(#[from] io::Error),
-    /// The pooled client failed.
-    #[error(transparent)]
-    Client(#[from] hyper_util::client::legacy::Error),
     /// HTTP failed on a dedicated (upgrade) connection.
     #[error(transparent)]
     Http(#[from] hyper::Error),
@@ -349,17 +233,14 @@ enum ProxyError {
     Timeout,
 }
 
-/// Forwards an `Upgrade` request on its own connection and, on 101, splices
-/// the client and device connections together.
-async fn forward_upgrade(
-    upstream: &Upstream,
-    target: Uri,
+/// Forwards one HTTP request and splices upgraded streams after a 101 response.
+async fn forward_request(
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     mut parts: http::request::Parts,
     body: Incoming,
-    client_upgrade: hyper::upgrade::OnUpgrade,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
 ) -> Result<Response<Body>, ProxyError> {
-    let path = target.path_and_query().cloned();
-    let stream = upstream.connector.clone().connect(target).await?;
+    let path = parts.uri.path_and_query().cloned();
     let (mut sender, conn) =
         hyper::client::conn::http1::Builder::new().max_buf_size(super::MAX_BUF).handshake(TokioIo::new(stream)).await?;
     tokio::spawn(async move {
@@ -370,7 +251,9 @@ async fn forward_upgrade(
     // Origin-form request target: just the path and query.
     parts.uri = path.map_or_else(|| Uri::from_static("/"), Uri::from);
     let mut resp = sender.send_request(Request::from_parts(parts, Body::new(body))).await?;
-    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS
+        && let Some(client_upgrade) = client_upgrade
+    {
         let device_upgrade = hyper::upgrade::on(&mut resp);
         tokio::spawn(async move {
             match tokio::try_join!(client_upgrade, device_upgrade) {
@@ -387,7 +270,6 @@ async fn forward_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Scheme;
 
     fn res(access: AccessMode) -> Resource {
         Resource {
@@ -395,8 +277,7 @@ mod tests {
             user_id: 1,
             host: "app.example.com".into(),
             device_id: 1,
-            target_port: 80,
-            target_scheme: Scheme::Http,
+            service: "web".into(),
             access,
             basic_user: String::new(),
             secret_hash: String::new(),

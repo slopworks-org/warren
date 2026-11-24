@@ -49,6 +49,9 @@ pub fn status(args: &Args) {
         tunnel_status(&saved);
     }
     control_status(&args.paths.status());
+    if let Err(e) = crate::expose::list(&args.paths) {
+        println!("Exposed services unavailable: {e}");
+    }
 }
 
 fn tunnel_status(saved: &Saved) {
@@ -126,7 +129,7 @@ pub fn down(args: &Args) -> Result<()> {
     };
     let iface = saved.map_or_else(|| args.interface.clone(), |s| s.interface);
     if wg::link_index(&iface).is_some() {
-        wg::delete_link(&iface)?;
+        tunnel::remove_link(&iface)?;
         println!("Removed interface {iface}.");
     } else {
         println!("Interface {iface} is not present.");

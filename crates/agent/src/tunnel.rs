@@ -50,6 +50,7 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
         wg::create_wireguard_link(iface)?;
         crate::log!(Info, "created interface", iface = iface);
     }
+    guard(iface)?;
     let current = wg::get_device(iface)?;
     let mut set = DeviceSet { private_key: Some(*key), ..DeviceSet::default() };
     for p in &saved.tunnel.peers {
@@ -69,6 +70,24 @@ pub fn apply(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+fn guard(iface: &str) -> Result<()> {
+    if let Err(e) = crate::firewall::protect(iface) {
+        // An interface left by an older agent may already have live peers.
+        wg::delete_link(iface)?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Deletes a guarded interface before removing its firewall rules.
+pub fn remove_link(iface: &str) -> Result<()> {
+    if wg::link_index(iface).is_some() {
+        wg::delete_link(iface)?;
+        crate::firewall::remove(iface)?;
+    }
+    Ok(())
+}
+
 /// Configures permanent receive permissions separately from application routes.
 fn apply_direct(saved: &Saved, key: &[u8; 32]) -> Result<()> {
     wg::allow_asymmetric(&saved.interface)?;
@@ -81,6 +100,7 @@ fn apply_direct(saved: &Saved, key: &[u8; 32]) -> Result<()> {
         links.reset();
         wg::create_wireguard_link(&iface)?;
     }
+    guard(&iface)?;
     let current = wg::get_device(&iface)?;
     let mut set = DeviceSet { private_key: Some(*key), ..DeviceSet::default() };
     let mut peers = Vec::new();
@@ -116,10 +136,7 @@ fn apply_direct(saved: &Saved, key: &[u8; 32]) -> Result<()> {
 /// Removes the auxiliary interface and any host routes it owns.
 pub fn remove_direct(hub: &str) -> Result<()> {
     let iface = lan::interface(hub);
-    if wg::link_index(&iface).is_some() {
-        wg::delete_link(&iface)?;
-    }
-    Ok(())
+    remove_link(&iface)
 }
 
 /// Age of the most recent handshake with any peer.

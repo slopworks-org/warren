@@ -42,7 +42,7 @@ fn real_name(name: &str) -> Option<String> {
     (valid && socket(&real).exists() && if_index(&real).is_some()).then_some(real)
 }
 
-fn real(name: &str) -> io::Result<String> {
+pub(super) fn real(name: &str) -> io::Result<String> {
     real_name(name).ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
 }
 

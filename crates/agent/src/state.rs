@@ -62,6 +62,15 @@ fn format_err(what: &'static str) -> impl FnOnce(warren_proto::Error) -> Error {
 }
 
 impl Saved {
+    /// Never let a hub-supplied control address redirect HTTP onto the local host or LAN.
+    pub fn control(&self) -> io::Result<std::net::SocketAddr> {
+        let control: std::net::SocketAddr = self.tunnel.control.parse().map_err(io::Error::other)?;
+        if !warren_wgctl::routes_to(&self.interface, control.ip()).map_err(io::Error::other)? {
+            return Err(io::Error::other("control address is outside the Warren interface"));
+        }
+        Ok(control)
+    }
+
     pub fn load(path: &Path) -> Result<Saved> {
         Self::read(path, fs::File::open(path))
     }
@@ -140,6 +149,7 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 
 /// Keeps the status file in the directory resolved when the worker started.
 pub struct StatusFile {
+    name: &'static CStr,
     dir: fs::File,
     published: bool,
     #[cfg(target_os = "macos")]
@@ -148,9 +158,14 @@ pub struct StatusFile {
 
 impl StatusFile {
     pub fn open(run_dir: &Path) -> Result<Self> {
+        Self::named(run_dir, c"status")
+    }
+
+    pub fn named(run_dir: &Path, name: &'static CStr) -> Result<Self> {
         let dir = create_public_dirs(run_dir).map_err(Error::io(format!("opening {}", run_dir.display())))?;
         Ok(Self {
             dir,
+            name,
             published: false,
             #[cfg(target_os = "macos")]
             boot_id: boot_id().map_err(Error::io("reading the boot session ID"))?,
@@ -166,7 +181,7 @@ impl StatusFile {
         let failed = || Error::io("publishing the agent status");
         let temporary = format!(".status-{}", codec::hex_encode(&random_bytes::<8>()?));
         let temporary = CString::new(temporary).map_err(|e| failed()(e.into()))?;
-        replace_at(&self.dir, c"status", &temporary, data, |file| {
+        replace_at(&self.dir, self.name, &temporary, data, |file| {
             file.set_permissions(fs::Permissions::from_mode(0o644))
         })
         .map_err(failed())?;
@@ -204,7 +219,7 @@ impl Drop for StatusFile {
     fn drop(&mut self) {
         if self.published {
             // SAFETY: the pinned directory remains live for unlinkat.
-            unsafe { libc::unlinkat(self.dir.as_raw_fd(), c"status".as_ptr(), 0) };
+            unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) };
         }
     }
 }
