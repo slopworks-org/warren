@@ -23,23 +23,44 @@ pub fn spawn(paths: &Paths) {
         let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
         while !stopping() {
             workers.retain(|w| !w.is_finished());
-            let result = poll(&config, &dir, &mut workers);
-            let summary = match result {
-                Ok(summary) => summary,
-                Err(e) => {
-                    crate::log!(Debug, "service control unavailable", error = e);
-                    thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
+            let (summary, error) = match poll(&config, &dir, &mut workers) {
+                Ok(summary) => (summary, None),
+                Err(e) => (error_summary(&dir, &e), Some(e)),
             };
-            if last.as_ref() != Some(&summary)
-                && let Some(file) = &mut status
-                && file.write_public(summary.as_bytes()).is_ok()
-            {
-                last = Some(summary);
+            if last.as_ref() != Some(&summary) {
+                if let Some(error) = &error {
+                    crate::log!(Warn, "service sync unavailable", error = error);
+                }
+                if status.as_mut().is_none_or(|file| file.write_public(summary.as_bytes()).is_ok()) {
+                    last = Some(summary);
+                }
+            } else if let Some(error) = &error {
+                crate::log!(Debug, "service sync unavailable", error = error);
+            }
+            if error.is_some() {
+                thread::sleep(Duration::from_secs(2));
             }
         }
     });
+}
+
+fn error_summary(dir: &Path, error: &io::Error) -> String {
+    let mut summary = Kv::new();
+    if let Ok(services) = services(dir) {
+        for (name, service) in &services {
+            summary.push("grant", format!("{name} {}://{}", service.scheme, service.target));
+        }
+    }
+    summary.push("last_error", error.to_string());
+    summary.encode()
+}
+
+fn status_error(status: u16) -> io::Error {
+    if status == 404 {
+        io::Error::other("server does not support exposed services; update warren-server")
+    } else {
+        io::Error::other(format!("service sync returned HTTP {status}"))
+    }
 }
 
 fn poll(config: &Path, dir: &Path, workers: &mut Vec<thread::JoinHandle<()>>) -> io::Result<String> {
@@ -53,7 +74,7 @@ fn poll(config: &Path, dir: &Path, workers: &mut Vec<thread::JoinHandle<()>>) ->
     let addr = control.to_string();
     let reply = http::request(&addr, &addr, "POST", "/agent/v1/services", Some(&report.encode()), CONNECT)?;
     if reply.status != 200 {
-        return Err(io::Error::other(format!("service report returned {}", reply.status)));
+        return Err(status_error(reply.status));
     }
     let reply = Kv::parse(&reply.body).map_err(io::Error::other)?;
     for job in reply.get_all("open").take(64usize.saturating_sub(workers.len())) {
@@ -209,6 +230,22 @@ mod tests {
             let _ = client.write_all(b"no");
             assert_eq!(backend.read(&mut buf).unwrap(), 0);
         });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn error_summary_preserves_local_grants_and_explains_old_servers() {
+        let nonce = warren_proto::codec::hex_encode(&crate::state::random_bytes::<8>().unwrap());
+        let dir = std::env::temp_dir().join(format!("warren-sync-err-{nonce}"));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("web"), "http://127.0.0.1:8080\n").unwrap();
+
+        let encoded = error_summary(&dir, &status_error(404));
+        let kv = Kv::parse(&encoded).unwrap();
+        assert_eq!(kv.get_all("grant").collect::<Vec<_>>(), ["web http://127.0.0.1:8080"]);
+        assert_eq!(kv.get("last_error"), Some("server does not support exposed services; update warren-server"));
+        assert_eq!(status_error(500).to_string(), "service sync returned HTTP 500");
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

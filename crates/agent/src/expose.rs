@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::state::{self, Paths};
 use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -116,10 +117,17 @@ pub fn list(paths: &Paths) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
+    print!("{}", format_list(&services, published.as_ref()));
+    Ok(())
+}
+
+fn format_list(services: &BTreeMap<String, Service>, published: Option<&Kv>) -> String {
     if services.is_empty() {
-        println!("No exposed services. Use warren expose <name> <target>.");
-        return Ok(());
+        return "No exposed services. Use warren expose <name> <target>.\n".into();
     }
+    let sync_error =
+        published.and_then(|kv| kv.get("last_error")).filter(|e| !e.is_empty() && !e.chars().any(char::is_control));
+    let mut out = String::new();
     for (name, service) in services {
         let urls: Vec<_> = published
             .iter()
@@ -130,14 +138,19 @@ pub fn list(paths: &Paths) -> Result<()> {
             .collect();
         let status = if !urls.is_empty() {
             urls.join(", ")
+        } else if sync_error.is_some() {
+            "sync failed".into()
         } else if published.is_some() {
             "awaiting publication".into()
         } else {
             "publication status unknown".into()
         };
-        println!("{name} -> {}://{} ({status})", service.scheme, service.target);
+        let _ = writeln!(out, "{name} -> {}://{} ({status})", service.scheme, service.target);
     }
-    Ok(())
+    if let Some(err) = sync_error {
+        let _ = writeln!(out, "Service sync error: {err}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -177,5 +190,23 @@ mod tests {
         let found = services(&dir.join("services")).unwrap();
         assert_eq!(found.get("web"), Some(&Service { scheme: "http".into(), target: "127.0.0.1:8080".into() }));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn format_list_surfaces_service_sync_errors() {
+        let mut services = BTreeMap::new();
+        services.insert("web".into(), Service { scheme: "http".into(), target: "127.0.0.1:8080".into() });
+
+        let mut failed = Kv::new();
+        failed.push("last_error", "server does not support exposed services; update warren-server");
+        assert_eq!(
+            format_list(&services, Some(&failed)),
+            "web -> http://127.0.0.1:8080 (sync failed)\n\
+             Service sync error: server does not support exposed services; update warren-server\n"
+        );
+
+        let mut ok = Kv::new();
+        ok.push("published", "web https://web.example.com");
+        assert_eq!(format_list(&services, Some(&ok)), "web -> http://127.0.0.1:8080 (https://web.example.com)\n");
     }
 }
