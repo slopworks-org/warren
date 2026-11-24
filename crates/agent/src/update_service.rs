@@ -107,6 +107,7 @@ pub struct Installation {
     pub candidate: PathBuf,
     pub request: PathBuf,
     pub update_lock: PathBuf,
+    update_result: PathBuf,
     trial_lock: PathBuf,
     service_lock: PathBuf,
     worker_lock: PathBuf,
@@ -165,6 +166,7 @@ impl Installation {
             activation: adjacent(&exe, ".update-activation"),
             backup: adjacent(&exe, ".update-backup"),
             update_lock: runtime.join(format!("{exe_id}.update")),
+            update_result: runtime.join(format!("{exe_id}.update-result")),
             trial_lock: runtime.join(format!("{exe_id}.trial")),
             service_lock: runtime.join(format!("{exe_id}.service")),
             worker_lock: runtime.join(format!("{exe_id}.worker")),
@@ -482,7 +484,58 @@ fn await_child(worker: &mut ServiceChild, expected: u8, phase: &str) -> Result<(
     Err(failed(io::Error::new(io::ErrorKind::TimedOut, format!("the candidate did not {phase}"))))
 }
 
-fn activate(install: &Installation, mut request: Request, worker: &mut Option<ServiceChild>) -> Result<()> {
+fn format_update_result(candidate: Option<&Binary>, message: &str) -> String {
+    let mut kv = Kv::new();
+    if let Some(sha256) = candidate.and_then(|binary| binary.sha256.as_deref()) {
+        kv.push("candidate", sha256);
+    }
+    kv.push("error", message);
+    kv.encode()
+}
+
+fn parse_update_result(text: &str, candidate: Option<&Binary>) -> Option<String> {
+    let kv = Kv::parse(text).ok()?;
+    if let Some(expected) = candidate.and_then(|binary| binary.sha256.as_deref())
+        && kv.get("candidate") != Some(expected)
+    {
+        return None;
+    }
+    kv.get("error").filter(|message| !message.is_empty()).map(str::to_owned)
+}
+
+fn store_update_result(install: &Installation, candidate: Option<&Binary>, message: &str) {
+    let data = format_update_result(candidate, message);
+    let _ = state::write_private(&install.update_result, data.as_bytes());
+}
+
+fn read_update_result(install: &Installation, candidate: Option<&Binary>) -> Option<String> {
+    let path = protected_file(&install.update_result).ok()?;
+    let text = fs::read_to_string(path).ok()?;
+    parse_update_result(&text, candidate)
+}
+
+fn clear_update_result(install: &Installation) {
+    let _ = fs::remove_file(&install.update_result);
+}
+
+fn status_is_error(path: &Path, pid: u32) -> bool {
+    let Ok(text) = fs::read_to_string(path) else { return false };
+    let Ok(kv) = Kv::parse(&text) else { return false };
+    kv.get("pid").and_then(|value| value.parse::<u32>().ok()) == Some(pid) && kv.get("state") == Some("error")
+}
+
+fn previous_tunnel_broken(args: &Args, worker: Option<&ServiceChild>) -> bool {
+    worker.is_some_and(|worker| status_is_error(&args.paths.status(), worker.child.id()))
+}
+
+fn activate(
+    args: &Args,
+    install: &Installation,
+    mut request: Request,
+    worker: &mut Option<ServiceChild>,
+) -> Result<()> {
+    clear_update_result(install);
+    let previous_broken = previous_tunnel_broken(args, worker.as_ref());
     request.validate(install)?;
     // The marker must be durable before even the candidate's version command runs.
     if request.registration.as_deref() != Some(&install.registration) {
@@ -502,7 +555,21 @@ fn activate(install: &Installation, mut request: Request, worker: &mut Option<Se
             previous.stop().map_err(Error::io("stopping the previous service process"))?;
         }
         send_commit(&mut guard)?;
-        await_child(&mut guard, ACTIVE, "confirm supervisor activation")?;
+        if let Err(trial_err) = await_child(&mut guard, ACTIVE, "confirm supervisor activation") {
+            let reason = read_update_result(install, None).unwrap_or_else(|| trial_err.to_string());
+            store_update_result(install, Some(&request.candidate), &reason);
+            if stopping() || request.remote || !previous_broken {
+                return Err(trial_err);
+            }
+            log!(
+                Warn,
+                "activating manual agent update despite tunnel error because the previous tunnel was already unavailable",
+                version = request.version,
+                error = reason,
+            );
+        } else {
+            clear_update_result(install);
+        }
         request.validate(install)?;
         request.confirmed = true;
         request.store(&install.activation, &install.registration)?;
@@ -512,6 +579,11 @@ fn activate(install: &Installation, mut request: Request, worker: &mut Option<Se
         }
         Ok(())
     })();
+    if let Err(e) = &result
+        && read_update_result(install, Some(&request.candidate)).is_none()
+    {
+        store_update_result(install, Some(&request.candidate), &e.to_string());
+    }
     let stop = guard.stop().map_err(Error::io("stopping the trial service"));
     if result.is_ok() {
         if let Err(e) = stop {
@@ -729,7 +801,7 @@ fn handle_request(
         if stopping() || policy.as_ref().is_some_and(|policy| !policy.authorizes(request.consent.as_deref())) {
             return Ok(false);
         }
-        activate(&install, request, worker)?;
+        activate(args, &install, request, worker)?;
         Ok(true)
     });
     match result {
@@ -893,7 +965,14 @@ fn run_worker(
     if stopping() {
         return Ok(());
     }
-    daemon::run(args, supervised.then_some(install), trial, cooldown)
+    let result = daemon::run(args, supervised.then_some(install), trial, cooldown);
+    if trial
+        && !stopping()
+        && let Err(e) = &result
+    {
+        store_update_result(install, None, &e.to_string());
+    }
+    result
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -1037,7 +1116,16 @@ pub fn acknowledge_ready() -> Result<()> {
     send_ack(ACTIVE)
 }
 
-pub fn wait_for_install(install: &Installation, candidate: &Binary) -> Result<()> {
+/// Result of activating a live agent update.
+pub enum ActivationOutcome {
+    /// The updated daemon confirmed a working tunnel.
+    Updated,
+    /// A manual update was applied while the previous tunnel was already broken,
+    /// and the updated daemon still reported a tunnel error.
+    UpdatedWithWarning(String),
+}
+
+pub fn wait_for_install(install: &Installation, candidate: &Binary) -> Result<ActivationOutcome> {
     let deadline = Instant::now() + UPDATE_TIMEOUT;
     while Instant::now() < deadline {
         if !install.request.try_exists().map_err(Error::io("checking the update handoff"))? {
@@ -1048,33 +1136,92 @@ pub fn wait_for_install(install: &Installation, candidate: &Binary) -> Result<()
     finish_wait(install, candidate)
 }
 
-fn finish_wait(install: &Installation, candidate: &Binary) -> Result<()> {
+fn finish_wait(install: &Installation, candidate: &Binary) -> Result<ActivationOutcome> {
     let _guard = lock(&install.update_lock)?;
     let pending = install.request.try_exists().map_err(Error::io("checking the update handoff"))?;
     if install.replacement_pending()? {
-        return Err(activation_failed());
+        return Err(activation_failed(None));
     }
+    let detail = read_update_result(install, Some(candidate));
     let request = Request::load(&install.request);
     let ours = request.as_ref().is_some_and(|request| request.candidate == *candidate);
     if candidate.matches(&install.exe)? {
-        return if pending && (ours || request.is_none()) {
-            Err(Error::io("activating the update")(io::Error::other(
+        if pending && (ours || request.is_none()) {
+            return Err(Error::io("activating the update")(io::Error::other(
                 "the updated supervisor has yet to confirm activation",
-            )))
-        } else {
-            Ok(())
-        };
+            )));
+        }
+        clear_update_result(install);
+        return Ok(match detail {
+            Some(reason) => ActivationOutcome::UpdatedWithWarning(reason),
+            None => ActivationOutcome::Updated,
+        });
     }
     if ours && candidate.matches(&install.candidate).unwrap_or(false) {
         install.clear_request()?;
     }
-    Err(activation_failed())
+    clear_update_result(install);
+    Err(activation_failed(detail.as_deref()))
 }
 
-fn activation_failed() -> Error {
-    Error::io("activating the update")(io::Error::other(
-        "the Warren daemon did not confirm a working tunnel; the previous binary was kept (see the service log)",
-    ))
+fn activation_failed(detail: Option<&str>) -> Error {
+    let message = match detail {
+        Some(reason) => {
+            format!("the Warren daemon did not confirm a working tunnel ({reason}); the previous binary was kept")
+        }
+        None => {
+            "the Warren daemon did not confirm a working tunnel; the previous binary was kept (see the service log)"
+                .to_string()
+        }
+    };
+    Error::io("activating the update")(io::Error::other(message))
+}
+
+#[cfg(test)]
+mod unit_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn status_is_error_requires_matching_pid_and_error_state() {
+        let suffix = warren_proto::codec::hex_encode(&state::random_bytes::<8>().unwrap());
+        let path = std::env::temp_dir().join(format!("warren-status-test-{suffix}"));
+
+        fs::write(&path, "pid=4242\nstate=error\nlast_error=boom\n").unwrap();
+        assert!(status_is_error(&path, 4242));
+        assert!(!status_is_error(&path, 9999));
+
+        fs::write(&path, "pid=4242\nstate=connected\n").unwrap();
+        assert!(!status_is_error(&path, 4242));
+
+        fs::write(&path, "pid=4242\nstate=starting\n").unwrap();
+        assert!(!status_is_error(&path, 4242));
+
+        fs::remove_file(&path).unwrap();
+        assert!(!status_is_error(&path, 4242));
+    }
+
+    #[test]
+    fn update_result_roundtrips_and_matches_candidate() {
+        let candidate = Binary { id: FileId(1, 2), sha256: Some("abc123".into()) };
+        let other = Binary { id: FileId(1, 3), sha256: Some("def456".into()) };
+
+        let encoded = format_update_result(Some(&candidate), "line 1\nline 2");
+        assert_eq!(parse_update_result(&encoded, Some(&candidate)).as_deref(), Some("line 1 line 2"));
+        assert_eq!(parse_update_result(&encoded, None).as_deref(), Some("line 1 line 2"));
+        assert_eq!(parse_update_result(&encoded, Some(&other)), None);
+    }
+
+    #[test]
+    fn activation_failed_includes_detail_when_available() {
+        let detailed = activation_failed(Some("pfctl failed")).to_string();
+        assert!(detailed.contains("pfctl failed"));
+        assert!(detailed.contains("the previous binary was kept"));
+
+        let fallback = activation_failed(None).to_string();
+        assert!(fallback.contains("see the service log"));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
