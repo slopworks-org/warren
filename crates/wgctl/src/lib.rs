@@ -340,6 +340,15 @@ pub fn ensure_addresses(name: &str, addresses: &[AllowedIp], mtu: u32) -> Result
     set_link_up(name, mtu)
 }
 
+/// Resolves Warren's logical interface name to the active system utun.
+///
+/// # Errors
+/// Returns an error if the associated WireGuard interface is missing.
+#[cfg(target_os = "macos")]
+pub fn macos_interface(name: &str) -> io::Result<String> {
+    macos::real(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

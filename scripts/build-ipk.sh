@@ -17,7 +17,7 @@ size=$(du -sk "$work/data" | cut -f1)
 cat > "$work/control/control" <<CTRL
 Package: warren
 Version: $version
-Depends: kmod-wireguard, curl, ca-bundle
+Depends: kmod-wireguard, nftables-json, curl, ca-bundle
 Architecture: $pkg_arch
 Installed-Size: $((size * 1024))
 Maintainer: Warren

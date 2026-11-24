@@ -369,6 +369,18 @@ impl AgentConfig {
     }
 }
 
+/// Maximum number of locally published service names per agent.
+pub const MAX_SERVICES: usize = 64;
+
+/// Checks the portable service label used by the allowlist and control protocol.
+#[must_use]
+pub fn service_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

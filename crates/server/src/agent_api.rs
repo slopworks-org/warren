@@ -349,6 +349,11 @@ async fn config(
 pub fn control_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route(warren_proto::CONFIG_PATH, get(config))
+        .route(
+            "/agent/v1/services",
+            axum::routing::post(crate::ingress::report).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route("/agent/v1/streams/{ticket}", get(crate::ingress::stream))
         .route("/agent/v1/routes", get(routes::continuation))
         .with_state(state)
 }

@@ -11,7 +11,12 @@ warren — Warren agent
 USAGE:
     warren up --server <URL> --token <TOKEN> [--name <NAME>] [--interface <IFACE>] [--force]
     warren run                 keep the tunnel up (run this as a service)
-    warren status              show the agent version and connection state
+    warren expose <name> <target> [--scheme http|https]
+                               allow forwarding to a local service (e.g. grafana 3000)
+                               targets accept a host:port or port, optionally prefixed with http(s)://
+    warren unexpose <name>     stop forwarding to the service
+    warren expose [--list]     list local services and published URLs
+    warren status              show the agent version, connection state and exposed services
     warren update              install the latest build on the configured channel
     warren update --check [--channel <release|main>]
                                check a channel without changing settings
@@ -42,6 +47,8 @@ pub enum Command {
     Up,
     Run,
     Status,
+    Expose,
+    Unexpose,
     Update { check: bool, remote: Option<bool>, channel: Option<UpdateChannel> },
     Down,
     Version,
@@ -56,6 +63,8 @@ pub struct Args {
     pub token: Option<String>,
     pub name: Option<String>,
     pub interface: String,
+    pub operands: Vec<String>,
+    pub scheme: Option<String>,
     pub force: bool,
     pub forget: bool,
     pub log_level: Option<String>,
@@ -68,6 +77,8 @@ impl Args {
         let command = match it.next().as_deref() {
             Some("up") => Command::Up,
             Some("run") => Command::Run,
+            Some("expose") => Command::Expose,
+            Some("unexpose") => Command::Unexpose,
             Some("status") => Command::Status,
             Some("update") => Command::Update { check: false, remote: None, channel: None },
             Some("down") => Command::Down,
@@ -81,6 +92,8 @@ impl Args {
             token: None,
             name: None,
             interface: DEFAULT_INTERFACE.to_string(),
+            operands: Vec::new(),
+            scheme: None,
             force: false,
             forget: false,
             log_level: None,
@@ -127,6 +140,11 @@ impl Args {
                     }
                     _ => return Err(Error::Usage("--remote is only for `warren update` without --check".into())),
                 },
+                "--list" if args.command == Command::Expose && inline.is_none() => args.operands.push("--list".into()),
+                "--scheme" if args.command == Command::Expose => args.scheme = Some(value()?),
+                operand if !operand.starts_with('-') && matches!(args.command, Command::Expose | Command::Unexpose) => {
+                    args.operands.push(operand.to_owned());
+                }
                 "--force" => args.force = true,
                 "--forget" => args.forget = true,
                 "--help" | "-h" => args.command = Command::Help,

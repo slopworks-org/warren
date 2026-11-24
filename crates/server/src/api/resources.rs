@@ -1,10 +1,10 @@
-//! Published resources: host → device and port, with an access mode.
+//! Published resources: hostname to a client-exposed service, with an access mode.
 
 use super::session::hash_password;
 use super::{ApiError, ApiResult, Auth, Ip, rebuild};
 use crate::access::Grant;
 use crate::auth::Perm;
-use crate::db::{AccessMode, Resource, ResourceInput, Scheme};
+use crate::db::{AccessMode, Resource, ResourceInput};
 use crate::state::AppState;
 use axum::Json;
 use axum::extract::{Path, State};
@@ -14,15 +14,14 @@ use std::sync::Arc;
 
 /// Request body for create and update; on update, absent fields keep their value.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceReq {
     #[serde(default)]
     host: Option<String>,
     #[serde(default)]
     device_id: Option<i64>,
     #[serde(default)]
-    port: Option<u16>,
-    #[serde(default)]
-    scheme: Option<Scheme>,
+    service: Option<String>,
     #[serde(default)]
     access: Option<AccessMode>,
     #[serde(default)]
@@ -44,6 +43,7 @@ fn view(state: &AppState, r: &Resource) -> Value {
     let snap = state.snapshot();
     let device = snap.devices.get(&r.device_id);
     let mut v = json!(r);
+    v["scheme"] = json!(device.and_then(|d| state.ingress.catalog(&d.public_key).get(&r.service).copied()));
     v["url"] = json!(state.config.https_origin(&r.host));
     v["device_name"] = json!(device.map(|d| d.name.clone()));
     v["device_online"] = json!(device.is_some_and(|d| d.enabled && state.is_online(d.id)));
@@ -71,10 +71,16 @@ async fn validate(
     if device.user_id != auth.user.id && !auth.can(Perm::AllDevices) {
         return Err(ApiError::bad("no such device"));
     }
-    let target_port =
-        req.port.or_else(|| current.map(|c| c.target_port)).ok_or_else(|| ApiError::bad("port is required"))?;
-    if target_port == 0 {
-        return Err(ApiError::bad("port must be between 1 and 65535"));
+    let service = req
+        .service
+        .or_else(|| current.map(|r| r.service.clone()))
+        .ok_or_else(|| ApiError::bad("choose a client-exposed service"))?;
+    let changed = current
+        .is_none_or(|r| r.device_id != device_id || r.service != service || (!r.enabled && req.enabled == Some(true)));
+    if changed && !state.ingress.catalog(&device.public_key).contains_key(&service) {
+        return Err(ApiError::bad(
+            "this device has not exposed that service; use warren expose <name> <target> on the device",
+        ));
     }
     let access = req.access.or_else(|| current.map(|c| c.access)).unwrap_or(AccessMode::Public);
     let basic_user =
@@ -122,8 +128,7 @@ async fn validate(
     let input = ResourceInput {
         host,
         device_id,
-        target_port,
-        target_scheme: req.scheme.or_else(|| current.map(|c| c.target_scheme)).unwrap_or(Scheme::Http),
+        service,
         access,
         basic_user: if access == AccessMode::Basic { basic_user } else { String::new() },
         secret_hash,
@@ -156,10 +161,7 @@ pub async fn create(
     let (input, owner) = validate(&state, &auth, None, req).await?;
     let id = state.db.create_resource(owner, &input)?;
     rebuild(&state)?;
-    let details = format!(
-        "→ device:{} port {} ({:?}, {:?})",
-        input.device_id, input.target_port, input.target_scheme, input.access
-    );
+    let details = format!("device {} service {} ({:?})", input.device_id, input.service, input.access);
     state.audit(Some(&auth.user), &ip, "resource.create", &format!("resource:{id} {}", input.host), &details);
     let r = state.db.resource(id)?.ok_or(ApiError::Internal)?;
     Ok(Json(view(&state, &r)))
@@ -177,10 +179,7 @@ pub async fn update(
     let (input, owner) = validate(&state, &auth, Some(&current), req).await?;
     state.db.update_resource(id, owner, &input)?;
     rebuild(&state)?;
-    let details = format!(
-        "→ device:{} port {} ({:?}, {:?})",
-        input.device_id, input.target_port, input.target_scheme, input.access
-    );
+    let details = format!("device {} service {} ({:?})", input.device_id, input.service, input.access);
     state.audit(Some(&auth.user), &ip, "resource.update", &format!("resource:{id} {}", input.host), &details);
     let r = state.db.resource(id)?.ok_or(ApiError::NotFound)?;
     Ok(Json(view(&state, &r)))
