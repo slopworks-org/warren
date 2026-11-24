@@ -17,6 +17,7 @@ mod log;
 mod mesh_probe;
 mod privilege;
 mod selfupdate;
+mod service;
 mod state;
 mod status;
 mod tunnel;
@@ -83,6 +84,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let result = match args.command {
+        Command::Service(action) => service::manage(action, &args),
+        Command::ServiceHelp => {
+            print!("{}", cli::SERVICE_HELP);
+            Ok(())
+        }
         Command::Up => up::run(&args),
         Command::Run => install_signal_handlers()
             .map_err(error::Error::io("installing signal handlers"))
