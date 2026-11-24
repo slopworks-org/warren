@@ -6,7 +6,11 @@ use std::os::unix::process::CommandExt;
 fn needs_root(command: &Command) -> bool {
     !matches!(
         command,
-        Command::Help | Command::Version | Command::Status | Command::Update { check: true, remote: None, .. }
+        Command::ServiceHelp
+            | Command::Help
+            | Command::Version
+            | Command::Status
+            | Command::Update { check: true, remote: None, .. }
     )
 }
 

@@ -252,7 +252,10 @@ install_agent() {
     echo "and run this installer again, or start the service yourself."
     return
   fi
-  if [ "$os" = Darwin ]; then
+  if { [ "$os" = Darwin ] || [ -f /etc/openwrt_release ] || has_systemd; } && "$bin" service --help >/dev/null 2>&1; then
+    "$bin" service install
+  # Older pinned releases only support external service setup.
+  elif [ "$os" = Darwin ]; then
     launchctl bootout system/org.slopworks.warren 2>/dev/null || true
     launchctl bootstrap system "$plist"
   elif [ -f /etc/openwrt_release ]; then

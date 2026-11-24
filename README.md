@@ -62,6 +62,12 @@ You need:
    Agent commands automatically request administrator privileges through `sudo`
    when needed. On systems without `sudo`, run the agent as root.
 
+   To manage the registered agent manually, run `warren service install`,
+   `warren service restart`, or `warren service uninstall`. Install uses the
+   current executable and accepts `--config-dir`, `--run-dir`, and
+   `--log-level`. Keep that executable at its installed path. Uninstall
+   preserves the device registration.
+
    For the native Warren Android app, choose **Devices → Add device → Warren
    Android app** and scan the one-time enrollment QR in the app. **WireGuard
    config** still creates a configuration for the standard WireGuard app.

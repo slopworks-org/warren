@@ -11,6 +11,7 @@ warren — Warren agent
 USAGE:
     warren up --server <URL> --token <TOKEN> [--name <NAME>] [--interface <IFACE>] [--force]
     warren run                 keep the tunnel up (run this as a service)
+    warren service <install|uninstall|restart>   manage the background service
     warren expose <name> <target> [--scheme http|https]
                                allow forwarding to a local service (e.g. grafana 3000)
                                targets accept a host:port or port, optionally prefixed with http(s)://
@@ -41,9 +42,27 @@ Operational commands request administrator privileges through sudo when needed.
 On systems without sudo, run them as root. Update checks use system curl and CA certificates.
 ";
 
+pub const SERVICE_HELP: &str = "\
+warren service install    enable and start the agent using this executable
+warren service restart    restart the installed agent
+warren service uninstall  stop and remove the service, keeping registration
+
+Register with warren up before installing. Install accepts --config-dir <DIR>,
+--run-dir <DIR> and --log-level <LEVEL> for the background agent.
+";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Service {
+    Install,
+    Uninstall,
+    Restart,
+}
+
 /// Which subcommand to run.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    Service(Service),
+    ServiceHelp,
     Up,
     Run,
     Status,
@@ -75,6 +94,13 @@ impl Args {
     pub fn parse(words: impl IntoIterator<Item = String>) -> Result<Args> {
         let mut it = words.into_iter();
         let command = match it.next().as_deref() {
+            Some("service") => match it.next().as_deref() {
+                Some("install") => Command::Service(Service::Install),
+                Some("uninstall") => Command::Service(Service::Uninstall),
+                Some("restart") => Command::Service(Service::Restart),
+                Some("--help" | "-h" | "help") | None => Command::ServiceHelp,
+                Some(other) => return Err(Error::Usage(format!("unknown service command {other:?}"))),
+            },
             Some("up") => Command::Up,
             Some("run") => Command::Run,
             Some("expose") => Command::Expose,
