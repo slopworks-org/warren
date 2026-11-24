@@ -46,6 +46,17 @@ static PF_STATE: std::sync::Mutex<PfState> =
     std::sync::Mutex::new(PfState { token: None, interfaces: std::collections::BTreeSet::new() });
 
 #[cfg(target_os = "macos")]
+fn is_scrub_rule(line: &str) -> bool {
+    matches!(line.split_whitespace().next(), Some("scrub" | "scrub-anchor"))
+}
+
+#[cfg(target_os = "macos")]
+fn has_warren_anchor(rules_output: &str) -> bool {
+    rules_output.lines().map(str::trim).find(|line| !line.is_empty() && !is_scrub_rule(line))
+        == Some("anchor \"warren/*\" quick all")
+}
+
+#[cfg(target_os = "macos")]
 fn pf_is_ready() -> Result<bool> {
     let show =
         |option| Command::new("/sbin/pfctl").args(["-s", option]).output().map_err(Error::io("reading PF policy"));
@@ -54,7 +65,7 @@ fn pf_is_ready() -> Result<bool> {
     Ok(info.status.success()
         && String::from_utf8_lossy(&info.stdout).contains("Status: Enabled")
         && root.status.success()
-        && String::from_utf8_lossy(&root.stdout).lines().next() == Some("anchor \"warren/*\" quick all"))
+        && has_warren_anchor(&String::from_utf8_lossy(&root.stdout)))
 }
 
 #[cfg(target_os = "macos")]
@@ -102,8 +113,7 @@ fn with_warren_anchor(conf: &str) -> String {
 #[cfg(target_os = "macos")]
 fn ensure_pf_ready(state: &mut PfState) -> Result<()> {
     let root = Command::new("/sbin/pfctl").args(["-s", "rules"]).output().map_err(Error::io("reading PF policy"))?;
-    let has_anchor = root.status.success()
-        && String::from_utf8_lossy(&root.stdout).lines().next() == Some("anchor \"warren/*\" quick all");
+    let has_anchor = root.status.success() && has_warren_anchor(&String::from_utf8_lossy(&root.stdout));
     if !has_anchor {
         let conf = std::fs::read_to_string("/etc/pf.conf").map_err(Error::io("reading /etc/pf.conf"))?;
         let patched = with_warren_anchor(&conf);
@@ -222,5 +232,26 @@ anchor \"com.apple/*\"
         let conf = "scrub-anchor \"com.apple/*\"\n";
         let expected = "scrub-anchor \"com.apple/*\"\nanchor \"warren/*\" quick\n";
         assert_eq!(with_warren_anchor(conf), expected);
+    }
+
+    #[test]
+    fn detects_warren_anchor_after_scrub_rules() {
+        let rules = "\
+scrub-anchor \"com.apple/*\" all fragment reassemble
+anchor \"warren/*\" quick all
+anchor \"com.apple/*\" all
+dummynet-anchor \"com.apple/*\" all
+";
+        assert!(has_warren_anchor(rules));
+    }
+
+    #[test]
+    fn rejects_warren_anchor_after_other_filter_rules() {
+        let rules = "\
+scrub-anchor \"com.apple/*\" all fragment reassemble
+anchor \"com.apple/*\" all
+anchor \"warren/*\" quick all
+";
+        assert!(!has_warren_anchor(rules));
     }
 }
