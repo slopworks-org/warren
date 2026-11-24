@@ -3,20 +3,20 @@
 use crate::cli::{Args, Command};
 use std::os::unix::process::CommandExt;
 
-fn needs_root(command: &Command) -> bool {
+fn needs_root(args: &Args) -> bool {
     !matches!(
-        command,
+        args.command,
         Command::ServiceHelp
             | Command::Help
             | Command::Version
             | Command::Status
             | Command::Update { check: true, remote: None, .. }
-    )
+    ) && !crate::expose::is_list(args)
 }
 
 pub fn elevate(args: &Args) -> std::io::Result<()> {
     // SAFETY: geteuid takes no arguments and has no preconditions.
-    if !needs_root(&args.command) || unsafe { libc::geteuid() } == 0 {
+    if !needs_root(args) || unsafe { libc::geteuid() } == 0 {
         return Ok(());
     }
     let executable = std::env::current_exe()?;
@@ -39,21 +39,27 @@ mod tests {
 
     #[test]
     fn only_operational_commands_require_root() {
-        for command in [
-            Command::Up,
-            Command::Run,
-            Command::Down,
-            Command::Update { check: false, remote: None, channel: Some(warren_proto::UpdateChannel::Main) },
+        for argv in [
+            &["up", "--server", "https://vpn.example.com", "--token", "tok"][..],
+            &["run"][..],
+            &["down"][..],
+            &["update", "--channel", "main"][..],
+            &["expose", "web", "8080"][..],
+            &["unexpose", "web"][..],
         ] {
-            assert!(needs_root(&command));
+            let args = Args::parse(argv.iter().copied().map(str::to_owned)).unwrap();
+            assert!(needs_root(&args), "expected root for {argv:?}");
         }
-        for command in [
-            Command::Help,
-            Command::Version,
-            Command::Status,
-            Command::Update { check: true, remote: None, channel: Some(warren_proto::UpdateChannel::Main) },
+        for argv in [
+            &["--help"][..],
+            &["--version"][..],
+            &["status"][..],
+            &["update", "--check", "--channel", "main"][..],
+            &["expose"][..],
+            &["expose", "--list"][..],
         ] {
-            assert!(!needs_root(&command));
+            let args = Args::parse(argv.iter().copied().map(str::to_owned)).unwrap();
+            assert!(!needs_root(&args), "did not expect root for {argv:?}");
         }
     }
 }

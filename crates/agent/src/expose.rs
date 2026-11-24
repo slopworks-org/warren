@@ -3,6 +3,7 @@ use crate::cli::{Args, Command};
 use crate::error::{Error, Result};
 use crate::state::{self, Paths};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -62,11 +63,14 @@ pub fn services(dir: &Path) -> Result<BTreeMap<String, Service>> {
     Ok(services)
 }
 
-pub fn command(args: &Args) -> Result<()> {
-    if args.command == Command::Expose
+pub fn is_list(args: &Args) -> bool {
+    args.command == Command::Expose
         && (args.operands.is_empty() || args.operands == ["--list"])
         && args.scheme.is_none()
-    {
+}
+
+pub fn command(args: &Args) -> Result<()> {
+    if is_list(args) {
         return list(&args.paths);
     }
     let name = args.operands.first().filter(|n| warren_proto::service_name(n)).ok_or_else(|| {
@@ -83,7 +87,8 @@ pub fn command(args: &Args) -> Result<()> {
             if !path.exists() && services(&dir)?.len() >= warren_proto::MAX_SERVICES {
                 return Err(Error::Usage("service limit reached".into()));
             }
-            state::write_private(&path, format!("{}://{}\n", s.scheme, s.target).as_bytes())?;
+            let entry = CString::new(name.as_str()).map_err(|_| Error::Usage("invalid service name".into()))?;
+            state::write_at(&lock, &entry, format!("{}://{}\n", s.scheme, s.target).as_bytes(), 0o644)?;
             println!("{name} -> {}://{} (exposed)", s.scheme, s.target);
         }
         (Command::Unexpose, [_]) => {
@@ -150,5 +155,27 @@ mod tests {
             assert!(Service::parse(value, None).is_err());
         }
         assert!(Service::parse("https://3000", Some("http")).is_err());
+    }
+
+    #[test]
+    fn expose_writes_world_readable_service_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = warren_proto::codec::hex_encode(&crate::state::random_bytes::<8>().unwrap());
+        let dir = std::env::temp_dir().join(format!("warren-expose-{suffix}"));
+        let args = Args::parse(
+            ["expose", "web", "8080", "--config-dir", dir.to_str().unwrap(), "--run-dir", dir.to_str().unwrap()]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+
+        command(&args).unwrap();
+        let file = dir.join("services/web");
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "http://127.0.0.1:8080\n");
+        let found = services(&dir.join("services")).unwrap();
+        assert_eq!(found.get("web"), Some(&Service { scheme: "http".into(), target: "127.0.0.1:8080".into() }));
+        fs::remove_dir_all(dir).unwrap();
     }
 }
