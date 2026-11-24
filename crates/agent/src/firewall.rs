@@ -41,14 +41,19 @@ pub fn protect(iface: &str) -> Result<()> {
     if !info.status.success()
         || !String::from_utf8_lossy(&info.stdout).contains("Status: Enabled")
         || !root.status.success()
-        || !String::from_utf8_lossy(&root.stdout)
-            .lines()
-            .next()
-            .is_some_and(|r| r.starts_with("anchor \"warren/*\"") && r.split_whitespace().any(|w| w == "quick"))
+        || String::from_utf8_lossy(&root.stdout).lines().next() != Some("anchor \"warren/*\" quick all")
     {
         return Err(Error::InvalidConfig(
             "enable PF with anchor \"warren/*\" quick as its first filter rule (see README)",
         ));
+    }
+    let interface = Command::new("/sbin/pfctl")
+        .args(["-v", "-i", &real, "-s", "Interfaces"])
+        .output()
+        .map_err(Error::io("reading PF interface flags"))?;
+    let flags = String::from_utf8_lossy(&interface.stdout);
+    if !interface.status.success() || !flags.split_whitespace().any(|word| word == real) || flags.contains("skip") {
+        return Err(Error::InvalidConfig("PF must filter the Warren utun interface"));
     }
     let anchor = format!("warren/{}", crate::lan::interface(iface));
     let script = format!(
