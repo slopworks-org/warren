@@ -94,10 +94,11 @@ the hub and connections from other devices. Outbound traffic, its replies,
 and IPv4 echo requests remain available.
 
 Linux requires the `nft` command and kernel connection tracking. On macOS,
-place `anchor "warren/*" quick` as the first filter rule in your PF
-configuration, after translation rules. Load that configuration and enable
-PF before starting Warren. Each utun gets its own anchor. Warren refuses
-to configure peers if it cannot install the ingress policy.
+Warren enables PF with a reference-counted token (`pfctl -E`), loads
+`anchor "warren/*" quick` as the first filter rule in memory from
+`/etc/pf.conf` if it is not already present, and installs a dedicated anchor
+per utun. Warren refuses to configure peers if it cannot install the ingress
+policy.
 
 Upgrade the agents to enforce the local policy. Upgrading the server disables
 existing port-based publications and preserves their hostnames and access
