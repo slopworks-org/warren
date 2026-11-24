@@ -505,8 +505,14 @@ pub fn run(paths: &Paths, check: bool, remote: Option<bool>, channel: Option<Upd
             }
             Install::Live(current, candidate) => {
                 println!("Restarting the Warren service and checking the tunnel...");
-                update_service::wait_for_install(&installation, &candidate)?;
-                println!("{current} -> {version}, updated");
+                match update_service::wait_for_install(&installation, &candidate)? {
+                    update_service::ActivationOutcome::Updated => {
+                        println!("{current} -> {version}, updated");
+                    }
+                    update_service::ActivationOutcome::UpdatedWithWarning(reason) => {
+                        println!("{current} -> {version}, updated (tunnel not ready: {reason})");
+                    }
+                }
             }
         }
     }
