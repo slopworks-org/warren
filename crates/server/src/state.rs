@@ -138,7 +138,6 @@ pub struct AppState {
     pub latest_main: RwLock<Option<crate::update::Release>>,
     /// Stops the server so that systemd restarts it into a staged update.
     pub restart: Notify,
-    pub(crate) ingress: crate::ingress::Directory,
     alloc: Mutex<()>,
     agent_reports: Mutex<HashMap<i64, (i64, String)>>,
     lan_reports: RwLock<HashMap<i64, LanReport>>,
@@ -147,8 +146,6 @@ pub struct AppState {
 /// Device fields plus live tunnel state, as the API shows them.
 #[derive(Serialize)]
 pub struct DeviceView {
-    /// Services currently advertised by the agent.
-    pub services: std::collections::BTreeMap<String, crate::db::Scheme>,
     /// Stored fields.
     #[serde(flatten)]
     pub device: Device,
@@ -213,7 +210,6 @@ impl AppState {
             latest_release: RwLock::new(None),
             latest_main: RwLock::new(None),
             restart: Notify::new(),
-            ingress: crate::ingress::Directory::default(),
             alloc: Mutex::new(()),
             agent_reports: Mutex::new(HashMap::new()),
             lan_reports: RwLock::new(HashMap::new()),
@@ -462,7 +458,6 @@ impl AppState {
             .as_ref()
             .is_some_and(|version| warren_proto::is_update_available(d.update_channel, version, &d.agent_version));
         DeviceView {
-            services: self.ingress.catalog(&d.public_key),
             owner: snap.users.get(&d.user_id).map(|u| u.username.clone()).unwrap_or_default(),
             online: d.enabled && Self::recent(s),
             last_handshake: s.last_handshake,

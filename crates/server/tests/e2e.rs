@@ -517,7 +517,6 @@ fn flows(s: &Scenario, dir: &Path, dev: &Netns, admin: &mut Client, agent_bin: &
     assert_eq!(admin.ok("GET", "/me", None)["user"]["role"], "admin");
     let mut agent = register_agent(s, dir, dev, admin, agent_bin);
     check_public_proxy(s, admin, &agent);
-    check_local_consent(s, dev, admin, &agent);
     let visitor = Client::new(dir, "visitor", s.https_port);
     check_pin_and_basic(s, admin, &visitor, agent.id);
     let (bob, bob_id) = check_users_mode(s, dir, admin, &visitor, agent.id);
@@ -570,12 +569,9 @@ fn register_agent(s: &Scenario, dir: &Path, dev: &Netns, admin: &Client, agent_b
     restrictive.extend(run_args.iter().map(String::as_str));
     let daemon = dev.spawn(&restrictive, &log);
     dev.serve(8000);
-    dev.must(&agent_args(&common, &[agent_bin, "expose", "app", "8000"]));
-    dev.must(&agent_args(&common, &[agent_bin, "expose", "down", "9"]));
 
     let device = || admin.ok("GET", "/devices", None)[0].clone();
     wait_for("the device to come online", Duration::from_secs(30), || device()["online"] == json!(true));
-    wait_for("service advertisement", Duration::from_secs(10), || device()["services"]["app"] == "http");
     assert!(!failed_trial.exists());
     assert_eq!(fs::metadata(&installed).unwrap().ino(), previous);
     assert!(fs::read_to_string(&log).unwrap().contains("exit status: 77"));
@@ -721,7 +717,7 @@ fi
 /// A public resource: HTTP and WebSocket through the tunnel, redirects, and
 /// no certificate for unknown names.
 fn check_public_proxy(s: &Scenario, admin: &Client, agent: &Agent) {
-    let res = admin.ok("POST", "/resources", Some(json!({ "host": "app", "device_id": agent.id, "service": "app" })));
+    let res = admin.ok("POST", "/resources", Some(json!({ "host": "app", "device_id": agent.id, "port": 8000 })));
     assert_eq!(res["host"], format!("app.{DOMAIN}"));
     let app = format!("https://app.{DOMAIN}:{}", s.https_port);
     let r = admin.request("GET", &format!("{app}/hello"), None, &["-H", "Cookie: theirs=1; __Host-warren_auth=leak"]);
@@ -748,29 +744,11 @@ fn check_public_proxy(s: &Scenario, admin: &Client, agent: &Agent) {
     assert!(!by_ip.success(), "HTTPS by IP address must fail");
 }
 
-fn check_local_consent(s: &Scenario, dev: &Netns, admin: &Client, agent: &Agent) {
-    let request = json!({ "host": "unknown", "device_id": agent.id, "service": "missing" });
-    assert_eq!(admin.api("POST", "/resources", Some(request)).status, 400);
-    let old = json!({ "host": "legacy", "device_id": agent.id, "port": 8000 });
-    assert!(admin.api("POST", "/resources", Some(old)).status >= 400);
-    let url = format!("https://app.{DOMAIN}:{}/", s.https_port);
-    let common = &agent.run_args[2..];
-    let bin = agent.run_args[0].as_str();
-    dev.must(&agent_args(common, &[bin, "unexpose", "app"]));
-    assert_eq!(admin.get(&url).status, 502);
-    dev.must(&agent_args(common, &[bin, "expose", "app", "http://127.0.0.1:8000"]));
-    wait_for("the service to be republished live", Duration::from_secs(10), || admin.get(&url).status == 200);
-    wait_for("the public status to include the published URL", Duration::from_secs(10), || {
-        let result = dev.exec(&agent_args(common, &[bin, "expose", "--list"]));
-        String::from_utf8_lossy(&result.stdout).contains(url.trim_end_matches('/'))
-    });
-}
-
 fn check_pin_and_basic(s: &Scenario, admin: &Client, visitor: &Client, dev_id: i64) {
     let pin = admin.ok(
         "POST",
         "/resources",
-        Some(json!({ "host": "pin", "device_id": dev_id, "service": "app", "access": "pin", "secret": "4321" })),
+        Some(json!({ "host": "pin", "device_id": dev_id, "port": 8000, "access": "pin", "secret": "4321" })),
     );
     let pin_url = format!("https://pin.{DOMAIN}:{}", s.https_port);
     let r = visitor.get(&format!("{pin_url}/secret"));
@@ -785,7 +763,7 @@ fn check_pin_and_basic(s: &Scenario, admin: &Client, visitor: &Client, dev_id: i
     admin.ok("PATCH", &format!("/resources/{}", pin["id"]), Some(json!({ "secret": "9999" })));
     assert_eq!(visitor.get(&format!("{pin_url}/secret")).status, 401);
 
-    let basic = json!({ "host": "basic", "device_id": dev_id, "service": "app", "access": "basic", "basic_user": "u", "secret": "basic-pass" });
+    let basic = json!({ "host": "basic", "device_id": dev_id, "port": 8000, "access": "basic", "basic_user": "u", "secret": "basic-pass" });
     admin.ok("POST", "/resources", Some(basic));
     let basic_url = format!("https://basic.{DOMAIN}:{}/", s.https_port);
     assert_eq!(visitor.get(&basic_url).status, 401);
@@ -800,7 +778,7 @@ fn check_users_mode(s: &Scenario, dir: &Path, admin: &Client, visitor: &Client, 
     let users_res = admin.ok(
         "POST",
         "/resources",
-        Some(json!({ "host": "private", "device_id": dev_id, "service": "app", "access": "users" })),
+        Some(json!({ "host": "private", "device_id": dev_id, "port": 8000, "access": "users" })),
     );
     let private = format!("https://private.{DOMAIN}:{}", s.https_port);
     let r = visitor.get(&format!("{private}/inner?a=b"));
@@ -920,7 +898,7 @@ fn check_agentless_and_acl(s: &Scenario, dir: &Path, admin: &Client, bob: &Clien
         String::from_utf8_lossy(&out.stdout).contains("hello from device")
     };
     // Same owner: device to device through the hub.
-    assert!(!reach_agent(), "direct TCP requires a client-granted ingress stream");
+    wait_for("the agentless device to reach the agent's service", Duration::from_secs(20), reach_agent);
     let phone = || {
         let devices = admin.ok("GET", "/devices", None);
         devices.as_array().unwrap().iter().find(|d| d["address"] == json!(manual_ip)).unwrap().clone()
@@ -936,7 +914,7 @@ fn check_agentless_and_acl(s: &Scenario, dir: &Path, admin: &Client, bob: &Clien
     assert!(!reach_agent(), "devices of different users must not see each other");
     let rule = json!({ "src": format!("user:{bob_id}"), "dst": format!("device:{}", agent.id), "ports": "tcp:8000" });
     admin.ok("POST", "/acl", Some(rule));
-    assert!(!reach_agent(), "hub ACLs cannot grant local service access");
+    wait_for("the ACL rule to apply", Duration::from_secs(10), reach_agent);
     let other_port = manual_ns.exec(&["curl", "-s", "--max-time", "3", &format!("http://{}:8001/", agent.addr)]);
     assert!(other_port.stdout.is_empty(), "only the allowed port is open");
 }
@@ -986,14 +964,14 @@ fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, age
     wait_for("a direct path between the router and the NAS", Duration::from_secs(90), || {
         has_route(router, &agent.iface, &nas_addr) && has_route(&nas, &iface, &agent.addr)
     });
-    assert!(!reach_nas(), "direct mesh cannot bypass the local service policy");
+    wait_for("the NAS to answer over the direct path", Duration::from_secs(10), reach_nas);
 
     // Idle sessions must remain direct across the former 25-second expiry.
     let idle = std::env::var("WARREN_MESH_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(35);
     thread::sleep(Duration::from_secs(idle));
     assert!(has_route(router, &agent.iface, &nas_addr));
     assert!(has_route(&nas, &iface, &agent.addr));
-    assert!(!reach_nas());
+    assert!(reach_nas());
     let ping_both = || {
         router.must(&["ping", "-q", "-c", "3", "-W", "2", &nas_addr]);
         nas.must(&["ping", "-q", "-c", "3", "-W", "2", &agent.addr]);
@@ -1027,7 +1005,7 @@ fn check_lan_peers(s: &Scenario, dir: &Path, router: &Netns, admin: &Client, age
         !has_route(router, &agent.iface, &nas_addr) && !has_route(&nas, &iface, &agent.addr)
     });
     ping_both();
-    assert!(!reach_nas());
+    assert!(reach_nas());
     nas.must(&["nft", "delete table ip block"]);
     wait_for("direct paths to recover", Duration::from_secs(20), || {
         has_route(router, &agent.iface, &nas_addr) && has_route(&nas, &iface, &agent.addr)
@@ -1053,7 +1031,7 @@ fn check_failures_restart_revoke(
     agent: &mut Agent,
 ) {
     let app = format!("https://app.{DOMAIN}:{}", s.https_port);
-    admin.ok("POST", "/resources", Some(json!({ "host": "down", "device_id": agent.id, "service": "down" })));
+    admin.ok("POST", "/resources", Some(json!({ "host": "down", "device_id": agent.id, "port": 9 })));
     let r = visitor.get(&format!("https://down.{DOMAIN}:{}/", s.https_port));
     assert_eq!(r.status, 502);
     assert!(r.body.contains("Service unreachable"));
@@ -1076,8 +1054,6 @@ fn check_failures_restart_revoke(
     for file in ["agent.conf", "private.key"] {
         fs::copy(config.join(file), second.join(file)).unwrap();
     }
-    fs::create_dir_all(second.join("services")).unwrap();
-    fs::copy(config.join("services/app"), second.join("services/app")).unwrap();
     let config_index = args.iter().position(|&arg| arg == "--config-dir").unwrap() + 1;
     args[config_index] = second.to_str().unwrap();
     let run = dir.join("agent/runtime/run");

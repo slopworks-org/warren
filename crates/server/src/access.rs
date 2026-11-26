@@ -122,7 +122,7 @@ pub fn strip_cookie(header: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::AccessMode;
+    use crate::db::{AccessMode, Scheme};
 
     fn res() -> Resource {
         Resource {
@@ -130,7 +130,8 @@ mod tests {
             user_id: 1,
             host: "app.example.com".into(),
             device_id: 1,
-            service: "web".into(),
+            target_port: 80,
+            target_scheme: Scheme::Http,
             access: AccessMode::Users,
             basic_user: String::new(),
             secret_hash: String::new(),

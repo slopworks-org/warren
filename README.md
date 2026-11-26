@@ -16,7 +16,7 @@ It is like Tailscale plus Cloudflare Tunnel, but you host it on one cheap VPS.
   reverse proxy, Let's Encrypt certificates, the web admin, an API and SQLite.
 - The agent for OpenWrt routers and Linux boxes is about 470 KB. It also
   runs on macOS.
-- You expose a service on the device, publish its name in the dashboard, then open
+- You publish a service with one form, then open
   `https://app.warren.example.com`.
 - Each service is public, or it asks for a Warren login, Basic auth or a PIN.
 - Phones and laptops connect with the usual WireGuard app and a QR code.
@@ -54,9 +54,8 @@ You need:
    wget -qO- https://github.com/slopworks-org/warren/releases/latest/download/install.sh \
      | sh -s -- agent --server https://warren.example.com --token wrt_…
    ```
-   On Linux, install nftables. On macOS, install wireguard-go and configure
-   the [packet filter](#agent-ingress-policy) before starting the agent.
-   The script installs WireGuard and nftables on OpenWrt (opkg or apk), registers
+   On macOS, install wireguard-go first: `brew install wireguard-go`.
+   The script installs `kmod-wireguard` on OpenWrt (opkg or apk), registers
    the device and starts the agent service (systemd, OpenWrt init or
    launchd). Check it with `warren status`.
    Agent commands automatically request administrator privileges through `sudo`
@@ -71,40 +70,8 @@ You need:
    For the native Warren Android app, choose **Devices → Add device → Warren
    Android app** and scan the one-time enrollment QR in the app. **WireGuard
    config** still creates a configuration for the standard WireGuard app.
-4. On the device, allow a local service:
-   ```sh
-   warren expose grafana 3000
-   ```
-   This forwards to `127.0.0.1:3000`. Use a hostname or IP with a port for another
-   address, or `warren expose console https://127.0.0.1:8443` for HTTPS.
-5. In **Resources → Publish service**, choose the device and exposed service.
-   Set the hostname, access policy and enabled state. Run `warren expose --list`
-   or `warren status` on the device to see local targets and published URLs.
-   `warren unexpose grafana` withdraws the grant and closes active streams.
-   Changes take effect while the daemon runs. Grant files persist under
-   `services/` in the agent configuration directory.
-
-### Agent ingress policy
-
-The agent opens each service stream outward over its WireGuard control channel.
-Only the service name and protocol leave the device. The agent looks up the
-target locally for every new connection. Incoming connections to application
-ports on both Warren interfaces are blocked, including traffic forwarded by
-the hub and connections from other devices. Outbound traffic, its replies,
-and IPv4 echo requests remain available.
-
-Linux requires the `nft` command and kernel connection tracking. On macOS,
-Warren enables PF with a reference-counted token (`pfctl -E`), loads
-`anchor "warren/*" quick` as the first filter rule in memory from
-`/etc/pf.conf` if it is not already present, and installs a dedicated anchor
-per utun. Warren refuses to configure peers if it cannot install the ingress
-policy.
-
-Upgrade the agents to enforce the local policy. Upgrading the server disables
-existing port-based publications and preserves their hostnames and access
-settings. Edit each route to select a client-exposed service and enable it.
-Manual WireGuard and Android profiles can use the tunnel but cannot advertise
-services through this protocol.
+4. Publish a service. Go to Resources → Publish service. Set the address, the
+   device and the port.
 
 The script checks every download against the release's `SHA256SUMS`.
 `--version v0.1.0` installs a given release. You can also download the
