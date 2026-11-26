@@ -237,7 +237,7 @@ pub async fn update(
 }
 
 /// `DELETE /api/v1/devices/{id}`: revokes the device; its key leaves the hub
-/// immediately and its resources are deleted.
+/// immediately.
 pub async fn remove(
     State(state): State<Arc<AppState>>,
     ip: Ip,

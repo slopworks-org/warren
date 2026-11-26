@@ -1,6 +1,6 @@
 #!/bin/sh
-# Puts the tunnel interface in its own firewall zone so the Warren server can
-# reach services on the router (fw4 rejects input on unknown interfaces).
+# Puts the tunnel interface in its own firewall zone so peers on the Warren
+# network can reach the router (fw4 rejects input on unknown interfaces).
 uci -q get firewall.warren >/dev/null && exit 0
 uci -q batch <<UCI
 set firewall.warren=zone

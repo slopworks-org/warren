@@ -4,7 +4,7 @@
 //! checked against the ACL (with a small connection table for replies) and
 //! re-encrypted for the destination peer. Only packets addressed to the hub
 //! itself are written to the TUN device, where the kernel's TCP stack serves
-//! the proxy and the control channel.
+//! the control channel.
 
 use super::packet::ipv4_flow;
 use super::{HubSpec, PeerSpec, PeerStats, WgError};

@@ -157,7 +157,7 @@ pub async fn task(state: Arc<AppState>) {
                 }
             }
         }
-        // Re-check hourly, or as soon as the set of hosts changes.
-        let _ = tokio::time::timeout(Duration::from_secs(3600), state.acme_wake.notified()).await;
+        // Re-check hourly.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }

@@ -1,24 +1,23 @@
-//! End-to-end test: agent → tunnel → reverse proxy → HTTP service on the device.
+//! End-to-end test: agent → tunnel → VPN peers, ACLs, and LAN peering.
 //!
 //! Runs the real binaries. The "device" lives in its own network namespace,
-//! connected to the host by a veth pair, and serves HTTP (and a WebSocket
-//! echo) on a port that is only reachable through the tunnel. A second
-//! namespace plays an agentless device configured from the generated
-//! `wg-quick` file. Needs Linux, root and `ip`, `wg`, `curl`; run it with
-//! `scripts/e2e.sh`, which builds everything in a privileged container.
+//! connected to the host by a veth pair, and serves HTTP on a port that is
+//! only reachable through the tunnel. A second namespace plays an agentless
+//! device configured from the generated `wg-quick` file. Needs Linux, root
+//! and `ip`, `wg`, `curl`; run it with `scripts/e2e.sh`, which builds
+//! everything in a privileged container.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -108,7 +107,7 @@ impl Netns {
         Guard(Some(child))
     }
 
-    /// Serves HTTP and a WebSocket echo on `port` inside the namespace.
+    /// Serves HTTP on `port` inside the namespace.
     fn serve(&self, port: u16) {
         let ns = fs::File::open(format!("/run/netns/{}", self.name)).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -160,14 +159,7 @@ impl Drop for Guard {
     }
 }
 
-fn ws_accept(key: &str) -> String {
-    use sha1::{Digest, Sha1};
-    let digest = Sha1::digest(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC11B85").as_bytes());
-    warren_proto::codec::b64_encode(&digest)
-}
-
-/// The HTTP service on the device: echoes request headers, or upgrades to a
-/// WebSocket that echoes text frames.
+/// The HTTP service on the device: echoes request headers.
 fn device_service(mut conn: TcpStream) {
     let mut reader = BufReader::new(conn.try_clone().unwrap());
     let mut head = Vec::new();
@@ -178,126 +170,9 @@ fn device_service(mut conn: TcpStream) {
         }
         head.push(line.trim_end().to_string());
     }
-    let header = |name: &str| {
-        head.iter().find_map(|l| {
-            l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string())
-        })
-    };
-    if let Some(key) = header("sec-websocket-key") {
-        let resp = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-            ws_accept(&key)
-        );
-        conn.write_all(resp.as_bytes()).unwrap();
-        while let Some(text) = read_frame(&mut reader) {
-            conn.write_all(&frame(&text, None)).unwrap();
-        }
-        return;
-    }
     let body = format!("hello from device\n{}\n", head.join("\n").to_lowercase());
     let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
     let _ = conn.write_all(resp.as_bytes());
-}
-
-fn frame(text: &str, mask: Option<[u8; 4]>) -> Vec<u8> {
-    let data = text.as_bytes();
-    // Test frames are short, so the 7-bit length form suffices.
-    let len = u8::try_from(data.len()).ok().filter(|l| *l < 126).unwrap();
-    let mut f = vec![0x81, len | if mask.is_some() { 0x80 } else { 0 }];
-    match mask {
-        Some(m) => {
-            f.extend_from_slice(&m);
-            f.extend(data.iter().enumerate().map(|(i, b)| b ^ m[i % 4]));
-        }
-        None => f.extend_from_slice(data),
-    }
-    f
-}
-
-fn read_frame(r: &mut impl Read) -> Option<String> {
-    let mut h = [0u8; 2];
-    r.read_exact(&mut h).ok()?;
-    let len = usize::from(h[1] & 0x7f);
-    let mask = if h[1] & 0x80 != 0 {
-        let mut m = [0u8; 4];
-        r.read_exact(&mut m).ok()?;
-        Some(m)
-    } else {
-        None
-    };
-    let mut data = vec![0u8; len];
-    r.read_exact(&mut data).ok()?;
-    if let Some(m) = mask {
-        data.iter_mut().enumerate().for_each(|(i, b)| *b ^= m[i % 4]);
-    }
-    String::from_utf8(data).ok()
-}
-
-#[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        m: &[u8],
-        c: &rustls::pki_types::CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
-    }
-    fn verify_tls13_signature(
-        &self,
-        m: &[u8],
-        c: &rustls::pki_types::CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Opens a WebSocket through the proxy, sends a text frame and returns the echo.
-fn websocket_echo(port: u16, host: &str, text: &str) -> String {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-        .with_no_client_auth();
-    let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
-    let conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
-    let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut tls = rustls::StreamOwned::new(conn, tcp);
-    let req = format!(
-        "GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
-    tls.write_all(req.as_bytes()).unwrap();
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        tls.read_exact(&mut byte).unwrap();
-        head.push(byte[0]);
-    }
-    let head = String::from_utf8_lossy(&head);
-    assert!(head.starts_with("HTTP/1.1 101"), "websocket handshake failed: {head}");
-    assert!(head.contains(&ws_accept("dGhlIHNhbXBsZSBub25jZQ==")));
-    tls.write_all(&frame(text, Some([1, 2, 3, 4]))).unwrap();
-    read_frame(&mut tls).unwrap()
 }
 
 struct Resp {
@@ -328,11 +203,8 @@ impl Client {
     /// Raw request; `None` status means the connection or TLS failed.
     fn try_request(&self, method: &str, url: &str, body: Option<&str>, extra: &[&str]) -> Option<Resp> {
         let headers_file = self.dir.join("headers.txt");
-        // Every name the test uses, so redirects between hosts resolve too.
-        let resolves: Vec<String> = ["", "app.", "pin.", "basic.", "private.", "down.", "nope."]
-            .iter()
-            .map(|p| format!("{p}{DOMAIN}:{}:127.0.0.1", self.port))
-            .collect();
+        let resolves: Vec<String> =
+            ["", "nope."].iter().map(|p| format!("{p}{DOMAIN}:{}:127.0.0.1", self.port)).collect();
         let csrf = format!("X-CSRF-Token: {}", self.csrf);
         let jar = self.jar.to_str().unwrap();
         let mut args = vec![
@@ -400,10 +272,6 @@ impl Client {
             self.csrf = self.ok("GET", "/me", None)["csrf"].as_str().unwrap().to_string();
         }
         v
-    }
-
-    fn get(&self, url: &str) -> Resp {
-        self.request("GET", url, None, &[])
     }
 }
 
@@ -515,17 +383,15 @@ fn agent_args<'a>(base: &'a [String], extra: &[&'a str]) -> Vec<&'a str> {
 fn flows(s: &Scenario, dir: &Path, dev: &Netns, admin: &mut Client, agent_bin: &str) {
     admin.login("admin", "admin-password-1");
     assert_eq!(admin.ok("GET", "/me", None)["user"]["role"], "admin");
+    check_admin_edge(s, admin);
     let mut agent = register_agent(s, dir, dev, admin, agent_bin);
-    check_public_proxy(s, admin, &agent);
-    let visitor = Client::new(dir, "visitor", s.https_port);
-    check_pin_and_basic(s, admin, &visitor, agent.id);
-    let (bob, bob_id) = check_users_mode(s, dir, admin, &visitor, agent.id);
+    let (bob, bob_id) = check_users_and_isolation(s, dir, admin, agent.id);
     let bob = check_two_factor(bob);
     check_mandatory_2fa(dir, admin, s.https_port);
     check_api_token(dir, admin, s.https_port);
     check_agentless_and_acl(s, dir, admin, &bob, bob_id, &agent);
     check_lan_peers(s, dir, dev, admin, agent_bin, &agent);
-    check_failures_restart_revoke(s, dir, dev, admin, &visitor, &mut agent);
+    check_failures_restart_revoke(s, dir, dev, admin, &mut agent);
     check_audit(admin, &bob);
 }
 
@@ -714,27 +580,12 @@ fi
     }
 }
 
-/// A public resource: HTTP and WebSocket through the tunnel, redirects, and
-/// no certificate for unknown names.
-fn check_public_proxy(s: &Scenario, admin: &Client, agent: &Agent) {
-    let res = admin.ok("POST", "/resources", Some(json!({ "host": "app", "device_id": agent.id, "port": 8000 })));
-    assert_eq!(res["host"], format!("app.{DOMAIN}"));
-    let app = format!("https://app.{DOMAIN}:{}", s.https_port);
-    let r = admin.request("GET", &format!("{app}/hello"), None, &["-H", "Cookie: theirs=1; __Host-warren_auth=leak"]);
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert!(r.body.starts_with("hello from device"));
-    assert!(r.body.contains("get /hello http/1.1"));
-    assert!(r.body.contains("x-forwarded-proto: https"));
-    assert!(r.body.contains("x-forwarded-for: 127.0.0.1"));
-    assert!(r.body.contains(&format!("x-forwarded-host: app.{DOMAIN}")));
-    assert!(r.body.contains("cookie: theirs=1") && !r.body.contains("leak"), "gate cookie must not reach the device");
-    let echo = websocket_echo(s.https_port, &format!("app.{DOMAIN}"), "ping through the tunnel");
-    assert_eq!(echo, "ping through the tunnel");
-    let resolve = format!("app.{DOMAIN}:{}:127.0.0.1", s.http_port);
-    let plain =
-        admin.request("GET", &format!("http://app.{DOMAIN}:{}/x?y=1", s.http_port), None, &["--resolve", &resolve]);
+/// Admin HTTP→HTTPS redirect, unknown SNI rejection, and raw IP rejection.
+fn check_admin_edge(s: &Scenario, admin: &Client) {
+    let resolve = format!("{DOMAIN}:{}:127.0.0.1", s.http_port);
+    let plain = admin.request("GET", &format!("http://{DOMAIN}:{}/x?y=1", s.http_port), None, &["--resolve", &resolve]);
     assert_eq!(plain.status, 308);
-    assert!(plain.headers.to_lowercase().contains(&format!("location: https://app.{DOMAIN}:{}/x?y=1", s.https_port)));
+    assert!(plain.headers.to_lowercase().contains(&format!("location: https://{DOMAIN}:{}/x?y=1", s.https_port)));
 
     assert!(admin.try_request("GET", &format!("https://nope.{DOMAIN}:{}/", s.https_port), None, &[]).is_none());
     let by_ip = Command::new("curl")
@@ -744,70 +595,20 @@ fn check_public_proxy(s: &Scenario, admin: &Client, agent: &Agent) {
     assert!(!by_ip.success(), "HTTPS by IP address must fail");
 }
 
-fn check_pin_and_basic(s: &Scenario, admin: &Client, visitor: &Client, dev_id: i64) {
-    let pin = admin.ok(
-        "POST",
-        "/resources",
-        Some(json!({ "host": "pin", "device_id": dev_id, "port": 8000, "access": "pin", "secret": "4321" })),
-    );
-    let pin_url = format!("https://pin.{DOMAIN}:{}", s.https_port);
-    let r = visitor.get(&format!("{pin_url}/secret"));
-    assert_eq!(r.status, 401);
-    assert!(r.body.contains("PIN required") && !r.body.contains("hello from device"));
-    let bad = visitor.request("POST", &format!("{pin_url}/.warren/pin"), None, &["--data", "pin=0000&next=/secret"]);
-    assert_eq!(bad.status, 401);
-    let good = visitor.request("POST", &format!("{pin_url}/.warren/pin"), None, &["--data", "pin=4321&next=/secret"]);
-    assert_eq!(good.status, 303, "{}", good.body);
-    assert_eq!(visitor.get(&format!("{pin_url}/secret")).status, 200);
-    // Changing the resource signs PIN visitors out.
-    admin.ok("PATCH", &format!("/resources/{}", pin["id"]), Some(json!({ "secret": "9999" })));
-    assert_eq!(visitor.get(&format!("{pin_url}/secret")).status, 401);
-
-    let basic = json!({ "host": "basic", "device_id": dev_id, "port": 8000, "access": "basic", "basic_user": "u", "secret": "basic-pass" });
-    admin.ok("POST", "/resources", Some(basic));
-    let basic_url = format!("https://basic.{DOMAIN}:{}/", s.https_port);
-    assert_eq!(visitor.get(&basic_url).status, 401);
-    assert_eq!(visitor.request("GET", &basic_url, None, &["-u", "u:wrong-pass"]).status, 401);
-    let ok = visitor.request("GET", &basic_url, None, &["-u", "u:basic-pass"]);
-    assert_eq!(ok.status, 200);
-    assert!(!ok.body.contains("authorization:"), "Basic credentials must not reach the device");
-}
-
-/// Users mode, a second user and isolation; returns bob's client and id.
-fn check_users_mode(s: &Scenario, dir: &Path, admin: &Client, visitor: &Client, dev_id: i64) -> (Client, i64) {
-    let users_res = admin.ok(
-        "POST",
-        "/resources",
-        Some(json!({ "host": "private", "device_id": dev_id, "port": 8000, "access": "users" })),
-    );
-    let private = format!("https://private.{DOMAIN}:{}", s.https_port);
-    let r = visitor.get(&format!("{private}/inner?a=b"));
-    assert_eq!(r.status, 303);
-    assert!(r.headers.contains(&format!("https://{DOMAIN}:{}/auth/resource?rid={}", s.https_port, users_res["id"])));
-    // The administrator follows the sign-in hop and gets in.
-    let signed_in = admin.request("GET", &format!("{private}/inner?a=b"), None, &["-L"]);
-    assert_eq!(signed_in.status, 200, "{}", signed_in.body);
-    assert!(signed_in.body.contains("get /inner?a=b") && signed_in.body.contains("x-warren-user: admin"));
-
+/// A second user and isolation; returns bob's client and id.
+fn check_users_and_isolation(s: &Scenario, dir: &Path, admin: &Client, dev_id: i64) -> (Client, i64) {
     let created = admin.ok("POST", "/users", Some(json!({ "username": "bob", "password": "bob-password-1" })));
     let bob_id = created["user"]["id"].as_i64().unwrap();
     let mut bob = Client::new(dir, "bob", s.https_port);
     bob.login("bob", "bob-password-1");
     assert_eq!(bob.ok("GET", "/devices", None), json!([]));
-    assert_eq!(bob.ok("GET", "/resources", None), json!([]));
     assert_eq!(bob.api("GET", &format!("/devices/{dev_id}"), None).status, 404);
     assert_eq!(bob.api("DELETE", &format!("/devices/{dev_id}"), None).status, 404);
     assert_eq!(bob.api("GET", "/users", None).status, 403);
-    let denied = bob.request("GET", &format!("{private}/"), None, &["-L"]);
-    assert_eq!(denied.status, 403, "{}", denied.body);
     // CSRF: a cookie session without the right header cannot change anything.
     let mut no_csrf = Client::new(dir, "bob", s.https_port);
     no_csrf.csrf = "wrong".into();
     assert_eq!(no_csrf.api("POST", "/me/tokens", Some(json!({ "name": "x" }))).status, 403);
-    // Granting bob opens it.
-    let grants = json!({ "grants": [format!("user:{bob_id}")] });
-    admin.ok("PATCH", &format!("/resources/{}", users_res["id"]), Some(grants));
-    assert_eq!(bob.request("GET", &format!("{private}/"), None, &["-L"]).status, 200);
     (bob, bob_id)
 }
 
@@ -1021,26 +822,24 @@ fn restore_mesh_route(ns: &Netns, iface: &str, destination: &str, source: &str) 
     ns.must(&["ip", "route", "replace", &format!("{destination}/32"), "dev", iface, "src", source, "proto", "static"]);
 }
 
-/// Error pages, an agent restart ("reboot") and revocation.
-fn check_failures_restart_revoke(
-    s: &Scenario,
-    dir: &Path,
-    dev: &Netns,
-    admin: &Client,
-    visitor: &Client,
-    agent: &mut Agent,
-) {
-    let app = format!("https://app.{DOMAIN}:{}", s.https_port);
-    admin.ok("POST", "/resources", Some(json!({ "host": "down", "device_id": agent.id, "port": 9 })));
-    let r = visitor.get(&format!("https://down.{DOMAIN}:{}/", s.https_port));
-    assert_eq!(r.status, 502);
-    assert!(r.body.contains("Service unreachable"));
-    assert!(!r.body.contains("router") && !r.body.contains(&agent.addr), "error pages name no device");
+/// Device disable, an agent restart ("reboot") and revocation.
+fn check_failures_restart_revoke(s: &Scenario, dir: &Path, dev: &Netns, admin: &Client, agent: &mut Agent) {
+    let hub_vpn_ip = warren_server::config::Net4::parse(s.network).unwrap().server_ip().to_string();
+    let probe_url = format!("http://{}:8000/again", agent.addr);
+    let reachable = || {
+        let out = Command::new("curl").args(["-s", "--max-time", "2", &probe_url]).output().unwrap();
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("hello from device")
+    };
+    wait_for("the agent to be reachable over the VPN", Duration::from_secs(15), reachable);
     admin.ok("PATCH", &format!("/devices/{}", agent.id), Some(json!({ "enabled": false })));
-    let r = visitor.get(&format!("{app}/"));
-    assert_eq!(r.status, 503);
-    assert!(r.body.contains("Site offline") && !r.body.contains("router"));
+    wait_for("disabled device to lose tunnel access", Duration::from_secs(10), || !reachable());
     admin.ok("PATCH", &format!("/devices/{}", agent.id), Some(json!({ "enabled": true })));
+    wait_for("re-enabled device to regain tunnel access", Duration::from_secs(20), || {
+        // Both WireGuard peers drop the session and learned endpoint on disable;
+        // send a packet from the agent so it initiates a fresh handshake right away.
+        let _ = dev.exec(&["ping", "-c", "1", "-W", "1", &hub_vpn_ip]);
+        reachable()
+    });
 
     // The daemon stops (removing its interface) and starts again.
     agent.daemon.terminate();
@@ -1061,8 +860,7 @@ fn check_failures_restart_revoke(
     fs::set_permissions(run.join("status"), fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
     agent.daemon = dev.spawn(&args, &dir.join("agent2.log"));
-    let reachable = || visitor.try_request("GET", &format!("{app}/again"), None, &[]).is_some_and(|r| r.status == 200);
-    wait_for("the published service after a different registration starts", Duration::from_secs(30), || {
+    wait_for("the tunnel after a different registration starts", Duration::from_secs(30), || {
         !installed.with_extension("update-activation").exists() && reachable()
     });
     let pid = agent.daemon.0.as_ref().unwrap().id();
@@ -1078,7 +876,7 @@ fn check_failures_restart_revoke(
     args[config_index] = config.to_str().unwrap();
     args[run_index] = next_run.to_str().unwrap();
     check_orphaned_worker(dev, &mut agent.daemon, &args, &next_run, &dir.join("agent2.log"));
-    wait_for("the service after orphan teardown", Duration::from_secs(30), reachable);
+    wait_for("the tunnel after orphan teardown", Duration::from_secs(30), reachable);
 
     agent.daemon.terminate();
     for phase in ["version", "run"] {
@@ -1103,11 +901,10 @@ fn check_failures_restart_revoke(
     assert!(!installed.with_extension("update-backup").exists());
     fs::remove_file(direct).unwrap();
 
-    // Revoking removes the device and its resources.
+    // Revoking removes the device and drops it from the hub.
     admin.ok("DELETE", &format!("/devices/{}", agent.id), None);
-    let resources = admin.ok("GET", "/resources", None);
-    assert!(resources.as_array().unwrap().iter().all(|r| r["device_id"] != json!(agent.id)));
-    assert!(visitor.try_request("GET", &format!("{app}/"), None, &[]).is_none(), "its hosts are no longer served");
+    assert_eq!(admin.api("GET", &format!("/devices/{}", agent.id), None).status, 404);
+    wait_for("revoked device to lose tunnel access", Duration::from_secs(10), || !reachable());
     agent.daemon.terminate();
 }
 
@@ -1461,15 +1258,7 @@ fn check_orphaned_worker(dev: &Netns, daemon: &mut Guard, args: &[&str], run: &P
 fn check_audit(admin: &Client, bob: &Client) {
     let audit = admin.ok("GET", "/audit?limit=500", None);
     let actions: Vec<&str> = audit.as_array().unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
-    let expected = [
-        "auth.login",
-        "device.register",
-        "resource.create",
-        "device.revoke",
-        "user.create",
-        "acl.create",
-        "user.2fa_enable",
-    ];
+    let expected = ["auth.login", "device.register", "device.revoke", "user.create", "acl.create", "user.2fa_enable"];
     for a in expected {
         assert!(actions.contains(&a), "audit log lacks {a}: {actions:?}");
     }

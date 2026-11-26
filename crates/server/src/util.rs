@@ -124,18 +124,6 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
-/// Percent-encodes a query-string component.
-#[must_use]
-pub fn url_encode(s: &str) -> String {
-    form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
-/// True if `next` is a same-origin relative path safe to redirect to.
-#[must_use]
-pub fn safe_next(next: &str) -> bool {
-    next.starts_with('/') && !next.starts_with("//") && !next.starts_with("/\\") && !next.contains(['\r', '\n'])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,8 +140,6 @@ mod tests {
     #[test]
     fn misc() {
         assert_eq!(html_escape("<a href=\"x\">&'"), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
-        assert!(safe_next("/a?b=c"));
-        assert!(!safe_next("//evil.com") && !safe_next("https://evil.com") && !safe_next("/\\evil"));
         assert_ne!(token(), token());
         assert_eq!(sha256_hex(b"abc").len(), 64);
         assert_ne!(fnv64(b"a"), fnv64(b"b"));

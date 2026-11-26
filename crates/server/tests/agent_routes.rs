@@ -27,7 +27,7 @@ fn state() -> Arc<AppState> {
     let config =
         Config::from_toml("domain = 'warren.test'\n[tls]\nmode = 'self-signed'\n[wireguard]\nlan_peers = false")
             .unwrap();
-    let certs = Arc::new(CertStore::new(TlsMode::SelfSigned, PathBuf::new(), None, None).unwrap());
+    let certs = Arc::new(CertStore::new(TlsMode::SelfSigned, PathBuf::new(), config.admin_host(), None, None).unwrap());
     Arc::new(AppState::new(config, Db::memory().unwrap(), &[2; 32], [3; 32], certs, Backend::None))
 }
 

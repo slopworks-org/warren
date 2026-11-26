@@ -173,7 +173,6 @@ function go(path) {
 
 const NAV = [
   ['/devices', 'Devices', null],
-  ['/resources', 'Resources', null],
   ['/users', 'Users', 'users.manage'],
   ['/settings', 'Settings', 'settings.manage'],
   ['/audit', 'Audit log', null],
@@ -215,7 +214,6 @@ async function loadMe() {
 
 const PAGES = {
   '/devices': devicesPage,
-  '/resources': resourcesPage,
   '/users': usersPage,
   '/settings': settingsPage,
   '/audit': auditPage,
@@ -225,7 +223,7 @@ const PAGES = {
 async function route() {
   clearInterval(refreshTimer);
   const { path, params } = parseHash();
-  if (path === '/login') return loginPage(params);
+  if (path === '/login') return loginPage();
   if (path === '/setup') return setupPage(params);
   if (path === '/register') return registerPage(params);
   if (!me && !(await loadMe())) return go('/login');
@@ -244,18 +242,12 @@ function authCard(title, ...children) {
     h('h1', { text: title }), ...children)));
 }
 
-function safeNext(n) {
-  return n && n.startsWith('/') && !n.startsWith('//') && !n.startsWith('/\\') ? n : null;
-}
-
-async function afterLogin(params) {
+async function afterLogin() {
   await loadMe();
-  const next = safeNext(params.get('next'));
-  if (next) location.href = next;
-  else go('/devices');
+  go('/devices');
 }
 
-async function loginPage(params) {
+async function loginPage() {
   const status = await api('GET', '/auth/status').catch(() => ({}));
   if (status.setup_required) {
     authCard('Welcome', h('p', { class: 'lead', text: 'No administrator exists yet. Use the setup link from the server log, or run `warren-server create-admin <name>` on the server.' }));
@@ -286,7 +278,7 @@ async function loginPage(params) {
       } else {
         await api('POST', '/auth/totp', { code: code.value });
       }
-      await afterLogin(params);
+      await afterLogin();
     } catch (e) {
       error.textContent = e.message;
     }
@@ -318,7 +310,7 @@ function setupPage(params) {
     credentialsForm('Create', async (username, password) => {
       await api('POST', '/auth/setup', { token: params.get('token') || '', username, password });
       await api('POST', '/auth/login', { username, password });
-      await afterLogin(new URLSearchParams());
+      await afterLogin();
     }));
 }
 
@@ -327,7 +319,7 @@ function registerPage(params) {
     credentialsForm('Create account', async (username, password) => {
       await api('POST', '/auth/register', { invite: params.get('invite') || '', username, password });
       await api('POST', '/auth/login', { username, password });
-      await afterLogin(new URLSearchParams());
+      await afterLogin();
     }));
 }
 
@@ -406,7 +398,7 @@ async function devicesPage(el) {
           } }),
           d.kind === 'manual' ? h('button', { class: 'small', text: 'Config', onclick: () => showConfig(d) }) : null,
           h('button', { class: 'small danger', text: 'Revoke', onclick: () => confirmDialog('Revoke ' + d.name + '?',
-            'The device is disconnected at once and its resources are deleted. This cannot be undone.', async () => {
+            'The device is disconnected at once. This cannot be undone.', async () => {
               await api('DELETE', '/devices/' + d.id);
               toast('Device revoked');
               load();
@@ -511,105 +503,6 @@ async function addDeviceDialog(reload) {
   return dlg;
 }
 
-// ---------- resources ----------
-
-const ACCESS = [['public', 'Public — anyone'], ['users', 'Warren users'], ['basic', 'Basic auth'], ['pin', 'PIN code']];
-
-function accessBadge(r) {
-  const label = { public: 'Public', users: 'Users', basic: 'Basic auth', pin: 'PIN' }[r.access];
-  return h('span', { class: 'badge plain', text: label });
-}
-
-async function resourcesPage(el) {
-  const list = h('div', { class: 'panel' });
-  el.append(h('div', { class: 'head' },
-    h('div', {}, h('h1', { text: 'Resources' }), h('p', { class: 'lead', text: 'Services on your devices, published over HTTPS.' })),
-    h('button', { class: 'primary', text: 'Publish service', onclick: () => resourceDialog(null, load) })), list);
-
-  async function load() {
-    const items = await attempt(() => api('GET', '/resources'));
-    if (!items) return;
-    if (!items.length) {
-      list.replaceChildren(h('div', { class: 'empty', text: 'Nothing published yet.' }));
-      return;
-    }
-    list.replaceChildren(h('div', { class: 'table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, h('th', { text: 'Address' }), h('th', { text: 'Target' }), h('th', { text: 'Access' }),
-        can('resources.all') ? h('th', { class: 'hide-sm', text: 'Owner' }) : null, h('th'))),
-      h('tbody', {}, items.map((r) => h('tr', {},
-        h('td', {}, h('a', { href: r.url, target: '_blank', rel: 'noopener', text: r.host }),
-          r.enabled ? null : h('div', { class: 'sub', text: 'disabled' })),
-        h('td', {}, h('div', {}, (r.device_name || '?') + ' : ' + r.target_port),
-          h('div', { class: 'sub' }, r.target_scheme.toUpperCase() + ' · ', r.device_online ? 'device online' : 'device offline')),
-        h('td', {}, accessBadge(r)),
-        can('resources.all') ? h('td', { class: 'hide-sm', text: r.owner }) : null,
-        h('td', {}, h('div', { class: 'actions' },
-          h('button', { class: 'small', text: 'Edit', onclick: () => resourceDialog(r, load) }),
-          h('button', { class: 'small', text: r.enabled ? 'Disable' : 'Enable', onclick: async () => {
-            await attempt(() => api('PATCH', '/resources/' + r.id, { enabled: !r.enabled }));
-            load();
-          } }),
-          h('button', { class: 'small danger', text: 'Delete', onclick: () => confirmDialog('Delete ' + r.host + '?',
-            'The address stops working immediately.', async () => { await api('DELETE', '/resources/' + r.id); load(); }) })))))))));
-  }
-  await load();
-  refreshTimer = setInterval(load, 15000);
-}
-
-async function resourceDialog(res, reload) {
-  const devices = await attempt(() => api('GET', '/devices'));
-  if (!devices) return;
-  if (!devices.length) { toast('Add a device first.'); return; }
-  const roles = await attempt(() => api('GET', '/roles')) || [];
-  const users = await attempt(usersForPicker) || [];
-  modal(res ? 'Edit ' + res.host : 'Publish a service', (body) => {
-    const domain = server ? server.domain : '';
-    const host = h('input', { required: true, value: res ? res.host : '', placeholder: 'app' });
-    const device = select(devices.map((d) => [d.id, d.name + ' (' + d.address + ')' + (can('devices.all') && d.owner !== me.user.username ? ' — ' + d.owner : '')]), res ? res.device_id : devices[0].id);
-    const port = h('input', { type: 'number', min: 1, max: 65535, required: true, value: res ? res.target_port : '' });
-    const scheme = select([['http', 'HTTP'], ['https', 'HTTPS (certificate not checked)']], res ? res.target_scheme : 'http');
-    const access = select(ACCESS, res ? res.access : 'public');
-    const basicUser = h('input', { value: res ? res.basic_user : '', autocomplete: 'off' });
-    const secret = h('input', { type: 'password', autocomplete: 'new-password' });
-    const enabled = h('input', { type: 'checkbox', checked: res ? res.enabled : true });
-    const grants = new Set(res ? res.grants : []);
-    const grantBox = (subject, label) => h('label', { class: 'check' },
-      h('input', { type: 'checkbox', checked: grants.has(subject), onchange: (e) => (e.target.checked ? grants.add(subject) : grants.delete(subject)) }), label);
-    const modePane = h('div');
-    function renderMode() {
-      const m = access.value;
-      const keep = res && res.access === m ? 'Leave empty to keep the current one.' : null;
-      if (m === 'basic') modePane.replaceChildren(field('User name', basicUser), field('Password', secret, keep || 'At least 8 characters.'));
-      else if (m === 'pin') modePane.replaceChildren(field('PIN', secret, keep || '4 to 64 characters.'));
-      else if (m === 'users') {
-        modePane.replaceChildren(h('label', { text: 'Who may open it' }),
-          h('div', { class: 'hint', text: 'The owner and administrators always can.' }),
-          grantBox('all', 'Every signed-in user'),
-          ...roles.map((r) => grantBox('role:' + r.id, 'Role: ' + r.name)),
-          ...users.filter((u) => u.id !== me.user.id).map((u) => grantBox('user:' + u.id, 'User: ' + u.username)));
-      } else modePane.replaceChildren(h('div', { class: 'hint', text: 'Anyone with the address can open it.' }));
-    }
-    access.addEventListener('change', renderMode);
-    renderMode();
-    body.append(
-      field('Address', host, 'A name like “app” becomes app.' + domain + '; a full domain must point to this server.'),
-      field('Device', device), h('div', { class: 'row' }, field('Port', port), field('Protocol on the device', scheme)),
-      field('Access', access), modePane, h('label', { class: 'check' }, enabled, 'Enabled'));
-    return async () => {
-      const payload = {
-        host: host.value, device_id: Number(device.value), port: Number(port.value), scheme: scheme.value,
-        access: access.value, basic_user: basicUser.value, grants: [...grants], enabled: enabled.checked,
-      };
-      if (secret.value) payload.secret = secret.value;
-      if (res) await api('PATCH', '/resources/' + res.id, payload);
-      else await api('POST', '/resources', payload);
-      toast(res ? 'Saved' : 'Published');
-      reload();
-      return true;
-    };
-  });
-}
-
 // ---------- users ----------
 
 async function usersPage(el) {
@@ -641,7 +534,7 @@ async function usersPage(el) {
           } }),
           h('button', { class: 'small', text: 'Reset password', onclick: () => resetPassword(u) }),
           h('button', { class: 'small danger', text: 'Delete', onclick: () => confirmDialog('Delete ' + u.username + '?',
-            'Their devices and resources are deleted too.', async () => { await api('DELETE', '/users/' + u.id); load(); }) })))))))));
+            'Their devices are deleted too.', async () => { await api('DELETE', '/users/' + u.id); load(); }) })))))))));
     const inv = await attempt(() => api('GET', '/invites')) || [];
     invites.replaceChildren(inv.length ? h('div', { class: 'table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, h('th', { text: 'Role' }), h('th', { text: 'Expires' }), h('th', { text: 'Status' }), h('th'))),
@@ -748,7 +641,7 @@ async function settingsPage(el) {
 
   const acl = h('div', { class: 'panel' });
   const info = server ? h('div', { class: 'panel pad' }, h('dl', { class: 'kv' },
-    [['Version', server.version], ['Update channel', server.update_channel], ['Admin URL', server.admin_url], ['Resource domain', '*.' + server.domain],
+    [['Version', server.version], ['Update channel', server.update_channel], ['Admin URL', server.admin_url],
       ['WireGuard endpoint', server.wg_endpoint], ['Tunnel network', server.network + ' (server ' + server.server_ip + ')'],
       ['Server public key', server.public_key], ['Tunnel backend', server.backend], ['TLS', server.tls_mode]]
       .map(([k, v]) => [h('dt', { text: k }), h('dd', { class: k.includes('key') ? 'mono' : null, text: v })]))) : null;

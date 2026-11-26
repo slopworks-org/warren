@@ -1,14 +1,11 @@
 //! Listeners and request routing by host.
 //!
-//! * HTTPS: the admin host goes to the API/UI router, a resource host to the
-//!   access gate and the proxy, anything else gets a 404 (and unknown SNI
-//!   names never complete the TLS handshake).
+//! * HTTPS: the admin host goes to the API/UI router; anything else gets a 404
+//!   (and unknown SNI names never complete the TLS handshake).
 //! * HTTP: ACME challenges, agent registration, redirects to HTTPS.
 //! * Control: the agent long-poll, bound to the hub's tunnel address only.
 
-mod gate;
 pub mod pages;
-mod proxy;
 
 use crate::state::AppState;
 use axum::Router;
@@ -27,8 +24,6 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
-pub use proxy::Upstream;
-
 /// Upper bound on simultaneous client connections per listener; protects
 /// memory on small machines.
 const MAX_CONNECTIONS: usize = 2048;
@@ -37,7 +32,7 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-connection read/write buffer cap. hyper's default (~400 KiB) lets
 /// each streaming connection read far ahead; 64 KiB keeps 100 parallel
 /// downloads within the memory budget without hurting throughput.
-pub(crate) const MAX_BUF: usize = 64 * 1024;
+const MAX_BUF: usize = 64 * 1024;
 
 /// Address of the client, inserted into every request's extensions.
 #[derive(Clone, Copy, Debug)]
@@ -74,7 +69,6 @@ fn http1() -> hyper::server::conn::http1::Builder {
 
 async fn dispatch_https(
     state: Arc<AppState>,
-    upstream: Arc<Upstream>,
     admin: Router,
     sni: Option<String>,
     req: Request<Incoming>,
@@ -90,16 +84,14 @@ async fn dispatch_https(
         );
     }
     if host == state.config.admin_host() {
-        return admin.oneshot(req.map(Body::new)).await.unwrap_or_else(|e| match e {});
-    }
-    match state.snapshot().resources.get(&host).cloned() {
-        Some(res) => proxy::handle(&state, &upstream, res, req).await,
-        None => pages::not_found(),
+        admin.oneshot(req.map(Body::new)).await.unwrap_or_else(|e| match e {})
+    } else {
+        pages::not_found()
     }
 }
 
 /// Serves HTTPS until the listener fails.
-pub async fn serve_https(state: Arc<AppState>, upstream: Arc<Upstream>, admin: Router, listener: TcpListener) {
+pub async fn serve_https(state: Arc<AppState>, admin: Router, listener: TcpListener) {
     let acceptor = TlsAcceptor::from(Arc::new(crate::tls::server_config(Arc::clone(&state.certs))));
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -115,8 +107,7 @@ pub async fn serve_https(state: Arc<AppState>, upstream: Arc<Upstream>, admin: R
             tracing::warn!("connection limit reached; dropping HTTPS connection");
             continue;
         };
-        let (state, upstream, admin, acceptor) =
-            (Arc::clone(&state), Arc::clone(&upstream), admin.clone(), acceptor.clone());
+        let (state, admin, acceptor) = (Arc::clone(&state), admin.clone(), acceptor.clone());
         tokio::spawn(async move {
             let _permit = permit;
             let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
@@ -130,10 +121,10 @@ pub async fn serve_https(state: Arc<AppState>, upstream: Arc<Upstream>, admin: R
             let sni = tls.get_ref().1.server_name().map(str::to_ascii_lowercase);
             let svc = service_fn(move |mut req: Request<Incoming>| {
                 req.extensions_mut().insert(ClientIp(peer.ip()));
-                let fut = dispatch_https(Arc::clone(&state), Arc::clone(&upstream), admin.clone(), sni.clone(), req);
+                let fut = dispatch_https(Arc::clone(&state), admin.clone(), sni.clone(), req);
                 async move { Ok::<_, Infallible>(fut.await) }
             });
-            if let Err(e) = http1().serve_connection(TokioIo::new(tls), svc).with_upgrades().await {
+            if let Err(e) = http1().serve_connection(TokioIo::new(tls), svc).await {
                 tracing::debug!(peer = %peer, error = %e, "HTTPS connection ended with error");
             }
         });

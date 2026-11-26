@@ -19,8 +19,6 @@ pub enum Perm {
     ManageSettings,
     /// See and manage every user's devices.
     AllDevices,
-    /// See and manage every user's resources.
-    AllResources,
     /// Read everyone's audit log.
     AllAudit,
 }
@@ -33,7 +31,6 @@ impl Perm {
             Perm::ManageUsers => "users.manage",
             Perm::ManageSettings => "settings.manage",
             Perm::AllDevices => "devices.all",
-            Perm::AllResources => "resources.all",
             Perm::AllAudit => "audit.all",
         }
     }

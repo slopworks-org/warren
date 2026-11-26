@@ -1,33 +1,25 @@
 # Warren
 
-Warren puts the web apps on your router, NAS or home server on the internet
-at an HTTPS address. You do not open any ports at home.
+Warren is a self-hosted WireGuard mesh VPN with a tiny hub server on one VPS
+and lightweight agents for routers, Linux, macOS, and Android.
 
-It is like Tailscale plus Cloudflare Tunnel, but you host it on one cheap VPS.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
-  <img alt="Browser → proxy on a VPS → WireGuard tunnel → agent on your device → your app" src="docs/architecture-light.svg">
-</picture>
-
-- Your device connects out to the VPS, so Warren works behind NAT and CGNAT.
-  Nothing listens on the device.
-- The server is one binary of about 9 MB. It has the WireGuard hub, the
-  reverse proxy, Let's Encrypt certificates, the web admin, an API and SQLite.
+- Your devices connect out to the VPS, so Warren works behind NAT and CGNAT.
+  Nothing needs to listen on the public internet at home.
+- The server is one binary of about 9 MB. It has the WireGuard hub,
+  Let's Encrypt certificates for the admin, the web admin, an API and SQLite.
 - The agent for OpenWrt routers and Linux boxes is about 470 KB. It also
   runs on macOS.
-- You publish a service with one form, then open
-  `https://app.warren.example.com`.
-- Each service is public, or it asks for a Warren login, Basic auth or a PIN.
-- Phones and laptops connect with the usual WireGuard app and a QR code.
+- Agents on the same LAN connect directly to each other and fall back to the
+  VPS when that path breaks.
+- Phones and laptops connect with the native Android app or the usual
+  WireGuard app and a QR code.
 
 ## Get started
 
 You need:
 
 - a Linux VPS with 512 MB of RAM or more;
-- a domain, with `warren.example.com` and `*.warren.example.com` pointed at
-  the VPS;
+- a domain, with `warren.example.com` pointed at the VPS;
 - ports 80/tcp, 443/tcp and 51820/udp open on the VPS.
 
 1. Install the server on the VPS:
@@ -70,8 +62,6 @@ You need:
    For the native Warren Android app, choose **Devices → Add device → Warren
    Android app** and scan the one-time enrollment QR in the app. **WireGuard
    config** still creates a configuration for the standard WireGuard app.
-4. Publish a service. Go to Resources → Publish service. Set the address, the
-   device and the port.
 
 The script checks every download against the release's `SHA256SUMS`.
 `--version v0.1.0` installs a given release. You can also download the
@@ -212,12 +202,10 @@ HTTP API for all admin actions.
 
 ## Limits
 
-- No DNS-01, so no automatic wildcard certificates. To use your own
-  certificate, set `mode = "files"` in the `[tls]` section.
 - Only IPv4 inside the tunnel.
 - The agent needs kernel WireGuard on Linux and wireguard-go on macOS.
-- No direct paths between devices on different networks, no OIDC, no raw
-  TCP/UDP forwarding, no multiple servers.
+- No direct paths between devices on different networks, no OIDC, no multiple
+  servers.
 
 ## Change the code
 

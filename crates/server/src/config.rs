@@ -192,7 +192,7 @@ impl Default for UpdateConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Base domain: resources are published as `<name>.<domain>`.
+    /// Base domain for the server.
     pub domain: String,
     /// Host of the admin UI and API; defaults to `domain`.
     #[serde(default)]
@@ -206,7 +206,7 @@ pub struct Config {
     /// Plain HTTP listener (ACME challenges, redirects, agent registration).
     #[serde(default = "default_http")]
     pub listen_http: SocketAddr,
-    /// HTTPS listener (admin UI and published resources).
+    /// HTTPS listener (admin UI and API).
     #[serde(default = "default_https")]
     pub listen_https: SocketAddr,
     /// HTTPS port as seen from the internet, for redirects; defaults to the listener's.
@@ -393,13 +393,6 @@ impl Config {
             p => format!("https://{host}:{p}"),
         }
     }
-
-    /// Expands a resource name: a bare label becomes `<label>.<domain>`.
-    #[must_use]
-    pub fn resource_host(&self, name: &str) -> Option<String> {
-        let h = normalize_host(name)?;
-        Some(if h.contains('.') { h } else { format!("{h}.{}", self.domain) })
-    }
 }
 
 #[cfg(test)]
@@ -428,9 +421,6 @@ mod tests {
         assert_eq!(c.wg_endpoint(), "w.example.com:51820");
         assert_eq!(c.network().server_ip(), Ipv4Addr::new(10, 77, 0, 1));
         assert_eq!(c.https_origin("x.w.example.com"), "https://x.w.example.com");
-        assert_eq!(c.resource_host("App").as_deref(), Some("app.w.example.com"));
-        assert_eq!(c.resource_host("my.other.org").as_deref(), Some("my.other.org"));
-        assert_eq!(c.resource_host("bad_name"), None);
         assert!(c.update.check);
     }
 

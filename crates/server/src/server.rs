@@ -3,7 +3,6 @@
 use crate::auth::{hash_secret, password_ok};
 use crate::config::{Config, TlsMode};
 use crate::db::{Db, DbError};
-use crate::http::Upstream;
 use crate::secrets::load_or_create_key;
 use crate::state::{self, AppState};
 use crate::tls::CertStore;
@@ -96,6 +95,7 @@ pub async fn run(config: Config) -> Result<Stop, ServerError> {
     let certs = Arc::new(CertStore::new(
         config.tls.mode,
         dir.join("certs"),
+        config.admin_host(),
         config.tls.cert_file.as_deref(),
         config.tls.key_file.as_deref(),
     )?);
@@ -136,14 +136,13 @@ pub async fn run(config: Config) -> Result<Stop, ServerError> {
         wg_endpoint = %state.config.wg_endpoint(),
         "warren server started"
     );
-    let upstream = Arc::new(Upstream::new());
     let admin = crate::api::router(Arc::clone(&state));
     let mut tasks = vec![
         tokio::spawn(state::apply_task(Arc::clone(&state))),
         tokio::spawn(state::stats_task(Arc::clone(&state))),
         tokio::spawn(state::prune_task(Arc::clone(&state))),
         tokio::spawn(crate::http::serve_http(Arc::clone(&state), plain_listener)),
-        tokio::spawn(crate::http::serve_https(Arc::clone(&state), upstream, admin, tls_listener)),
+        tokio::spawn(crate::http::serve_https(Arc::clone(&state), admin, tls_listener)),
     ];
     if state.config.tls.mode == TlsMode::Acme {
         tasks.push(tokio::spawn(crate::acme::task(Arc::clone(&state))));

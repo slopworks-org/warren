@@ -38,7 +38,7 @@ pub async fn users(State(state): State<Arc<AppState>>, auth: Auth) -> ApiResult<
     Ok(Json(json!(state.db.users()?)))
 }
 
-/// `GET /api/v1/roles`: visible to everyone (for grant pickers).
+/// `GET /api/v1/roles`: visible to signed-in users.
 pub async fn roles(State(state): State<Arc<AppState>>, _auth: Auth) -> ApiResult<Json<Value>> {
     Ok(Json(json!(state.db.roles()?)))
 }
@@ -134,7 +134,7 @@ pub async fn update_user(
     Ok(Json(json!(state.db.user(id)?)))
 }
 
-/// `DELETE /api/v1/users/{id}`: also deletes the user's devices and resources.
+/// `DELETE /api/v1/users/{id}`: also deletes the user's devices.
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     ip: Ip,

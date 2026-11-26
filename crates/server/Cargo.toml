@@ -1,6 +1,6 @@
 [package]
 name = "warren-server"
-description = "Warren server: WireGuard hub, reverse proxy, ACME and web admin in one binary"
+description = "Warren server: WireGuard hub, ACME and web admin in one binary"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
