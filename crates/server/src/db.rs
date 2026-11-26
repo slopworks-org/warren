@@ -126,7 +126,8 @@ CREATE TABLE IF NOT EXISTS resources (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     host TEXT NOT NULL UNIQUE,
     device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    service TEXT NOT NULL DEFAULT '',
+    target_port INTEGER NOT NULL,
+    target_scheme TEXT NOT NULL,
     access TEXT NOT NULL,
     basic_user TEXT NOT NULL DEFAULT '',
     secret_hash TEXT NOT NULL DEFAULT '',
@@ -340,15 +341,6 @@ pub enum Scheme {
     Https,
 }
 
-impl Scheme {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Https => "https",
-        }
-    }
-}
-
 /// How visitors are authorized for a resource.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -382,8 +374,10 @@ pub struct Resource {
     pub host: String,
     /// Target device.
     pub device_id: i64,
-    /// Locally granted service name. Empty on an unconfigured legacy route.
-    pub service: String,
+    /// Target port on the device.
+    pub target_port: u16,
+    /// Target protocol.
+    pub target_scheme: Scheme,
     /// Visitor authorization mode.
     pub access: AccessMode,
     /// Basic-auth user name.
@@ -408,8 +402,10 @@ pub struct ResourceInput {
     pub host: String,
     /// Target device.
     pub device_id: i64,
-    /// Locally granted service name.
-    pub service: String,
+    /// Target port.
+    pub target_port: u16,
+    /// Target protocol.
+    pub target_scheme: Scheme,
     /// Authorization mode.
     pub access: AccessMode,
     /// Basic-auth user name.
@@ -579,23 +575,25 @@ fn device_row(r: &Row<'_>) -> DbResult<Device> {
     })
 }
 
-const RESOURCE_COLS: &str = "id, user_id, host, device_id, service, access, basic_user, \
+const RESOURCE_COLS: &str = "id, user_id, host, device_id, target_port, target_scheme, access, basic_user, \
      secret_hash, enabled, created_at, updated_at";
 
 fn resource_row(r: &Row<'_>) -> DbResult<Resource> {
-    let access: String = r.get(5)?;
+    let scheme: String = r.get(5)?;
+    let access: String = r.get(6)?;
     Ok(Resource {
         id: r.get(0)?,
         user_id: r.get(1)?,
         host: r.get(2)?,
         device_id: r.get(3)?,
-        service: r.get(4)?,
+        target_port: r.get(4)?,
+        target_scheme: enum_from(&scheme, "resources.target_scheme")?,
         access: enum_from(&access, "resources.access")?,
-        basic_user: r.get(6)?,
-        secret_hash: r.get(7)?,
-        enabled: r.get(8)?,
-        created_at: r.get(9)?,
-        updated_at: r.get(10)?,
+        basic_user: r.get(7)?,
+        secret_hash: r.get(8)?,
+        enabled: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
         grants: Vec::new(),
     })
 }
@@ -656,18 +654,6 @@ impl Db {
         )?;
         if !has_channel {
             tx.execute("ALTER TABLE device_updates ADD COLUMN channel TEXT NOT NULL DEFAULT 'release'", [])?;
-        }
-        if tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('resources') WHERE name='target_port')",
-            [],
-            |r| r.get::<_, bool>(0),
-        )? {
-            tx.execute_batch(
-                "ALTER TABLE resources ADD COLUMN service TEXT NOT NULL DEFAULT '';
-                UPDATE resources SET enabled=0;
-                ALTER TABLE resources DROP COLUMN target_port;
-                ALTER TABLE resources DROP COLUMN target_scheme;",
-            )?;
         }
         tx.commit()?;
         Ok(Db { conn: Mutex::new(conn) })
@@ -1291,13 +1277,14 @@ impl Db {
         let tx = c.transaction()?;
         let t = now();
         tx.execute(
-            "INSERT INTO resources (user_id, host, device_id, service, access, basic_user, \
-             secret_hash, enabled, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            "INSERT INTO resources (user_id, host, device_id, target_port, target_scheme, access, basic_user, \
+             secret_hash, enabled, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
                 user,
                 r.host,
                 r.device_id,
-                r.service,
+                r.target_port,
+                enum_str(r.target_scheme),
                 enum_str(r.access),
                 r.basic_user,
                 r.secret_hash.as_deref().unwrap_or_default(),
@@ -1321,13 +1308,14 @@ impl Db {
         let mut c = self.c();
         let tx = c.transaction()?;
         tx.execute(
-            "UPDATE resources SET host = ?1, device_id = ?2, service = ?3, access = ?4, \
-             basic_user = ?5, secret_hash = COALESCE(?6, secret_hash), enabled = ?7, updated_at = ?8, user_id = ?10 \
-             WHERE id = ?9",
+            "UPDATE resources SET host = ?1, device_id = ?2, target_port = ?3, target_scheme = ?4, access = ?5, \
+             basic_user = ?6, secret_hash = COALESCE(?7, secret_hash), enabled = ?8, updated_at = ?9, user_id = ?11 \
+             WHERE id = ?10",
             params![
                 r.host,
                 r.device_id,
-                r.service,
+                r.target_port,
+                enum_str(r.target_scheme),
                 enum_str(r.access),
                 r.basic_user,
                 r.secret_hash,
@@ -1545,26 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_port_routes_keep_their_policy_and_require_a_new_service() {
-        let (db, user) = db_with_user();
-        let device = db.create_device(user.id, "box", "key", Ipv4Addr::LOCALHOST, DeviceKind::Agent).unwrap();
-        let conn = db.conn.into_inner().unwrap();
-        conn.execute_batch(
-            "ALTER TABLE resources DROP COLUMN service;
-            ALTER TABLE resources ADD COLUMN target_port INTEGER NOT NULL;
-            ALTER TABLE resources ADD COLUMN target_scheme TEXT NOT NULL;",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO resources (user_id, device_id, host, access, target_port, target_scheme, created_at, updated_at)
-            VALUES (?1, ?2, 'old.example.com', 'users', 8080, 'http', 1, 1)", params![user.id, device]).unwrap();
-        let db = Db::init(conn).unwrap();
-        let route = db.resources().unwrap().remove(0);
-        assert!(!route.enabled);
-        assert_eq!(route.service, "");
-        assert_eq!((route.access, route.host.as_str()), (AccessMode::Users, "old.example.com"));
-    }
-
-    #[test]
     fn migrating_existing_update_requests_preserves_release_consent() {
         let (db, user) = db_with_user();
         let id = db.create_device(user.id, "router", "key", Ipv4Addr::new(10, 77, 0, 2), DeviceKind::Agent).unwrap();
@@ -1660,7 +1628,8 @@ mod tests {
         let input = ResourceInput {
             host: "app.example.com".into(),
             device_id: d,
-            service: "web".into(),
+            target_port: 80,
+            target_scheme: Scheme::Http,
             access: AccessMode::Users,
             basic_user: String::new(),
             secret_hash: None,

@@ -72,8 +72,8 @@ fn poll(saved: &Saved, wait: u64, channel: UpdateChannel, generation: Option<&st
         u8::from(generation.is_some()),
         lan_query(saved),
     );
-    let control = saved.control().map_err(Error::io("validating control endpoint"))?.to_string();
-    let resp = http::request(&control, &control, "GET", &path, None, Duration::from_secs(wait + 15))
+    let control = &saved.tunnel.control;
+    let resp = http::request(control, control, "GET", &path, None, Duration::from_secs(wait + 15))
         .map_err(Error::io(format!("polling {control}")))?;
     match resp.status {
         200 => {
@@ -187,7 +187,6 @@ pub fn run(args: &Args, install: Option<&Installation>, mut trial: bool, cooldow
 
     tunnel::remove_direct(&saved.interface)?;
     lan::spawn_watcher();
-    crate::ingress::spawn(&args.paths);
     let mut status = StatusFile::open(&args.paths.run_dir)
         .inspect_err(|e| log!(Debug, "cannot open the status directory", error = e))
         .ok();
@@ -286,7 +285,9 @@ pub fn run(args: &Args, install: Option<&Installation>, mut trial: bool, cooldow
     }
 
     log!(Info, "stopping; removing interface", iface = saved.interface);
-    tunnel::remove_link(&saved.interface)?;
+    if wg::link_index(&saved.interface).is_some() {
+        wg::delete_link(&saved.interface)?;
+    }
     tunnel::remove_direct(&saved.interface).and(trial_result)
 }
 

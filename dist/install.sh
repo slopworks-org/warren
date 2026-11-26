@@ -194,8 +194,7 @@ install_agent() {
     put 0644 "$work/org.slopworks.warren.plist" "$plist"
   elif [ -f /etc/openwrt_release ]; then
     bin=/usr/bin/warren
-    packages="kmod-wireguard"
-    command -v nft >/dev/null 2>&1 || packages="$packages nftables-json"
+    packages=kmod-wireguard
     if [ "$remote" = on ]; then
       packages="$packages curl ca-bundle"
     fi
@@ -225,7 +224,6 @@ install_agent() {
     sh "$work/warren.uci-defaults"
   else
     bin=/usr/local/bin/warren
-    command -v nft >/dev/null 2>&1 || die "install nftables before installing the agent"
     modprobe wireguard 2>/dev/null ||
       echo "warning: cannot load the wireguard kernel module; the agent needs it" >&2
     say "Downloading the agent ($version, $arch)"

@@ -539,8 +539,8 @@ async function resourcesPage(el) {
       h('tbody', {}, items.map((r) => h('tr', {},
         h('td', {}, h('a', { href: r.url, target: '_blank', rel: 'noopener', text: r.host }),
           r.enabled ? null : h('div', { class: 'sub', text: 'disabled' })),
-        h('td', {}, h('div', {}, (r.device_name || '?') + ' / ' + (r.service || 'Choose a service')),
-          h('div', { class: 'sub' }, r.scheme ? r.scheme.toUpperCase() + ' · ' : '', !r.device_online ? 'device offline' : r.scheme ? 'exposed' : 'not exposed')),
+        h('td', {}, h('div', {}, (r.device_name || '?') + ' : ' + r.target_port),
+          h('div', { class: 'sub' }, r.target_scheme.toUpperCase() + ' · ', r.device_online ? 'device online' : 'device offline')),
         h('td', {}, accessBadge(r)),
         can('resources.all') ? h('td', { class: 'hide-sm', text: r.owner }) : null,
         h('td', {}, h('div', { class: 'actions' },
@@ -566,21 +566,8 @@ async function resourceDialog(res, reload) {
     const domain = server ? server.domain : '';
     const host = h('input', { required: true, value: res ? res.host : '', placeholder: 'app' });
     const device = select(devices.map((d) => [d.id, d.name + ' (' + d.address + ')' + (can('devices.all') && d.owner !== me.user.username ? ' — ' + d.owner : '')]), res ? res.device_id : devices[0].id);
-    const service = h('select', { required: true });
-    const hint = h('div', { class: 'hint' });
-    function renderServices() {
-      const selected = devices.find((d) => String(d.id) === device.value);
-      const entries = Object.entries(selected?.services || {});
-      service.replaceChildren(...entries.map(([name, scheme]) => h('option', { value: name, text: name + ' (' + scheme.toUpperCase() + ')' })));
-      if (res && selected?.id === res.device_id && res.service && !entries.some(([name]) => name === res.service)) {
-        service.append(h('option', { value: res.service, text: res.service + ' (not exposed)' }));
-      }
-      if (res && selected?.id === res.device_id) service.value = res.service;
-      if (!entries.length && !service.options.length) service.append(h('option', { value: '', text: 'No exposed services' }));
-      hint.textContent = entries.length ? '' : 'On this device, run warren expose <name> <target>, then reopen this dialog.';
-    }
-    device.addEventListener('change', renderServices);
-    renderServices();
+    const port = h('input', { type: 'number', min: 1, max: 65535, required: true, value: res ? res.target_port : '' });
+    const scheme = select([['http', 'HTTP'], ['https', 'HTTPS (certificate not checked)']], res ? res.target_scheme : 'http');
     const access = select(ACCESS, res ? res.access : 'public');
     const basicUser = h('input', { value: res ? res.basic_user : '', autocomplete: 'off' });
     const secret = h('input', { type: 'password', autocomplete: 'new-password' });
@@ -606,11 +593,11 @@ async function resourceDialog(res, reload) {
     renderMode();
     body.append(
       field('Address', host, 'A name like “app” becomes app.' + domain + '; a full domain must point to this server.'),
-      field('Device', device), field('Exposed service', service), hint,
+      field('Device', device), h('div', { class: 'row' }, field('Port', port), field('Protocol on the device', scheme)),
       field('Access', access), modePane, h('label', { class: 'check' }, enabled, 'Enabled'));
     return async () => {
       const payload = {
-        host: host.value, device_id: Number(device.value), service: service.value,
+        host: host.value, device_id: Number(device.value), port: Number(port.value), scheme: scheme.value,
         access: access.value, basic_user: basicUser.value, grants: [...grants], enabled: enabled.checked,
       };
       if (secret.value) payload.secret = secret.value;

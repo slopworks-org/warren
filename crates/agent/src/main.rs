@@ -8,10 +8,7 @@
 mod cli;
 mod daemon;
 mod error;
-mod expose;
-mod firewall;
 mod http;
-mod ingress;
 mod lan;
 mod log;
 mod mesh_probe;
@@ -98,7 +95,6 @@ fn main() -> ExitCode {
             Ok(())
         }
         Command::Update { check, remote, channel } => selfupdate::run(&args.paths, check, remote, channel),
-        Command::Expose | Command::Unexpose => expose::command(&args),
         Command::Down => status::down(&args),
         Command::Version => {
             println!("warren {}", warren_proto::VERSION);
