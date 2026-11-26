@@ -60,7 +60,7 @@ async fn android_qr_uses_scoped_one_time_agent_tokens() {
     let user = db.create_user("alice", "unused", "user").unwrap();
     let other = db.create_user("bob", "unused", "user").unwrap();
     db.create_api_token(user.id, "test", &sha256_hex(b"test-api-secret")).unwrap();
-    let certs = Arc::new(CertStore::new(TlsMode::SelfSigned, PathBuf::new(), None, None).unwrap());
+    let certs = Arc::new(CertStore::new(TlsMode::SelfSigned, PathBuf::new(), config.admin_host(), None, None).unwrap());
     let state = Arc::new(AppState::new(config, db, &[2; 32], [3; 32], certs, Backend::None));
     state.rebuild().unwrap();
     let admin = warren_server::api::router(Arc::clone(&state));

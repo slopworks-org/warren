@@ -1,5 +1,5 @@
 [Unit]
-Description=Warren server (WireGuard hub, reverse proxy, admin)
+Description=Warren server (WireGuard hub, admin)
 After=network-online.target
 Wants=network-online.target
 

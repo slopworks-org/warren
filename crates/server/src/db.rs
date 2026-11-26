@@ -5,7 +5,6 @@
 //! keeps memory flat. Roles carry a list of permission names, so new roles are
 //! new rows, not a schema change.
 
-use crate::access::Grant;
 use crate::acl::{PortSpec, Subject};
 use crate::util::now;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -120,25 +119,6 @@ CREATE TABLE IF NOT EXISTS reg_receipts (
     device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     request_hash TEXT NOT NULL,
     reply TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS resources (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    host TEXT NOT NULL UNIQUE,
-    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    target_port INTEGER NOT NULL,
-    target_scheme TEXT NOT NULL,
-    access TEXT NOT NULL,
-    basic_user TEXT NOT NULL DEFAULT '',
-    secret_hash TEXT NOT NULL DEFAULT '',
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS resource_grants (
-    resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
-    subject TEXT NOT NULL,
-    PRIMARY KEY (resource_id, subject)
 );
 CREATE TABLE IF NOT EXISTS acl_rules (
     id INTEGER PRIMARY KEY,
@@ -331,91 +311,8 @@ pub(crate) struct ReceiptSigner<'a> {
     pub sign: &'a dyn Fn(&Device) -> String,
 }
 
-/// Device-side protocol of a resource.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Scheme {
-    /// Plain HTTP to the device.
-    Http,
-    /// HTTPS to the device; its certificate is not verified.
-    Https,
-}
-
-/// How visitors are authorized for a resource.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AccessMode {
-    /// Anyone.
-    Public,
-    /// Signed-in Warren users from the grant list (plus owner and admins).
-    Users,
-    /// HTTP Basic authentication with the resource's own credentials.
-    Basic,
-    /// A PIN code entered on a Warren page.
-    Pin,
-}
-
-fn enum_str<T: Serialize>(v: T) -> String {
-    serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
-}
-
 fn enum_from<T: for<'de> Deserialize<'de>>(s: &str, col: &'static str) -> DbResult<T> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(|_| DbError::Corrupt(col))
-}
-
-/// A published service.
-#[derive(Clone, Debug, Serialize)]
-pub struct Resource {
-    /// Row id.
-    pub id: i64,
-    /// Owner.
-    pub user_id: i64,
-    /// Public host name.
-    pub host: String,
-    /// Target device.
-    pub device_id: i64,
-    /// Target port on the device.
-    pub target_port: u16,
-    /// Target protocol.
-    pub target_scheme: Scheme,
-    /// Visitor authorization mode.
-    pub access: AccessMode,
-    /// Basic-auth user name.
-    pub basic_user: String,
-    /// Argon2 hash of the Basic password or PIN.
-    #[serde(skip)]
-    pub secret_hash: String,
-    /// Disabled resources answer 404.
-    pub enabled: bool,
-    /// Creation time.
-    pub created_at: i64,
-    /// Last change; invalidates visitor cookies.
-    pub updated_at: i64,
-    /// Who may open it in [`AccessMode::Users`].
-    pub grants: Vec<Grant>,
-}
-
-/// Fields of a resource that can be written.
-#[derive(Clone, Debug)]
-pub struct ResourceInput {
-    /// Public host name.
-    pub host: String,
-    /// Target device.
-    pub device_id: i64,
-    /// Target port.
-    pub target_port: u16,
-    /// Target protocol.
-    pub target_scheme: Scheme,
-    /// Authorization mode.
-    pub access: AccessMode,
-    /// Basic-auth user name.
-    pub basic_user: String,
-    /// New secret hash; `None` keeps the current one.
-    pub secret_hash: Option<String>,
-    /// Enabled flag.
-    pub enabled: bool,
-    /// Who may open it in [`AccessMode::Users`].
-    pub grants: Vec<Grant>,
 }
 
 /// An administrator ACL rule.
@@ -575,29 +472,6 @@ fn device_row(r: &Row<'_>) -> DbResult<Device> {
     })
 }
 
-const RESOURCE_COLS: &str = "id, user_id, host, device_id, target_port, target_scheme, access, basic_user, \
-     secret_hash, enabled, created_at, updated_at";
-
-fn resource_row(r: &Row<'_>) -> DbResult<Resource> {
-    let scheme: String = r.get(5)?;
-    let access: String = r.get(6)?;
-    Ok(Resource {
-        id: r.get(0)?,
-        user_id: r.get(1)?,
-        host: r.get(2)?,
-        device_id: r.get(3)?,
-        target_port: r.get(4)?,
-        target_scheme: enum_from(&scheme, "resources.target_scheme")?,
-        access: enum_from(&access, "resources.access")?,
-        basic_user: r.get(7)?,
-        secret_hash: r.get(8)?,
-        enabled: r.get(9)?,
-        created_at: r.get(10)?,
-        updated_at: r.get(11)?,
-        grants: Vec::new(),
-    })
-}
-
 /// Collects rows with a mapper that may fail with [`DbError`].
 fn collect<T>(
     stmt: &mut rusqlite::Statement<'_>,
@@ -654,6 +528,27 @@ impl Db {
         )?;
         if !has_channel {
             tx.execute("ALTER TABLE device_updates ADD COLUMN channel TEXT NOT NULL DEFAULT 'release'", [])?;
+        }
+        tx.execute_batch("DROP TABLE IF EXISTS resource_grants; DROP TABLE IF EXISTS resources;")?;
+        let mut stmt = tx.prepare("SELECT id, permissions FROM roles")?;
+        let mut rows = stmt.query([])?;
+        let mut role_updates = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            let mut perms: Vec<String> =
+                serde_json::from_str(&raw).map_err(|_| DbError::Corrupt("roles.permissions"))?;
+            let before = perms.len();
+            perms.retain(|p| p != "resources.all");
+            if perms.len() != before {
+                let updated = serde_json::to_string(&perms).map_err(|_| DbError::Corrupt("roles.permissions"))?;
+                role_updates.push((id, updated));
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        for (id, perms) in role_updates {
+            tx.execute("UPDATE roles SET permissions = ?1 WHERE id = ?2", params![perms, id])?;
         }
         tx.commit()?;
         Ok(Db { conn: Mutex::new(conn) })
@@ -778,7 +673,7 @@ impl Db {
         Ok(())
     }
 
-    /// Deletes a user with their devices, resources, sessions and tokens.
+    /// Deletes a user with their devices, sessions and tokens.
     ///
     /// # Errors
     /// On database failure.
@@ -1090,7 +985,7 @@ impl Db {
         Ok(())
     }
 
-    /// Deletes a device and its resources.
+    /// Deletes a device.
     ///
     /// # Errors
     /// On database failure.
@@ -1227,116 +1122,6 @@ impl Db {
         c.execute("DELETE FROM sessions WHERE expires_at < ?1", [t])?;
         c.execute("DELETE FROM invites WHERE expires_at < ?1 - 86400", [t])?;
         Ok(())
-    }
-
-    // ---- resources ----
-
-    /// All resources with their grants.
-    ///
-    /// # Errors
-    /// On database failure.
-    pub fn resources(&self) -> DbResult<Vec<Resource>> {
-        let c = self.c();
-        let mut s = c.prepare(&format!("SELECT {RESOURCE_COLS} FROM resources ORDER BY host"))?;
-        let mut list = collect(&mut s, [], resource_row)?;
-        let mut g = c.prepare("SELECT resource_id, subject FROM resource_grants ORDER BY subject")?;
-        let grants = collect(&mut g, [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-        for (rid, subject) in grants {
-            if let Some(res) = list.iter_mut().find(|r| r.id == rid) {
-                res.grants.push(subject.parse().map_err(|_| DbError::Corrupt("resource_grants.subject"))?);
-            }
-        }
-        Ok(list)
-    }
-
-    /// A resource by id.
-    ///
-    /// # Errors
-    /// On database failure.
-    pub fn resource(&self, id: i64) -> DbResult<Option<Resource>> {
-        Ok(self.resources()?.into_iter().find(|r| r.id == id))
-    }
-
-    fn write_grants(tx: &rusqlite::Transaction<'_>, id: i64, grants: &[Grant]) -> DbResult<()> {
-        tx.execute("DELETE FROM resource_grants WHERE resource_id = ?1", [id])?;
-        for g in grants {
-            tx.execute(
-                "INSERT OR IGNORE INTO resource_grants (resource_id, subject) VALUES (?1, ?2)",
-                params![id, g.to_string()],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Creates a resource.
-    ///
-    /// # Errors
-    /// [`DbError::Conflict`] if the host is taken.
-    pub fn create_resource(&self, user: i64, r: &ResourceInput) -> DbResult<i64> {
-        let mut c = self.c();
-        let tx = c.transaction()?;
-        let t = now();
-        tx.execute(
-            "INSERT INTO resources (user_id, host, device_id, target_port, target_scheme, access, basic_user, \
-             secret_hash, enabled, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![
-                user,
-                r.host,
-                r.device_id,
-                r.target_port,
-                enum_str(r.target_scheme),
-                enum_str(r.access),
-                r.basic_user,
-                r.secret_hash.as_deref().unwrap_or_default(),
-                r.enabled,
-                t
-            ],
-        )
-        .map_err(conflict)?;
-        let id = tx.last_insert_rowid();
-        Self::write_grants(&tx, id, &r.grants)?;
-        tx.commit()?;
-        Ok(id)
-    }
-
-    /// Replaces a resource's fields. `owner` is the target device's owner:
-    /// moving a resource to another user's device hands it over.
-    ///
-    /// # Errors
-    /// [`DbError::Conflict`] if the new host is taken.
-    pub fn update_resource(&self, id: i64, owner: i64, r: &ResourceInput) -> DbResult<()> {
-        let mut c = self.c();
-        let tx = c.transaction()?;
-        tx.execute(
-            "UPDATE resources SET host = ?1, device_id = ?2, target_port = ?3, target_scheme = ?4, access = ?5, \
-             basic_user = ?6, secret_hash = COALESCE(?7, secret_hash), enabled = ?8, updated_at = ?9, user_id = ?11 \
-             WHERE id = ?10",
-            params![
-                r.host,
-                r.device_id,
-                r.target_port,
-                enum_str(r.target_scheme),
-                enum_str(r.access),
-                r.basic_user,
-                r.secret_hash,
-                r.enabled,
-                now(),
-                id,
-                owner
-            ],
-        )
-        .map_err(conflict)?;
-        Self::write_grants(&tx, id, &r.grants)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Deletes a resource.
-    ///
-    /// # Errors
-    /// On database failure.
-    pub fn delete_resource(&self, id: i64) -> DbResult<bool> {
-        Ok(self.c().execute("DELETE FROM resources WHERE id = ?1", [id])? > 0)
     }
 
     // ---- ACL rules ----
@@ -1624,24 +1409,74 @@ mod tests {
     #[test]
     fn deleting_a_user_cascades() {
         let (db, u) = db_with_user();
-        let d = db.create_device(u.id, "box", "k", Ipv4Addr::new(10, 77, 0, 2), DeviceKind::Manual).unwrap();
-        let input = ResourceInput {
-            host: "app.example.com".into(),
-            device_id: d,
-            target_port: 80,
-            target_scheme: Scheme::Http,
-            access: AccessMode::Users,
-            basic_user: String::new(),
-            secret_hash: None,
-            enabled: true,
-            grants: vec![Grant::Role("user".into()), Grant::User(7)],
-        };
-        let r = db.create_resource(u.id, &input).unwrap();
-        assert!(matches!(db.create_resource(u.id, &input), Err(DbError::Conflict)));
-        assert_eq!(db.resource(r).unwrap().unwrap().grants, [Grant::Role("user".into()), Grant::User(7)]);
+        db.create_device(u.id, "box", "k", Ipv4Addr::new(10, 77, 0, 2), DeviceKind::Manual).unwrap();
+        assert_eq!(db.devices().unwrap().len(), 1);
         assert!(db.delete_user(u.id).unwrap());
         assert!(db.devices().unwrap().is_empty());
-        assert!(db.resources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrating_legacy_db_drops_resources_and_stale_role_perms() {
+        let (db, u) = db_with_user();
+        let device_id = db.create_device(u.id, "box", "k", Ipv4Addr::new(10, 77, 0, 2), DeviceKind::Manual).unwrap();
+        let acl_id = db
+            .create_acl_rule(Subject::Any, Subject::User(u.id), &PortSpec::parse_list("tcp:80").unwrap(), "allow http")
+            .unwrap();
+        let conn = db.conn.into_inner().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resources (
+                 id INTEGER PRIMARY KEY,
+                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 host TEXT NOT NULL UNIQUE,
+                 device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                 target_port INTEGER NOT NULL,
+                 target_scheme TEXT NOT NULL,
+                 access TEXT NOT NULL,
+                 basic_user TEXT NOT NULL DEFAULT '',
+                 secret_hash TEXT NOT NULL DEFAULT '',
+                 enabled INTEGER NOT NULL DEFAULT 1,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE resource_grants (
+                 resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+                 subject TEXT NOT NULL,
+                 PRIMARY KEY (resource_id, subject)
+             );
+             INSERT INTO roles (id, name, permissions)
+                 VALUES ('operator', 'Operator', '[\"devices.all\",\"resources.all\"]');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resources (id, user_id, host, device_id, target_port, target_scheme, access, created_at, updated_at)
+             VALUES (1, ?1, 'app.example.com', ?2, 80, 'http', 'users', 1, 1)",
+            params![u.id, device_id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO resource_grants (resource_id, subject) VALUES (1, 'all')", []).unwrap();
+
+        let db = Db::init(conn).unwrap();
+        let db = Db::init(db.conn.into_inner().unwrap()).unwrap();
+        let conn = db.c();
+        for table in ["resources", "resource_grants"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "{table} should be dropped");
+        }
+        drop(conn);
+
+        assert_eq!(db.user(u.id).unwrap().unwrap().username, "alice");
+        assert_eq!(db.device(device_id).unwrap().unwrap().name, "box");
+        let acls = db.acl_rules().unwrap();
+        assert_eq!(acls.len(), 1);
+        assert_eq!(acls[0].id, acl_id);
+        let operator = db.roles().unwrap().into_iter().find(|r| r.id == "operator").unwrap();
+        assert_eq!(operator.permissions, vec!["devices.all"]);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Certificates and SNI-based selection.
 //!
 //! Only names the server actually serves get a certificate. A handshake for
-//! an unknown name, or one without SNI (a bare IP address), fails, so a
-//! protected resource cannot be reached by guessing hosts or by IP.
+//! an unknown name, or one without SNI (a bare IP address), fails, so the
+//! admin host cannot be reached by guessing names or by IP.
 
 use crate::config::TlsMode;
 use crate::util::now;
@@ -83,14 +83,15 @@ pub fn self_signed(host: &str) -> Result<CertifiedKey, TlsError> {
 }
 
 impl CertStore {
-    /// Creates the store, loading existing ACME certificates or the
-    /// configured certificate files.
+    /// Creates the store, loading an existing ACME certificate for `admin_host`
+    /// or the configured certificate files.
     ///
     /// # Errors
     /// When configured certificate files cannot be loaded.
     pub fn new(
         mode: TlsMode,
         dir: PathBuf,
+        admin_host: &str,
         cert_file: Option<&Path>,
         key_file: Option<&Path>,
     ) -> Result<CertStore, TlsError> {
@@ -107,7 +108,7 @@ impl CertStore {
             file_cert,
         };
         if mode == TlsMode::Acme {
-            store.load_issued();
+            store.load_issued(admin_host);
         }
         Ok(store)
     }
@@ -120,23 +121,21 @@ impl CertStore {
         )
     }
 
-    fn load_issued(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(host) = name.strip_suffix(".pem") else { continue };
-            let (pem, key, issued) = self.paths(host);
-            let loaded = read(&pem).and_then(|c| read(&key).and_then(|k| certified_key(&c, &k, &pem)));
-            match loaded {
-                Ok(ck) => {
-                    let at = std::fs::read_to_string(&issued).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-                    self.issued
-                        .write()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(host.to_string(), (Arc::new(ck), at));
-                }
-                Err(e) => tracing::warn!(host, error = %e, "ignoring unreadable certificate"),
+    fn load_issued(&self, host: &str) {
+        let (pem, key, issued) = self.paths(host);
+        if !pem.exists() && !key.exists() {
+            return;
+        }
+        let loaded = read(&pem).and_then(|c| read(&key).and_then(|k| certified_key(&c, &k, &pem)));
+        match loaded {
+            Ok(ck) => {
+                let at = std::fs::read_to_string(&issued).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                self.issued
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(host.to_string(), (Arc::new(ck), at));
             }
+            Err(e) => tracing::warn!(host, error = %e, "ignoring unreadable certificate"),
         }
     }
 
@@ -249,7 +248,7 @@ mod tests {
 
     #[test]
     fn only_known_hosts_get_certificates() {
-        let store = CertStore::new(TlsMode::SelfSigned, std::env::temp_dir(), None, None).unwrap();
+        let store = CertStore::new(TlsMode::SelfSigned, std::env::temp_dir(), "a.example.com", None, None).unwrap();
         store.set_known(["a.example.com".to_string()].into());
         assert!(store.lookup("a.example.com").is_some());
         assert!(store.lookup("b.example.com").is_none());
@@ -259,16 +258,35 @@ mod tests {
     #[test]
     fn acme_install_and_renewal() {
         let dir = std::env::temp_dir().join(format!("warren-tls-{}", std::process::id()));
-        let store = CertStore::new(TlsMode::Acme, dir.clone(), None, None).unwrap();
+        let store = CertStore::new(TlsMode::Acme, dir.clone(), "a.example.com", None, None).unwrap();
         store.set_known(["a.example.com".to_string(), "b.example.com".to_string()].into());
         assert_eq!(store.needing_certs(), ["a.example.com", "b.example.com"]);
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["a.example.com".to_string()]).unwrap();
         store.install("a.example.com", &cert.pem(), &signing_key.serialize_pem()).unwrap();
         assert_eq!(store.needing_certs(), ["b.example.com"]);
-        let reloaded = CertStore::new(TlsMode::Acme, dir.clone(), None, None).unwrap();
+        let reloaded = CertStore::new(TlsMode::Acme, dir.clone(), "a.example.com", None, None).unwrap();
         reloaded.set_known(["a.example.com".to_string()].into());
         assert!(reloaded.needing_certs().is_empty(), "certificates persist");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn acme_loads_only_admin_host() {
+        let dir = std::env::temp_dir().join(format!("warren-tls-admin-only-{}", std::process::id()));
+        let store = CertStore::new(TlsMode::Acme, dir.clone(), "a.example.com", None, None).unwrap();
+        for host in ["a.example.com", "b.example.com"] {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+            store.install(host, &cert.pem(), &signing_key.serialize_pem()).unwrap();
+        }
+        let reloaded = CertStore::new(TlsMode::Acme, dir.clone(), "a.example.com", None, None).unwrap();
+        reloaded.set_known(["a.example.com".to_string(), "b.example.com".to_string()].into());
+        assert_eq!(reloaded.needing_certs(), ["b.example.com"]);
+        assert!(reloaded.issued.read().unwrap().contains_key("a.example.com"));
+        assert!(!reloaded.issued.read().unwrap().contains_key("b.example.com"));
+        assert!(dir.join("b.example.com.pem").exists());
+        assert!(dir.join("b.example.com.key").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

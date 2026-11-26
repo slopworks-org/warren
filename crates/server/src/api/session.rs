@@ -1,20 +1,17 @@
-//! Sign-in, sign-out, first-run setup, invite registration and the sign-in
-//! hop to resource hosts.
+//! Sign-in, sign-out, first-run setup and invite registration.
 
 use super::{
     ApiError, ApiResult, CodeReq, Ip, PendingAuth, SESSION_COOKIE, cookie, rebuild, session_cookie, valid_username,
 };
-use crate::access;
 use crate::auth::{hash_async, password_ok, totp_verify, verify_async};
 use crate::db::{Registration, Session, User};
-use crate::http::{pages, redirect};
 use crate::state::AppState;
-use crate::util::{now, safe_next, sha256_hex, token, url_encode};
+use crate::util::{now, sha256_hex, token};
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
+use http::HeaderMap;
 use http::header::{SET_COOKIE, USER_AGENT};
-use http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, PoisonError};
@@ -227,46 +224,4 @@ pub async fn register(
     rebuild(&state)?;
     state.audit(Some(&user), &ip, "user.register", &format!("user:{}", user.id), &format!("role {}", user.role));
     Ok(Json(json!({ "ok": true })))
-}
-
-#[derive(Deserialize)]
-pub struct ResourceSignIn {
-    rid: i64,
-    #[serde(default)]
-    next: String,
-}
-
-/// `GET /auth/resource?rid=…&next=…`: the hop from a `users`-mode resource
-/// to the admin host and back. Signed-in, authorized users are sent back
-/// with a one-minute code that the resource host exchanges for its cookie.
-pub async fn resource_sign_in(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ResourceSignIn>,
-    headers: HeaderMap,
-) -> Response {
-    let next = if safe_next(&q.next) { q.next.clone() } else { "/".to_string() };
-    let session = cookie(&headers, SESSION_COOKIE)
-        .and_then(|raw| state.db.session(&sha256_hex(raw.as_bytes())).ok().flatten())
-        .filter(|s| s.mfa_passed);
-    let snap = state.snapshot();
-    let user = session.and_then(|s| snap.users.get(&s.user_id).cloned()).filter(|u| !u.disabled);
-    let Some(user) = user else {
-        let here = format!("/auth/resource?rid={}&next={}", q.rid, url_encode(&next));
-        return redirect(&format!("/#/login?next={}", url_encode(&here)), StatusCode::SEE_OTHER);
-    };
-    if snap.settings.require_2fa && !user.totp_enabled {
-        return redirect("/#/profile", StatusCode::SEE_OTHER);
-    }
-    let Some(res) = snap.resources_by_id.get(&q.rid).cloned() else {
-        return pages::not_found();
-    };
-    if !access::user_allowed(&res, user.id, &user.role, snap.perms_of(&user)) {
-        return pages::forbidden();
-    }
-    let code = state.new_auth_code(res.id, user.id);
-    let origin = state.config.https_origin(&res.host);
-    redirect(
-        &format!("{origin}/.warren/callback?code={}&next={}", url_encode(&code), url_encode(&next)),
-        StatusCode::SEE_OTHER,
-    )
 }

@@ -1,14 +1,14 @@
 //! Shared server state and the background tasks that keep it in sync.
 //!
 //! The database is the source of truth. After every change, [`AppState::rebuild`]
-//! loads a fresh in-memory [`Snapshot`] that the proxy and the tunnel read
+//! loads a fresh in-memory [`Snapshot`] that the API and the tunnel read
 //! without touching SQLite, then wakes the tasks that push it to the
 //! WireGuard backend and to long-polling agents.
 
 use crate::acl::{Acl, Node, Rule};
 use crate::auth::RateLimiter;
 use crate::config::{Config, Net4};
-use crate::db::{AuditEntry, Db, DbError, Device, Resource, Settings, User};
+use crate::db::{AuditEntry, Db, DbError, Device, Settings, User};
 use crate::lan::{self, LanReport, Seen};
 use crate::tls::CertStore;
 use crate::util::{fnv64, now};
@@ -28,7 +28,7 @@ use warren_proto::{AgentConfig, DEFAULT_KEEPALIVE, LAN_KEEPALIVE, PeerConfig, Up
 /// handshakes at least every ~145 s.
 pub const ONLINE_WINDOW: i64 = 210;
 
-/// What the proxy and the tunnel need, read without locking the database.
+/// What the API and the tunnel need, read without locking the database.
 #[derive(Default)]
 pub struct Snapshot {
     /// Users by id.
@@ -39,10 +39,6 @@ pub struct Snapshot {
     pub devices: HashMap<i64, Device>,
     /// Device id by tunnel address.
     pub device_by_ip: HashMap<Ipv4Addr, i64>,
-    /// Enabled resources by host.
-    pub resources: HashMap<String, Arc<Resource>>,
-    /// The same resources by id.
-    pub resources_by_id: HashMap<i64, Arc<Resource>>,
     /// Enabled devices, for the hub.
     pub peers: Vec<PeerSpec>,
     /// Compiled device-to-device ACL.
@@ -65,17 +61,6 @@ impl Snapshot {
     }
 }
 
-/// A short-lived code that carries a sign-in from the admin host to a
-/// resource host.
-pub struct AuthCode {
-    /// Resource the code is for.
-    pub resource: i64,
-    /// Signed-in user.
-    pub user: i64,
-    /// Expiry.
-    pub expires: i64,
-}
-
 /// Rate limiters for abuse-prone endpoints.
 pub struct Limits {
     /// Login attempts per client IP.
@@ -84,8 +69,6 @@ pub struct Limits {
     pub login_user: RateLimiter,
     /// Device registrations and setup attempts per client IP.
     pub register_ip: RateLimiter,
-    /// PIN and Basic-auth attempts per client IP and resource.
-    pub resource_secret: RateLimiter,
 }
 
 /// Why a tunnel address could not be assigned.
@@ -109,7 +92,7 @@ pub struct AppState {
     pub network: Net4,
     /// Hub public key, base64.
     pub server_public_key: String,
-    /// Key for visitor cookies on resource hosts.
+    /// Key for HMAC-authenticated state such as route-directory revisions.
     pub cookie_key: [u8; 32],
     /// Certificates.
     pub certs: Arc<CertStore>,
@@ -120,16 +103,10 @@ pub struct AppState {
     stats: RwLock<HashMap<i64, PeerStats>>,
     /// HTTP-01 key authorizations by token.
     pub acme_challenges: RwLock<HashMap<String, String>>,
-    /// Wakes the ACME task when hosts change.
-    pub acme_wake: Notify,
-    /// Pending resource sign-ins.
-    pub auth_codes: Mutex<HashMap<String, AuthCode>>,
     /// One-time token for creating the first administrator.
     pub setup_token: Mutex<Option<String>>,
     /// Rate limiters.
     pub limits: Limits,
-    /// Recently verified Basic-auth headers (hash → expiry), to skip Argon2.
-    pub basic_cache: Mutex<HashMap<String, i64>>,
     /// Last TOTP step used per user, to refuse replays.
     pub totp_used: Mutex<HashMap<i64, u64>>,
     /// The latest release on GitHub, once checked.
@@ -184,6 +161,7 @@ impl AppState {
     ) -> AppState {
         let public = x25519_dalek::x25519(*server_key, x25519_dalek::X25519_BASEPOINT_BYTES);
         let minute = Duration::from_secs(60);
+        certs.set_known([config.admin_host().to_string()].into_iter().collect());
         AppState {
             network: config.network(),
             config,
@@ -196,16 +174,12 @@ impl AppState {
             generation: watch::Sender::new(0),
             stats: RwLock::new(HashMap::new()),
             acme_challenges: RwLock::new(HashMap::new()),
-            acme_wake: Notify::new(),
-            auth_codes: Mutex::new(HashMap::new()),
             setup_token: Mutex::new(None),
             limits: Limits {
                 login_ip: RateLimiter::new(20, minute),
                 login_user: RateLimiter::new(5, minute),
                 register_ip: RateLimiter::new(10, minute),
-                resource_secret: RateLimiter::new(10, minute),
             },
-            basic_cache: Mutex::new(HashMap::new()),
             totp_used: Mutex::new(HashMap::new()),
             latest_release: RwLock::new(None),
             latest_main: RwLock::new(None),
@@ -226,8 +200,8 @@ impl AppState {
         self.generation.subscribe()
     }
 
-    /// Reloads the snapshot from the database and notifies the tunnel,
-    /// long-polling agents and the ACME task.
+    /// Reloads the snapshot from the database and notifies the tunnel and
+    /// long-polling agents.
     ///
     /// # Errors
     /// On database failure.
@@ -235,8 +209,6 @@ impl AppState {
         let users: HashMap<i64, User> = self.db.users()?.into_iter().map(|u| (u.id, u)).collect();
         let roles = self.db.roles()?.into_iter().map(|r| (r.id, r.permissions)).collect();
         let devices: HashMap<i64, Device> = self.db.devices()?.into_iter().map(|d| (d.id, d)).collect();
-        let resources: HashMap<String, Arc<Resource>> =
-            self.db.resources()?.into_iter().filter(|r| r.enabled).map(|r| (r.host.clone(), Arc::new(r))).collect();
 
         // Devices of blocked users drop off the hub along with disabled ones.
         let active = |d: &&Device| d.enabled && users.get(&d.user_id).is_some_and(|u| !u.disabled);
@@ -252,17 +224,11 @@ impl AppState {
         let acl_rules: Vec<Rule> =
             self.db.acl_rules()?.into_iter().map(|r| Rule { src: r.src, dst: r.dst, ports: r.ports }).collect();
 
-        let mut hosts: HashSet<String> = resources.keys().cloned().collect();
-        hosts.insert(self.config.admin_host().to_string());
-        self.certs.set_known(hosts);
-
         let snap = Snapshot {
             device_by_ip: devices.values().map(|d| (d.address, d.id)).collect(),
-            resources_by_id: resources.values().map(|r| (r.id, Arc::clone(r))).collect(),
             users,
             roles,
             devices,
-            resources,
             peers,
             acl: Acl::compile(&nodes, &acl_rules),
             route_revisions: Mutex::default(),
@@ -270,7 +236,6 @@ impl AppState {
         };
         *self.snapshot.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(snap);
         self.generation.send_modify(|g| *g += 1);
-        self.acme_wake.notify_one();
         Ok(())
     }
 
@@ -487,22 +452,6 @@ impl AppState {
             tracing::error!(error = %e, "writing audit log");
         }
     }
-
-    /// Stores a resource sign-in code; returns the code.
-    pub fn new_auth_code(&self, resource: i64, user: i64) -> String {
-        let code = crate::util::token();
-        let mut codes = lock(&self.auth_codes);
-        let t = now();
-        codes.retain(|_, c| c.expires > t);
-        codes.insert(code.clone(), AuthCode { resource, user, expires: t + 60 });
-        code
-    }
-
-    /// Redeems a sign-in code for `resource`; returns the user id.
-    pub fn take_auth_code(&self, code: &str, resource: i64) -> Option<i64> {
-        let c = lock(&self.auth_codes).remove(code)?;
-        (c.resource == resource && c.expires > now()).then_some(c.user)
-    }
 }
 
 /// Pushes snapshot changes to the WireGuard backend, in order, skipping
@@ -568,7 +517,7 @@ pub async fn stats_task(state: Arc<AppState>) {
     }
 }
 
-/// Hourly housekeeping: expired tokens, sessions and caches.
+/// Hourly housekeeping: expired tokens and sessions.
 pub async fn prune_task(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     loop {
@@ -576,8 +525,5 @@ pub async fn prune_task(state: Arc<AppState>) {
         if let Err(e) = state.db.prune() {
             tracing::warn!(error = %e, "pruning database");
         }
-        let t = now();
-        lock(&state.basic_cache).retain(|_, exp| *exp > t);
-        lock(&state.auth_codes).retain(|_, c| c.expires > t);
     }
 }

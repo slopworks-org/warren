@@ -1,7 +1,7 @@
 # Warren — rules for Claude Code
 
-Self-hosted WireGuard hub plus HTTPS reverse proxy: a server for one VPS and a
-tiny agent for routers. See README.md for what it does and how it works.
+Self-hosted WireGuard hub: a server for one VPS and a tiny agent for routers.
+See README.md for what it does and how it works.
 
 ## Layout
 
@@ -10,10 +10,10 @@ crates/
   proto/   agent↔server wire formats, tokens, HMAC; dependency-light, shared with the agent
   wgctl/   hand-written netlink control of WireGuard, links and addresses (libc only, Linux)
   agent/   the `warren` binary
-  server/  the `warren-server` binary and library: API, web admin, proxy, ACME, hub
+  server/  the `warren-server` binary and library: API, web admin, ACME, hub
     web/   admin UI (HTML/JS/CSS), embedded into the binary with include_str!
     tests/ e2e.rs, the end-to-end test (ignored by default, run by scripts/e2e.sh)
-docs/      README diagram, light and dark variants
+docs/      Android enrollment and lab documentation
 dist/      config sample, systemd units, OpenWrt init scripts, Dockerfiles, install.sh
 scripts/   build, packaging, Linux container and gate scripts
 ```

@@ -3,8 +3,8 @@
 //! Two implementations behind one enum: the Linux kernel module (preferred;
 //! device-to-device ACLs become an nftables table) and boringtun on a TUN
 //! device (fallback; ACLs are checked per packet in-process). In both, the
-//! server's own sockets (proxy, control channel) use the kernel stack, so the
-//! rest of the server does not care which one runs.
+//! server's own control socket uses the kernel stack, so the rest of the
+//! server does not care which one runs.
 
 #[cfg(target_os = "linux")]
 mod kernel;

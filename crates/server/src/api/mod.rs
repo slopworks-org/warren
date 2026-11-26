@@ -8,7 +8,6 @@
 mod admin;
 mod devices;
 mod profile;
-mod resources;
 mod session;
 mod ui;
 
@@ -138,9 +137,14 @@ impl<S: Send + Sync> FromRequestParts<S> for Ip {
     }
 }
 
+/// Finds a cookie in a `Cookie` header.
+fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').filter_map(|c| c.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v)
+}
+
 /// Reads a cookie from the request.
 pub fn cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get_all(COOKIE).iter().filter_map(|v| v.to_str().ok()).find_map(|h| crate::access::cookie_value(h, name))
+    headers.get_all(COOKIE).iter().filter_map(|v| v.to_str().ok()).find_map(|h| cookie_value(h, name))
 }
 
 /// Builds the `Set-Cookie` value for the session cookie.
@@ -270,7 +274,7 @@ pub fn rebuild(state: &AppState) -> ApiResult<()> {
     state.rebuild().map_err(ApiError::internal)
 }
 
-/// The admin-host router: UI, API and the resource sign-in hop.
+/// The admin-host router: UI and JSON API.
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/auth/status", get(session::status))
@@ -295,8 +299,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/devices/{id}/update", post(devices::request_update))
         .route("/devices/{id}", get(devices::get_one).patch(devices::update).delete(devices::remove))
         .route("/devices/{id}/config", get(devices::config))
-        .route("/resources", get(resources::list).post(resources::create))
-        .route("/resources/{id}", get(resources::get_one).patch(resources::update).delete(resources::remove))
         .route("/users", get(admin::users).post(admin::create_user))
         .route("/users/{id}", axum::routing::patch(admin::update_user).delete(admin::delete_user))
         .route("/users/{id}/password", post(admin::reset_password))
@@ -310,7 +312,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(|| async { ApiError::NotFound });
     Router::new()
         .nest("/api/v1", api)
-        .route("/auth/resource", get(session::resource_sign_in))
         .merge(ui::routes())
         .layer(axum::middleware::map_response(ui::security_headers))
         .with_state(state)
@@ -322,5 +323,12 @@ mod tests {
     fn usernames() {
         assert!(super::valid_username("alice.b-c_1"));
         assert!(!super::valid_username("") && !super::valid_username("a b") && !super::valid_username(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn cookie_parsing() {
+        let h = "a=1; __Host-warren_session=xyz; b=2";
+        assert_eq!(super::cookie_value(h, super::SESSION_COOKIE), Some("xyz"));
+        assert_eq!(super::cookie_value("a=1", super::SESSION_COOKIE), None);
     }
 }

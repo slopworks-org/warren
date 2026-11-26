@@ -66,7 +66,7 @@ async fn lost_receipt_can_only_be_recovered_for_the_original_enrollment() {
         })
         .unwrap();
     }
-    let certs = Arc::new(CertStore::new(TlsMode::SelfSigned, PathBuf::new(), None, None).unwrap());
+    let certs = Arc::new(CertStore::new(TlsMode::SelfSigned, PathBuf::new(), config.admin_host(), None, None).unwrap());
     let state = Arc::new(AppState::new(config, db, &[2; 32], [3; 32], certs, Backend::None));
     state.rebuild().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

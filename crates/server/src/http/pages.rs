@@ -1,4 +1,4 @@
-//! Small self-contained HTML pages shown on resource hosts.
+//! Small self-contained HTML error pages.
 
 use crate::util::html_escape;
 use axum::body::Body;
@@ -7,12 +7,9 @@ use http::{HeaderValue, Response, StatusCode};
 
 const STYLE: &str = "body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;\
 background:#f4f5f7;color:#1d2330}@media(prefers-color-scheme:dark){body{background:#14171c;color:#e6e9ef}\
-.card{background:#1e222a!important;border-color:#2c313b!important}input{background:#14171c;color:inherit}}\
+.card{background:#1e222a!important;border-color:#2c313b!important}}\
 .card{background:#fff;border:1px solid #e1e4ea;border-radius:12px;padding:28px 32px;max-width:420px;margin:16px}\
-h1{font-size:20px;margin:0 0 8px}p{margin:0 0 12px;opacity:.85}small{opacity:.6}\
-input{font:inherit;padding:8px 10px;border:1px solid #9aa3b2;border-radius:8px;width:100%;box-sizing:border-box}\
-button{font:inherit;margin-top:12px;padding:8px 16px;border:0;border-radius:8px;background:#2f6fed;color:#fff;cursor:pointer}\
-.err{color:#d33}";
+h1{font-size:20px;margin:0 0 8px}p{margin:0 0 12px;opacity:.85}small{opacity:.6}";
 
 /// Renders a page with a heading and HTML body.
 fn page(status: StatusCode, title: &str, body_html: &str) -> Response<Body> {
@@ -45,47 +42,7 @@ pub fn simple(status: StatusCode, title: &str, text: &str) -> Response<Body> {
 /// 404 for unknown hosts and paths.
 #[must_use]
 pub fn not_found() -> Response<Body> {
-    simple(StatusCode::NOT_FOUND, "Not found", "Nothing is published at this address.")
-}
-
-/// 503 when the target device is not connected. Visitors of public sites
-/// see this page, so it names neither the device nor its address.
-#[must_use]
-pub fn device_offline() -> Response<Body> {
-    simple(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Site offline",
-        "The device that serves this site is not connected right now. Try again later.",
-    )
-}
-
-/// 502 when the device is connected but the service does not answer.
-#[must_use]
-pub fn service_unreachable() -> Response<Body> {
-    simple(StatusCode::BAD_GATEWAY, "Service unreachable", "The site is not answering right now. Try again later.")
-}
-
-/// 403 for signed-in users without access.
-#[must_use]
-pub fn forbidden() -> Response<Body> {
-    simple(StatusCode::FORBIDDEN, "No access", "Your account is not allowed to open this site.")
-}
-
-/// The PIN form for PIN-protected resources.
-#[must_use]
-pub fn pin_form(host: &str, next: &str, error: bool) -> Response<Body> {
-    let err = if error { "<p class=err>Wrong PIN.</p>" } else { "" };
-    page(
-        StatusCode::UNAUTHORIZED,
-        "PIN required",
-        &format!(
-            "<p>{} is protected by a PIN.</p>{err}<form method=post action=\"/.warren/pin\">\
-             <input type=hidden name=next value=\"{}\"><input name=pin type=password inputmode=numeric \
-             autocomplete=one-time-code autofocus required aria-label=PIN><button>Continue</button></form>",
-            html_escape(host),
-            html_escape(next)
-        ),
-    )
+    simple(StatusCode::NOT_FOUND, "Not found", "Nothing is served at this address.")
 }
 
 #[cfg(test)]
@@ -94,8 +51,8 @@ mod tests {
 
     #[test]
     fn pages_escape_input() {
-        let r = pin_form("<x>", "/\"><script>", true);
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let r = simple(StatusCode::NOT_FOUND, "<x>", "<script>");
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert!(r.headers().get(CONTENT_SECURITY_POLICY).is_some());
     }
 }
